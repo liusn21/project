@@ -1,0 +1,10 @@
+1.Tokenizer
+整个数据流分为raw packet sequence（参考TrafficFormer的做法），和metadata sequence（packet length序列和time序列），可以对他们进行联合embedding建立token embedding（参考PTU），随后加上位置编码、segment embedding（指示到底是raw packet还是metadata，应该是共三类），特别的，参考PTU，这三类应该有自己独特的embedding
+2.Pre-train
+2.1 数据增强
+时域增强和频域增强，时域增强模拟真实网络传输条件，如时序偏移、模拟重传等（可以参考Data Augmentation、Rosetta等文章）。频域增强针对metadata序列进行增强，如在FFT后添加噪声或掩蔽或混合。
+2.2 预训练方法
+对比式预训练方法（SimCLR或Simsiam等，待评估），辅助MBM生成式预训练方法
+3.Fine-tune
+3.1 类平衡采样
+3.2 监督对比损失
