@@ -576,213 +576,216 @@ class BertFlowDataLoader(DataLoader):
                 torch.LongTensor(proto)
 
 
+
 # ============================================================================
-# Multi-Modal Dataset for Contrastive Pre-training
+# Stage 1: Single-Modal Datasets (Raw Packet & Packet Size)
 # ============================================================================
 
-class MultiModalDataset(Dataset):
+class RawPacketDataset(Dataset):
     """
-    多模态流量数据集，用于对比学习预训练
+    Dataset for Raw Packet modality (Stage 1)
 
-    从JSON文件读取流特征，构建包含：
-    - Raw packet tokens (bigram)
-    - Temporal tokens (IAT)
-    - Size+Direction tokens
+    Corpus format (corpus_raw.txt):
+    ||
+    6
+    1 4500 0006 0683 3c52 5297 ...
+    -1 4500 0000 003c 3c52 ...
+    ||
+    17
+    1 ...
+    ...
+
+    Format explanation:
+    - || : Flow separator
+    - Next line: Protocol (6=TCP, 17=UDP)
+    - Following lines: "{direction} {bigrams...}" per packet
     """
 
     def __init__(self, args, vocab, tokenizer):
-        super(MultiModalDataset, self).__init__(args, vocab, tokenizer)
-        self.json_path = args.corpus_path  # 复用corpus_path参数，指向JSON文件
+        super(RawPacketDataset, self).__init__(args, vocab, tokenizer)
+        self.short_seq_prob = args.short_seq_prob
 
     def worker(self, proc_id, start, end):
-        """构建预训练数据集"""
-        import json
-
-        print(f"Worker {proc_id} is building dataset...")
+        print("Worker %d is building raw packet dataset..." % proc_id)
         set_seed(self.seed)
 
-        dataset_writer = open(f"/tmp/dataset-tmp-{proc_id}.pt", "wb")
+        # Buffer for accumulating flows
+        flow_buffer = []      # List of flows, each flow is list of packets
+        flow_proto = []       # Protocol for each flow (0=TCP, 1=UDP)
+        flow_directions = []  # Directions for each flow
 
-        # 读取JSON文件
-        with open(self.json_path, 'r') as f:
-            data = json.load(f)
+        # Current flow being parsed
+        current_packets = []       # List of token lists for current flow
+        current_directions = []    # List of direction values for current flow
+        current_protocol = 0       # Protocol for current flow
 
-        flows = data['flows']
-        total_flows = len(flows)
+        pos = 0
+        state = 'init'  # States: 'init', 'protocol', 'packets'
 
-        # 分配给当前worker的流
-        flows_for_worker = flows[start:end]
+        dataset_writer = open("/tmp/dataset-raw-tmp-" + str(proc_id) + ".pt", "wb")
 
-        print(f"Worker {proc_id}: processing {len(flows_for_worker)} flows")
+        with open(self.corpus_path, mode="r", encoding="utf-8") as f:
+            # Skip to start position
+            while pos < start:
+                f.readline()
+                pos += 1
 
-        for flow in flows_for_worker:
-            instances = self._create_instances_from_flow(flow)
-            for instance in instances:
-                pickle.dump(instance, dataset_writer)
+            while True:
+                line = f.readline()
+                if not line:  # EOF
+                    break
+                pos += 1
+
+                line = line.strip()
+
+                # Check for flow separator
+                if line == "||":
+                    # Save previous flow if exists
+                    if len(current_packets) > 0:
+                        flow_buffer.append(current_packets)
+                        flow_proto.append(current_protocol)
+                        flow_directions.append(current_directions)
+
+                    # Check if buffer is full
+                    total_packets = sum(len(f) for f in flow_buffer)
+                    if total_packets > self.docs_buffer_size:
+                        instances = self.build_instances(flow_buffer, flow_proto, flow_directions)
+                        for instance in instances:
+                            pickle.dump(instance, dataset_writer)
+                        flow_buffer = []
+                        flow_proto = []
+                        flow_directions = []
+
+                    # Reset for new flow
+                    current_packets = []
+                    current_directions = []
+                    state = 'protocol'
+                    continue
+
+                if pos > end:
+                    break
+
+                # Parse based on state
+                if state == 'protocol':
+                    # This line contains protocol number (6 or 17)
+                    try:
+                        proto_num = int(line)
+                        current_protocol = 0 if proto_num == 6 else 1  # 0=TCP, 1=UDP
+                    except ValueError:
+                        current_protocol = 0  # Default TCP
+                    state = 'packets'
+
+                elif state == 'packets':
+                    # This line contains: "{direction} {bigrams...}"
+                    if not line:
+                        continue
+
+                    parts = line.split(' ', 1)  # Split into direction and rest
+                    if len(parts) < 2:
+                        continue
+
+                    try:
+                        direction = int(parts[0])  # 1 or -1
+                    except ValueError:
+                        direction = 1
+
+                    bigram_str = parts[1]  # "4500 0006 0683 ..."
+
+                    # Tokenize bigrams
+                    tokens = self.tokenizer.convert_tokens_to_ids(
+                        self.tokenizer.tokenize(bigram_str)
+                    )
+
+                    if len(tokens) > 0:
+                        current_packets.append(tokens)
+                        current_directions.append(direction)
+
+            # Save last flow
+            if len(current_packets) > 0:
+                flow_buffer.append(current_packets)
+                flow_proto.append(current_protocol)
+                flow_directions.append(current_directions)
+
+            # Process remaining buffer
+            if len(flow_buffer) > 0:
+                instances = self.build_instances(flow_buffer, flow_proto, flow_directions)
+                for instance in instances:
+                    pickle.dump(instance, dataset_writer)
 
         dataset_writer.close()
-        print(f"Worker {proc_id} finished.")
+        print("Worker %d finished." % proc_id)
 
-    def _create_instances_from_flow(self, flow):
-        """从单个流创建训练实例"""
-        raw_tokens_list = flow['raw_tokens']
-        temporal_tokens_list = flow['temporal_tokens']
-        size_tokens_list = flow['size_tokens']
+    def build_instances(self, all_flows, flow_proto, flow_directions):
+        """Build training instances from accumulated flows"""
+        instances = []
+        for _ in range(self.dup_factor):
+            for flow_index in range(len(all_flows)):
+                instances.extend(
+                    self.create_ins_from_flow(all_flows, flow_index, flow_proto, flow_directions)
+                )
+        return instances
 
-        num_packets = len(raw_tokens_list)
+    def create_ins_from_flow(self, all_flows, flow_index, flow_proto, flow_directions):
+        """Create training instances from a single flow"""
+        packets = all_flows[flow_index]           # List of token lists
+        directions = flow_directions[flow_index]  # List of direction values (one per packet)
+        protocol = flow_proto[flow_index]
+        assert len(packets) == len(directions), f"Packet count {len(packets)} != direction count {len(directions)}"
 
-        if num_packets < 1:
-            return []
+        max_num_tokens = self.seq_length - 2  # Reserve for [CLS] and [SEP]
+        instances = []
 
-        # 构建完整的token序列
-        all_tokens = []
-        all_token_types = []
-        all_positions = []
+        # Concatenate all packets into one sequence
+        tokens = []
+        token_directions = []
 
-        global_pos = 0
+        for pkt_idx, packet_tokens in enumerate(packets):
+            pkt_direction = directions[pkt_idx] if pkt_idx < len(directions) else 1
 
-        for pkt_idx in range(num_packets):
-            # Raw packet tokens
-            raw_tokens = raw_tokens_list[pkt_idx]
-            for token in raw_tokens:
-                # 将hex转为int
-                token_id = int(token, 16)
-                all_tokens.append(token_id)
-                all_token_types.append(0)  # type=0: raw packet
-                all_positions.append(global_pos)
-                global_pos += 1
+            # Each token in the packet gets the same direction
+            tokens.extend(packet_tokens)
+            token_directions.extend([pkt_direction] * len(packet_tokens))
 
-            # Temporal tokens
-            temporal_tokens = temporal_tokens_list[pkt_idx]
-            for token_id in temporal_tokens:
-                all_tokens.append(token_id)
-                all_token_types.append(1)  # type=1: temporal
-                all_positions.append(global_pos)
-                global_pos += 1
+        # Truncate to max length
+        if len(tokens) > max_num_tokens:
+            tokens = tokens[:max_num_tokens]
+            token_directions = token_directions[:max_num_tokens]
 
-            # Size+Direction token
-            size_token = size_tokens_list[pkt_idx]
-            all_tokens.append(size_token)
-            all_token_types.append(2)  # type=2: size
-            all_positions.append(global_pos)
-            global_pos += 1
+        # Build sequence with special tokens
+        src = [self.vocab.get(CLS_TOKEN)] + tokens + [self.vocab.get(SEP_TOKEN)]
 
-        # 截断到seq_length（完整包截断）
-        truncated_tokens, truncated_types, truncated_positions = \
-            self._truncate_to_complete_packets(
-                all_tokens, all_token_types, all_positions
-            )
-
-        # 添加[CLS]和padding
-        src = [self.vocab.get(CLS_TOKEN)] + truncated_tokens
-        token_types = [0] + truncated_types  # [CLS]的type设为0
-        positions = [0] + [p+1 for p in truncated_positions]
+        # Direction: convert -1,1 to 0,2 for embedding index (1 reserved for padding)
+        # -1 -> 0, 1 -> 2, padding -> 1
+        directions_seq = [1]  # [CLS] gets neutral direction
+        for d in token_directions:
+            directions_seq.append(0 if d == -1 else 2)  # -1->0, 1->2
+        directions_seq.append(1)  # [SEP] gets neutral direction
 
         # Padding
-        padding_len = self.seq_length - len(src)
-        if padding_len > 0:
-            src += [PAD_ID] * padding_len
-            token_types += [0] * padding_len
-            positions += [0] * padding_len
+        while len(src) < self.seq_length:
+            src.append(PAD_ID)
+            directions_seq.append(1)  # Padding gets neutral direction
 
-        src = src[:self.seq_length]
-        token_types = token_types[:self.seq_length]
-        positions = positions[:self.seq_length]
-
-        # 应用Masking（用于MBM辅助任务）
+        # Apply masking
         if not self.dynamic_masking:
-            masked_src, masked_labels = self._apply_masking(src, token_types)
+            src, tgt_mlm = mask_seq(src, self.tokenizer, self.whole_word_masking,
+                                   self.span_masking, self.span_geo_prob, self.span_max_length)
+            instance = (src, tgt_mlm, directions_seq, protocol)
         else:
-            masked_src = src
-            masked_labels = [0] * len(src)  # 动态masking在训练时处理
+            instance = (src, directions_seq, protocol)
 
-        # 构造实例
-        instance = (
-            masked_src,         # 输入序列
-            masked_labels,      # mask标签（用于MBM）
-            token_types,        # token类型（0=raw, 1=temporal, 2=size）
-            positions,          # 位置索引
-        )
-
-        return [instance]
-
-    def _truncate_to_complete_packets(self, tokens, types, positions):
-        """
-        截断到完整包（方案B）
-
-        确保不会截断一个包的中间，保持包的完整性
-        """
-        if len(tokens) <= self.seq_length - 1:  # -1 for [CLS]
-            return tokens, types, positions
-
-        # 找到包的边界（size token的位置）
-        packet_boundaries = [i for i, t in enumerate(types) if t == 2]
-
-        # 找到最后一个完整包的结束位置
-        max_len = self.seq_length - 1
-        last_complete_idx = 0
-
-        for boundary in packet_boundaries:
-            if boundary < max_len:
-                last_complete_idx = boundary
-            else:
-                break
-
-        # 截断
-        return (tokens[:last_complete_idx+1],
-                types[:last_complete_idx+1],
-                positions[:last_complete_idx+1])
-
-    def _apply_masking(self, src, token_types):
-        """
-        应用BERT-style masking（15%）
-
-        对三种token类型都可能mask
-        """
-        masked_src = src.copy()
-        masked_labels = [0] * len(src)
-
-        # 找出可以mask的位置（排除[CLS], [SEP], [PAD]）
-        maskable_positions = []
-        for i, token_id in enumerate(src):
-            if token_id not in [self.vocab.get(CLS_TOKEN),
-                               self.vocab.get(SEP_TOKEN),
-                               PAD_ID]:
-                maskable_positions.append(i)
-
-        # 随机选择15%
-        num_to_mask = max(1, int(len(maskable_positions) * 0.15))
-        random.shuffle(maskable_positions)
-        mask_positions = maskable_positions[:num_to_mask]
-
-        for pos in mask_positions:
-            masked_labels[pos] = src[pos]  # 记录原始token
-
-            prob = random.random()
-            if prob < 0.8:
-                # 80%: 替换为[MASK]
-                masked_src[pos] = self.vocab.get(MASK_TOKEN)
-            elif prob < 0.9:
-                # 10%: 替换为随机token（根据token类型）
-                token_type = token_types[pos]
-                if token_type == 0:  # raw packet
-                    masked_src[pos] = random.randint(0, 65535)
-                elif token_type == 1:  # temporal
-                    masked_src[pos] = random.randint(0, 999)
-                elif token_type == 2:  # size
-                    masked_src[pos] = random.randint(0, 3000)
-            # 10%: 保持不变
-
-        return masked_src, masked_labels
+        instances.append(instance)
+        return instances
 
 
-class MultiModalDataLoader(DataLoader):
-    """多模态数据加载器"""
+class RawPacketDataLoader(DataLoader):
+    """DataLoader for Raw Packet modality"""
 
     def __iter__(self):
         while True:
             while self._empty():
                 self._fill_buf()
+
             if self.start + self.batch_size >= self.end:
                 instances = self.buffer[self.start:]
             else:
@@ -791,17 +794,237 @@ class MultiModalDataLoader(DataLoader):
             self.start += self.batch_size
 
             src = []
-            mask_labels = []
-            token_types = []
-            positions = []
+            tgt_mlm = []
+            directions = []
+            protocols = []
+
+            masked_words_num = 0
 
             for ins in instances:
-                src.append(ins[0])
-                mask_labels.append(ins[1])
-                token_types.append(ins[2])
-                positions.append(ins[3])
+                if len(ins) == 4:  # Static masking
+                    src.append(ins[0])
+                    masked_words_num += len(ins[1])
+                    tgt_mlm.append([0] * len(ins[0]))
+                    for mask in ins[1]:
+                        tgt_mlm[-1][mask[0]] = mask[1]
+                    directions.append(ins[2])
+                    protocols.append(ins[3])
+                else:  # Dynamic masking
+                    src_single, tgt_mlm_single = mask_seq(
+                        ins[0], self.tokenizer, self.whole_word_masking,
+                        self.span_masking, self.span_geo_prob, self.span_max_length
+                    )
+                    masked_words_num += len(tgt_mlm_single)
+                    src.append(src_single)
+                    tgt_mlm.append([0] * len(ins[0]))
+                    for mask in tgt_mlm_single:
+                        tgt_mlm[-1][mask[0]] = mask[1]
+                    directions.append(ins[1])
+                    protocols.append(ins[2])
+
+            if masked_words_num == 0:
+                continue
 
             yield (torch.LongTensor(src),
-                   torch.LongTensor(mask_labels),
-                   torch.LongTensor(token_types),
-                   torch.LongTensor(positions))
+                   torch.LongTensor(tgt_mlm),
+                   torch.LongTensor(directions),
+                   torch.LongTensor(protocols))
+
+
+class PacketSizeDataset(Dataset):
+    """
+    Dataset for Packet Size modality (Stage 1)
+
+    Corpus format (corpus_size.txt):
+    ||
+    6
+    1672 2185 953 ...
+    ||
+    17
+    1300 1400 ...
+
+    Format explanation:
+    - || : Flow separator
+    - Next line: Protocol (6=TCP, 17=UDP)
+    - Following line: Size tokens (direction already encoded: size * direction + 1500)
+    """
+
+    def __init__(self, args, vocab, tokenizer):
+        super(PacketSizeDataset, self).__init__(args, vocab, tokenizer)
+        self.short_seq_prob = args.short_seq_prob
+
+    def worker(self, proc_id, start, end):
+        print("Worker %d is building packet size dataset..." % proc_id)
+        set_seed(self.seed)
+
+        # Buffer for accumulating flows
+        flow_buffer = []   # List of token lists (one per flow)
+        flow_proto = []    # Protocol for each flow (0=TCP, 1=UDP)
+
+        # Current flow being parsed
+        current_tokens = []
+        current_protocol = 0
+
+        pos = 0
+        state = 'init'  # States: 'init', 'protocol', 'tokens'
+
+        dataset_writer = open("/tmp/dataset-size-tmp-" + str(proc_id) + ".pt", "wb")
+
+        with open(self.corpus_path, mode="r", encoding="utf-8") as f:
+            # Skip to start position
+            while pos < start:
+                f.readline()
+                pos += 1
+
+            while True:
+                line = f.readline()
+                if not line:  # EOF
+                    break
+                pos += 1
+
+                line = line.strip()
+
+                # Check for flow separator
+                if line == "||":
+                    # Save previous flow if exists
+                    if len(current_tokens) > 0:
+                        flow_buffer.append(current_tokens)
+                        flow_proto.append(current_protocol)
+
+                    # Check if buffer is full
+                    if len(flow_buffer) > self.docs_buffer_size:
+                        instances = self.build_instances(flow_buffer, flow_proto)
+                        for instance in instances:
+                            pickle.dump(instance, dataset_writer)
+                        flow_buffer = []
+                        flow_proto = []
+
+                    # Reset for new flow
+                    current_tokens = []
+                    state = 'protocol'
+                    continue
+
+                if pos > end:
+                    break
+
+                # Parse based on state
+                if state == 'protocol':
+                    # This line contains protocol number (6 or 17)
+                    try:
+                        proto_num = int(line)
+                        current_protocol = 0 if proto_num == 6 else 1  # 0=TCP, 1=UDP
+                    except ValueError:
+                        current_protocol = 0  # Default TCP
+                    state = 'tokens'
+
+                elif state == 'tokens':
+                    # This line contains size tokens
+                    if not line:
+                        continue
+
+                    # Tokenize size tokens
+                    tokens = self.tokenizer.convert_tokens_to_ids(
+                        self.tokenizer.tokenize(line)
+                    )
+
+                    if len(tokens) > 0:
+                        current_tokens = tokens
+
+            # Save last flow
+            if len(current_tokens) > 0:
+                flow_buffer.append(current_tokens)
+                flow_proto.append(current_protocol)
+
+            # Process remaining buffer
+            if len(flow_buffer) > 0:
+                instances = self.build_instances(flow_buffer, flow_proto)
+                for instance in instances:
+                    pickle.dump(instance, dataset_writer)
+
+        dataset_writer.close()
+        print("Worker %d finished." % proc_id)
+
+    def build_instances(self, all_flows, flow_proto):
+        """Build training instances from accumulated flows"""
+        instances = []
+        for _ in range(self.dup_factor):
+            for flow_index in range(len(all_flows)):
+                instances.extend(self.create_ins_from_flow(all_flows, flow_index, flow_proto))
+        return instances
+
+    def create_ins_from_flow(self, all_flows, flow_index, flow_proto):
+        """Create training instances from a single flow"""
+        tokens = all_flows[flow_index]
+        protocol = flow_proto[flow_index] if flow_index < len(flow_proto) else 0
+
+        max_num_tokens = self.seq_length - 2  # Reserve for [CLS] and [SEP]
+
+        # Truncate
+        if len(tokens) > max_num_tokens:
+            tokens = tokens[:max_num_tokens]
+
+        # Build instance with special tokens
+        src = [self.vocab.get(CLS_TOKEN)] + tokens + [self.vocab.get(SEP_TOKEN)]
+
+        # Padding
+        while len(src) < self.seq_length:
+            src.append(PAD_ID)
+
+        # Apply masking
+        if not self.dynamic_masking:
+            src, tgt_mlm = mask_seq(src, self.tokenizer, self.whole_word_masking,
+                                   self.span_masking, self.span_geo_prob, self.span_max_length)
+            instance = (src, tgt_mlm, protocol)
+        else:
+            instance = (src, protocol)
+
+        return [instance]
+
+
+class PacketSizeDataLoader(DataLoader):
+    """DataLoader for Packet Size modality"""
+
+    def __iter__(self):
+        while True:
+            while self._empty():
+                self._fill_buf()
+
+            if self.start + self.batch_size >= self.end:
+                instances = self.buffer[self.start:]
+            else:
+                instances = self.buffer[self.start: self.start + self.batch_size]
+
+            self.start += self.batch_size
+
+            src = []
+            tgt_mlm = []
+            protocols = []
+
+            masked_words_num = 0
+
+            for ins in instances:
+                if len(ins) == 3:  # Static masking
+                    src.append(ins[0])
+                    masked_words_num += len(ins[1])
+                    tgt_mlm.append([0] * len(ins[0]))
+                    for mask in ins[1]:
+                        tgt_mlm[-1][mask[0]] = mask[1]
+                    protocols.append(ins[2])
+                else:  # Dynamic masking
+                    src_single, tgt_mlm_single = mask_seq(
+                        ins[0], self.tokenizer, self.whole_word_masking,
+                        self.span_masking, self.span_geo_prob, self.span_max_length
+                    )
+                    masked_words_num += len(tgt_mlm_single)
+                    src.append(src_single)
+                    tgt_mlm.append([0] * len(ins[0]))
+                    for mask in tgt_mlm_single:
+                        tgt_mlm[-1][mask[0]] = mask[1]
+                    protocols.append(ins[1])
+
+            if masked_words_num == 0:
+                continue
+
+            yield (torch.LongTensor(src),
+                   torch.LongTensor(tgt_mlm),
+                   torch.LongTensor(protocols))

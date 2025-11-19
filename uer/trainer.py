@@ -204,7 +204,111 @@ class BertTrainer(Trainer):
         self.total_correct_mlm, self.total_denominator = 0.0, 0.0
         self.total_correct_sp, self.total_instances = 0.0, 0.0
 
- str2trainer = {"bertflow": BertTrainer}
+class RawPacketMlmTrainer(Trainer):
+    """Trainer for Raw Packet modality (Stage 1) - MLM only"""
+
+    def __init__(self, args):
+        super(RawPacketMlmTrainer, self).__init__(args)
+        self.total_loss_mlm = 0.0
+        self.total_correct_mlm = 0.0
+        self.total_denominator = 0.0
+
+    def forward_propagation(self, batch, model):
+        """
+        Batch format from RawPacketDataLoader:
+        (src, tgt_mlm, directions, protocols)
+        """
+        src, tgt_mlm, directions, protocols = batch
+
+        # Forward pass with directions and protocols
+        loss_mlm, correct_mlm, denominator = model(src, tgt_mlm, directions, protocols)
+
+        self.total_loss += loss_mlm.item()
+        self.total_loss_mlm += loss_mlm.item()
+        self.total_correct_mlm += correct_mlm.item()
+        self.total_denominator += denominator.item()
+
+        loss = loss_mlm / self.accumulation_steps
+        return loss
+
+    def report_and_reset_stats(self):
+        done_tokens = self.batch_size * self.seq_length * self.report_steps
+        if self.dist_train:
+            done_tokens *= self.world_size
+
+        print("| {:8d}/{:8d} steps"
+              "| {:3.3f} s"
+              "| {:8.2f} tokens/s"
+              "| loss_mlm: {:7.2f}"
+              "| acc_mlm: {:3.3f}".format(
+            self.current_step,
+            self.total_steps,
+            (time.time() - self.start_time),
+            done_tokens / (time.time() - self.start_time),
+            self.total_loss_mlm / self.report_steps,
+            self.total_correct_mlm / self.total_denominator))
+
+        self.total_loss = 0.0
+        self.total_loss_mlm = 0.0
+        self.total_correct_mlm = 0.0
+        self.total_denominator = 0.0
+
+
+class PacketSizeMlmTrainer(Trainer):
+    """Trainer for Packet Size modality (Stage 1) - MLM only"""
+
+    def __init__(self, args):
+        super(PacketSizeMlmTrainer, self).__init__(args)
+        self.total_loss_mlm = 0.0
+        self.total_correct_mlm = 0.0
+        self.total_denominator = 0.0
+
+    def forward_propagation(self, batch, model):
+        """
+        Batch format from PacketSizeDataLoader:
+        (src, tgt_mlm, protocols)
+        """
+        src, tgt_mlm, protocols = batch
+
+        # Forward pass with protocols
+        loss_mlm, correct_mlm, denominator = model(src, tgt_mlm, None, protocols)
+
+        self.total_loss += loss_mlm.item()
+        self.total_loss_mlm += loss_mlm.item()
+        self.total_correct_mlm += correct_mlm.item()
+        self.total_denominator += denominator.item()
+
+        loss = loss_mlm / self.accumulation_steps
+        return loss
+
+    def report_and_reset_stats(self):
+        done_tokens = self.batch_size * self.seq_length * self.report_steps
+        if self.dist_train:
+            done_tokens *= self.world_size
+
+        print("| {:8d}/{:8d} steps"
+              "| {:3.3f} s"
+              "| {:8.2f} tokens/s"
+              "| loss_mlm: {:7.2f}"
+              "| acc_mlm: {:3.3f}".format(
+            self.current_step,
+            self.total_steps,
+            (time.time() - self.start_time),
+            done_tokens / (time.time() - self.start_time),
+            self.total_loss_mlm / self.report_steps,
+            self.total_correct_mlm / self.total_denominator))
+
+        self.total_loss = 0.0
+        self.total_loss_mlm = 0.0
+        self.total_correct_mlm = 0.0
+        self.total_denominator = 0.0
+
+
+str2trainer = {
+    "bertflow": BertTrainer,
+    "raw_packet": RawPacketMlmTrainer,
+    "packet_size": PacketSizeMlmTrainer
+}
 
 def worker(proc_id, gpu_ranks, args, model):    
     """

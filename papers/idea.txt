@@ -8,3 +8,11 @@
 3.Fine-tune
 3.1 类平衡采样
 3.2 监督对比损失
+
+1.Tokenizer
+整个数据流分为raw packet sequence（参考TrafficFormer的做法），和packet size sequence。其中，raw packet建立逻辑如下，参考TrafficFormer，对于每条流的单个数据包，从以太网帧开始计算，单包最多64bytes。只考虑IPV4的TCP和UDP包即可，去除部分会导致偏置的字段（网络层的checksum、total length（因为我已经单独提取）、源目的地址、传输层TCP的源目的端口、序列号、确认号、windows、checksum、紧急指针、传输层UDP的源目的端口、checksum）。特别地，忽略没有payload的握手包，去除含有小于等于5个包的数据流。组成预训练的数据集。
+2.Pre-train
+2.1 stage 1
+两个模态的encoder独立训练，采用普通的mask掩码预测任务即可。
+2.2 stage 2
+cross-attention后预训练任务，目前想到的有数据增强对比学习(BYOL或SimSiam)、跨模态mask预测。（可补充）

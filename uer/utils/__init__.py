@@ -1,12 +1,22 @@
 from uer.utils.tokenizers import BertTokenizer
 from uer.utils.data import BertFlowDataset, BertFlowDataLoader
+from uer.utils.data import RawPacketDataset, RawPacketDataLoader
+from uer.utils.data import PacketSizeDataset, PacketSizeDataLoader
 from uer.utils.data import mask_seq, truncate_seq_pair
 from uer.utils.act_fun import *
 from uer.utils.optimizers import *
 
-str2tokenizer = {"bert": BertTokenizer, "bertflow": BertTokenizer}
-str2dataset = {"bertflow": BertFlowDataset}
-str2dataloader = {"bertflow": BertFlowDataLoader}
+str2tokenizer = {"bert": BertTokenizer, "bertflow": BertTokenizer, "raw_packet": BertTokenizer, "packet_size": BertTokenizer}
+str2dataset = {
+    "bertflow": BertFlowDataset,
+    "raw_packet": RawPacketDataset,
+    "packet_size": PacketSizeDataset
+}
+str2dataloader = {
+    "bertflow": BertFlowDataLoader,
+    "raw_packet": RawPacketDataLoader,
+    "packet_size": PacketSizeDataLoader
+}
 
 str2act = {"gelu": gelu, "gelu_fast": gelu_fast, "relu": relu, "silu": silu, "linear": linear}
 str2optimizer = {"adamw": AdamW, "adafactor": Adafactor}
@@ -18,8 +28,8 @@ str2scheduler = {"linear": get_linear_schedule_with_warmup,
                 "constant_with_warmup": get_constant_schedule_with_warmup}
 
 __all__ = ["BertTokenizer", "str2tokenizer",
-            "BertFlowDataset", "str2dataset",
-            "BertFlowDataLoader", "str2dataloader",
+            "BertFlowDataset", "RawPacketDataset", "PacketSizeDataset", "str2dataset",
+            "BertFlowDataLoader", "RawPacketDataLoader", "PacketSizeDataLoader", "str2dataloader",
             "mask_seq", "truncate_seq_pair",
             "gelu", "gelu_fast", "relu", "silu", "linear", "str2act",
             "AdamW", "Adafactor", "str2optimizer",
