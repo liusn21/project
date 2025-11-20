@@ -3,7 +3,7 @@ from uer.layers import *
 from uer.encoders import *
 from uer.targets import *
 from uer.models.model import Model
-from uer.models.stage1_models import RawPacketModel, PacketSizeModel
+from uer.models.raw_packet_model import RawPacketModel
 
 
 def build_model(args):
@@ -15,16 +15,16 @@ def build_model(args):
     We could select suitable one for downstream tasks.
     """
 
-    embedding = str2embedding[args.embedding](args, len(args.vocab))
-    encoder = str2encoder[args.encoder](args)
-    target = str2target[args.target](args, len(args.vocab))
-
-    # Use custom models for Stage 1 single-modal training
+    # For raw_packet target, use RawPacketEmbeddingV2
     if args.target == "raw_packet":
+        embedding = RawPacketEmbedding(args, len(args.vocab))
+        encoder = str2encoder[args.encoder](args)
+        target = str2target[args.target](args, len(args.vocab))
         model = RawPacketModel(args, embedding, encoder, target)
-    elif args.target == "packet_size":
-        model = PacketSizeModel(args, embedding, encoder, target)
     else:
+        embedding = str2embedding[args.embedding](args, len(args.vocab))
+        encoder = str2encoder[args.encoder](args)
+        target = str2target[args.target](args, len(args.vocab))
         model = Model(args, embedding, encoder, target)
 
     return model

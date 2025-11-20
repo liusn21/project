@@ -205,7 +205,15 @@ class BertTrainer(Trainer):
         self.total_correct_sp, self.total_instances = 0.0, 0.0
 
 class RawPacketMlmTrainer(Trainer):
-    """Trainer for Raw Packet modality (Stage 1) - MLM only"""
+    """
+    Trainer for Raw Packet modality - MLM only
+
+    New implementation using:
+    - token embedding
+    - position embedding
+    - packet embedding (0-7 for packets, 8 for special/padding)
+    - direction embedding (0=downlink, 1=neutral, 2=uplink)
+    """
 
     def __init__(self, args):
         super(RawPacketMlmTrainer, self).__init__(args)
@@ -216,12 +224,17 @@ class RawPacketMlmTrainer(Trainer):
     def forward_propagation(self, batch, model):
         """
         Batch format from RawPacketDataLoader:
-        (src, tgt_mlm, directions, protocols)
-        """
-        src, tgt_mlm, directions, protocols = batch
+        (src, tgt_mlm, packet_ids, directions)
 
-        # Forward pass with directions and protocols
-        loss_mlm, correct_mlm, denominator = model(src, tgt_mlm, directions, protocols)
+        src: [batch, seq_len] - token IDs
+        tgt_mlm: [batch, seq_len] - MLM targets
+        packet_ids: [batch, seq_len] - packet indices (0-7 for packets, 8 for special/padding)
+        directions: [batch, seq_len] - direction indices (0=downlink, 1=neutral, 2=uplink)
+        """
+        src, tgt_mlm, packet_ids, directions = batch
+
+        # Forward pass with packet_ids and directions
+        loss_mlm, correct_mlm, denominator = model(src, tgt_mlm, packet_ids, directions)
 
         self.total_loss += loss_mlm.item()
         self.total_loss_mlm += loss_mlm.item()

@@ -154,7 +154,7 @@ def merge_dataset(dataset_path, workers_num):
     # Merge datasets.
     dataset_writer = open(dataset_path, "wb")
     for i in range(workers_num):
-        tmp_dataset_reader = open("/mnt/data/zgm/ET-BERT/datasets/temp/dataset-tmp-" + str(i) + ".pt", "rb")
+        tmp_dataset_reader = open("/tmp/" + str(i) + ".pt", "rb")
         while True:
             tmp_data = tmp_dataset_reader.read(2^20) 
             if tmp_data:
@@ -162,7 +162,7 @@ def merge_dataset(dataset_path, workers_num):
             else:
                 break
         tmp_dataset_reader.close()
-        os.remove("/mnt/data/zgm/ET-BERT/datasets/temp/dataset-tmp-" + str(i) + ".pt")
+        os.remove("/tmp/" + str(i) + ".pt")
     dataset_writer.close()
 
 
@@ -622,7 +622,7 @@ class RawPacketDataset(Dataset):
         pos = 0
         state = 'init'  # States: 'init', 'protocol', 'packets'
 
-        dataset_writer = open("/tmp/dataset-raw-tmp-" + str(proc_id) + ".pt", "wb")
+        dataset_writer = open("/tmp/" + str(proc_id) + ".pt", "wb")
 
         with open(self.corpus_path, mode="r", encoding="utf-8") as f:
             # Skip to start position
@@ -726,36 +726,52 @@ class RawPacketDataset(Dataset):
         return instances
 
     def create_ins_from_flow(self, all_flows, flow_index, flow_proto, flow_directions):
-        """Create training instances from a single flow"""
+        """
+        Create training instances from a single flow
+
+        New approach: Track packet_id (0-7) and direction (1/-1) for each token
+        - packet_ids: 0-7 for packets (max 8 packets), 8 for special tokens and padding
+        - directions: 1 (uplink) or -1 (downlink) for each packet
+        """
         packets = all_flows[flow_index]           # List of token lists
-        directions = flow_directions[flow_index]  # List of direction values (one per packet)
-        protocol = flow_proto[flow_index]
-        assert len(packets) == len(directions), f"Packet count {len(packets)} != direction count {len(directions)}"
+        directions = flow_directions[flow_index]  # List of direction values (1 or -1) per packet
 
         max_num_tokens = self.seq_length - 2  # Reserve for [CLS] and [SEP]
         instances = []
 
-        # Concatenate all packets into one sequence
+        # Concatenate all packets into one sequence, tracking packet index and direction
         tokens = []
-        token_directions = []
+        packet_indices = []  # Track which packet each token belongs to (0-7)
+        token_directions = []  # Track direction for each token
 
         for pkt_idx, packet_tokens in enumerate(packets):
+            # Limit to 8 packets (indices 0-7)
+            if pkt_idx >= 8:
+                break
+
             pkt_direction = directions[pkt_idx] if pkt_idx < len(directions) else 1
 
-            # Each token in the packet gets the same direction
+            # Each token in the packet gets the same packet index and direction
             tokens.extend(packet_tokens)
+            packet_indices.extend([pkt_idx] * len(packet_tokens))
             token_directions.extend([pkt_direction] * len(packet_tokens))
 
         # Truncate to max length
         if len(tokens) > max_num_tokens:
             tokens = tokens[:max_num_tokens]
+            packet_indices = packet_indices[:max_num_tokens]
             token_directions = token_directions[:max_num_tokens]
 
         # Build sequence with special tokens
         src = [self.vocab.get(CLS_TOKEN)] + tokens + [self.vocab.get(SEP_TOKEN)]
 
-        # Direction: convert -1,1 to 0,2 for embedding index (1 reserved for padding)
-        # -1 -> 0, 1 -> 2, padding -> 1
+        # Packet indices: 8 is used for special tokens ([CLS], [SEP]) and padding
+        packet_ids = [8]  # [CLS] gets special index 8
+        packet_ids.extend(packet_indices)  # Regular tokens get their packet indices (0-7)
+        packet_ids.append(8)  # [SEP] gets special index 8
+
+        # Direction: convert -1,1 to 0,2 for embedding index (1 reserved for padding/special tokens)
+        # -1 -> 0 (downlink), 1 -> 2 (uplink), padding/special -> 1
         directions_seq = [1]  # [CLS] gets neutral direction
         for d in token_directions:
             directions_seq.append(0 if d == -1 else 2)  # -1->0, 1->2
@@ -764,22 +780,31 @@ class RawPacketDataset(Dataset):
         # Padding
         while len(src) < self.seq_length:
             src.append(PAD_ID)
+            packet_ids.append(8)  # Padding gets special index 8
             directions_seq.append(1)  # Padding gets neutral direction
 
         # Apply masking
         if not self.dynamic_masking:
             src, tgt_mlm = mask_seq(src, self.tokenizer, self.whole_word_masking,
                                    self.span_masking, self.span_geo_prob, self.span_max_length)
-            instance = (src, tgt_mlm, directions_seq, protocol)
+            instance = (src, tgt_mlm, packet_ids, directions_seq)
         else:
-            instance = (src, directions_seq, protocol)
+            instance = (src, packet_ids, directions_seq)
 
         instances.append(instance)
         return instances
 
 
 class RawPacketDataLoader(DataLoader):
-    """DataLoader for Raw Packet modality"""
+    """
+    DataLoader for Raw Packet modality
+
+    Returns:
+        src: [batch, seq_len] - token IDs
+        tgt_mlm: [batch, seq_len] - MLM targets
+        packet_ids: [batch, seq_len] - packet indices (0-7 for packets, 8 for special/padding)
+        directions: [batch, seq_len] - direction indices (0=downlink, 1=neutral, 2=uplink)
+    """
 
     def __iter__(self):
         while True:
@@ -795,21 +820,21 @@ class RawPacketDataLoader(DataLoader):
 
             src = []
             tgt_mlm = []
+            packet_ids = []
             directions = []
-            protocols = []
 
             masked_words_num = 0
 
             for ins in instances:
-                if len(ins) == 4:  # Static masking
+                if len(ins) == 4:  # Static masking: (src, tgt_mlm, packet_ids, directions_seq)
                     src.append(ins[0])
                     masked_words_num += len(ins[1])
                     tgt_mlm.append([0] * len(ins[0]))
                     for mask in ins[1]:
                         tgt_mlm[-1][mask[0]] = mask[1]
-                    directions.append(ins[2])
-                    protocols.append(ins[3])
-                else:  # Dynamic masking
+                    packet_ids.append(ins[2])
+                    directions.append(ins[3])
+                else:  # Dynamic masking: (src, packet_ids, directions_seq)
                     src_single, tgt_mlm_single = mask_seq(
                         ins[0], self.tokenizer, self.whole_word_masking,
                         self.span_masking, self.span_geo_prob, self.span_max_length
@@ -819,16 +844,16 @@ class RawPacketDataLoader(DataLoader):
                     tgt_mlm.append([0] * len(ins[0]))
                     for mask in tgt_mlm_single:
                         tgt_mlm[-1][mask[0]] = mask[1]
-                    directions.append(ins[1])
-                    protocols.append(ins[2])
+                    packet_ids.append(ins[1])
+                    directions.append(ins[2])
 
             if masked_words_num == 0:
                 continue
 
             yield (torch.LongTensor(src),
                    torch.LongTensor(tgt_mlm),
-                   torch.LongTensor(directions),
-                   torch.LongTensor(protocols))
+                   torch.LongTensor(packet_ids),
+                   torch.LongTensor(directions))
 
 
 class PacketSizeDataset(Dataset):
@@ -868,7 +893,7 @@ class PacketSizeDataset(Dataset):
         pos = 0
         state = 'init'  # States: 'init', 'protocol', 'tokens'
 
-        dataset_writer = open("/tmp/dataset-size-tmp-" + str(proc_id) + ".pt", "wb")
+        dataset_writer = open("/tmp/" + str(proc_id) + ".pt", "wb")
 
         with open(self.corpus_path, mode="r", encoding="utf-8") as f:
             # Skip to start position
