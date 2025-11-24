@@ -268,7 +268,13 @@ class RawPacketMlmTrainer(Trainer):
 
 
 class PacketSizeMlmTrainer(Trainer):
-    """Trainer for Packet Size modality (Stage 1) - MLM only"""
+    """
+    Trainer for Packet Size modality - MLM only
+
+    New implementation using:
+    - token embedding (direction already encoded in size tokens)
+    - position embedding
+    """
 
     def __init__(self, args):
         super(PacketSizeMlmTrainer, self).__init__(args)
@@ -279,12 +285,15 @@ class PacketSizeMlmTrainer(Trainer):
     def forward_propagation(self, batch, model):
         """
         Batch format from PacketSizeDataLoader:
-        (src, tgt_mlm, protocols)
-        """
-        src, tgt_mlm, protocols = batch
+        (src, tgt_mlm)
 
-        # Forward pass with protocols
-        loss_mlm, correct_mlm, denominator = model(src, tgt_mlm, None, protocols)
+        src: [batch, seq_len] - size token IDs (direction encoded)
+        tgt_mlm: [batch, seq_len] - MLM targets
+        """
+        src, tgt_mlm = batch
+
+        # Forward pass (no additional inputs needed)
+        loss_mlm, correct_mlm, denominator = model(src, tgt_mlm)
 
         self.total_loss += loss_mlm.item()
         self.total_loss_mlm += loss_mlm.item()

@@ -978,9 +978,14 @@ class PacketSizeDataset(Dataset):
         return instances
 
     def create_ins_from_flow(self, all_flows, flow_index, flow_proto):
-        """Create training instances from a single flow"""
+        """
+        Create training instances from a single flow
+
+        Note: Protocol is ignored. Direction is already encoded in size tokens (size * direction + 1500)
+        Only token embedding + position embedding are used.
+        """
         tokens = all_flows[flow_index]
-        protocol = flow_proto[flow_index] if flow_index < len(flow_proto) else 0
+        # flow_proto is ignored as per requirements
 
         max_num_tokens = self.seq_length - 2  # Reserve for [CLS] and [SEP]
 
@@ -999,15 +1004,21 @@ class PacketSizeDataset(Dataset):
         if not self.dynamic_masking:
             src, tgt_mlm = mask_seq(src, self.tokenizer, self.whole_word_masking,
                                    self.span_masking, self.span_geo_prob, self.span_max_length)
-            instance = (src, tgt_mlm, protocol)
+            instance = (src, tgt_mlm)
         else:
-            instance = (src, protocol)
+            instance = (src,)
 
         return [instance]
 
 
 class PacketSizeDataLoader(DataLoader):
-    """DataLoader for Packet Size modality"""
+    """
+    DataLoader for Packet Size modality
+
+    Returns:
+        src: [batch, seq_len] - token IDs (direction already encoded in size tokens)
+        tgt_mlm: [batch, seq_len] - MLM targets
+    """
 
     def __iter__(self):
         while True:
@@ -1023,19 +1034,17 @@ class PacketSizeDataLoader(DataLoader):
 
             src = []
             tgt_mlm = []
-            protocols = []
 
             masked_words_num = 0
 
             for ins in instances:
-                if len(ins) == 3:  # Static masking
+                if len(ins) == 2:  # Static masking: (src, tgt_mlm)
                     src.append(ins[0])
                     masked_words_num += len(ins[1])
                     tgt_mlm.append([0] * len(ins[0]))
                     for mask in ins[1]:
                         tgt_mlm[-1][mask[0]] = mask[1]
-                    protocols.append(ins[2])
-                else:  # Dynamic masking
+                else:  # Dynamic masking: (src,)
                     src_single, tgt_mlm_single = mask_seq(
                         ins[0], self.tokenizer, self.whole_word_masking,
                         self.span_masking, self.span_geo_prob, self.span_max_length
@@ -1045,11 +1054,9 @@ class PacketSizeDataLoader(DataLoader):
                     tgt_mlm.append([0] * len(ins[0]))
                     for mask in tgt_mlm_single:
                         tgt_mlm[-1][mask[0]] = mask[1]
-                    protocols.append(ins[1])
 
             if masked_words_num == 0:
                 continue
 
             yield (torch.LongTensor(src),
-                   torch.LongTensor(tgt_mlm),
-                   torch.LongTensor(protocols))
+                   torch.LongTensor(tgt_mlm))
