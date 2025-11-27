@@ -17,7 +17,29 @@ def train_and_validate(args):
 
     # Load vocabulary.
     print("Load vocabulary.")
-    if args.spm_model_path:
+    if args.target == "multimodal":
+        # Multi-modal requires two vocabularies
+        print("Loading multi-modal vocabularies...")
+        vocab_raw = Vocab()
+        vocab_raw.load(args.vocab_path_raw)
+        args.vocab_raw = vocab_raw.w2i
+
+        vocab_size = Vocab()
+        vocab_size.load(args.vocab_path_size)
+        args.vocab_size = vocab_size.w2i
+
+        # Create tokenizers for both modalities
+        args.tokenizer_raw = str2tokenizer[args.tokenizer](args)
+        args.tokenizer_raw.vocab = vocab_raw.w2i
+
+        args.tokenizer_size = str2tokenizer[args.tokenizer](args)
+        args.tokenizer_size.vocab = vocab_size.w2i
+
+        # Set main vocab/tokenizer for compatibility
+        args.vocab = vocab_raw.w2i
+        args.tokenizer = args.tokenizer_raw
+
+    elif args.spm_model_path:
         try:
             import sentencepiece as spm
         except ImportError:
@@ -83,7 +105,7 @@ class Trainer(object):
 
         self.start_time = time.time()
         self.total_loss = 0.0
-        
+
         self.dist_train = args.dist_train
         self.batch_size = args.batch_size
         self.world_size = args.world_size
@@ -99,7 +121,6 @@ class Trainer(object):
     def train(self, args, gpu_id, rank, loader, model, optimizer, scheduler):
         model.train()
         loader_iter = iter(loader)
-        
         while True:
             if self.current_step == self.total_steps + 1:
                 break
@@ -118,6 +139,17 @@ class Trainer(object):
                 loss.backward()
 
             if self.current_step % self.accumulation_steps == 0:
+                # Gradient clipping to prevent gradient explosion
+                if hasattr(args, 'clip_grad_norm') and args.clip_grad_norm > 0:
+                    if args.fp16:
+                        torch.nn.utils.clip_grad_norm_(
+                            args.amp.master_params(optimizer), args.clip_grad_norm
+                        )
+                    else:
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), args.clip_grad_norm
+                        )
+
                 optimizer.step()
                 scheduler.step()
                 model.zero_grad()
@@ -326,10 +358,284 @@ class PacketSizeMlmTrainer(Trainer):
         self.total_denominator = 0.0
 
 
+class MultiModalTrainer(Trainer):
+    """
+    Trainer for Multi-Modal Pretraining (Stage 2)
+
+    Implements two-phase training:
+    - Phase 1 (0-70K steps): Freeze encoders, train fusion only
+    - Phase 2 (70K-100K steps): Joint training with differential LR
+
+    Tasks: CMM + CMMP + Balance Loss
+    """
+
+    def __init__(self, args):
+        super(MultiModalTrainer, self).__init__(args)
+
+        # Loss tracking
+        self.total_loss_cmm = 0.0
+        self.total_loss_cmmp = 0.0
+        self.total_loss_balance = 0.0
+
+        # Accuracy tracking
+        self.total_correct_cmm = 0.0
+        self.total_instances_cmm = 0.0
+        self.total_correct_cmmp = 0.0
+        self.total_denominator_cmmp = 0.0
+
+        # Gate weight tracking
+        self.total_g_raw = 0.0
+        self.total_g_size = 0.0
+
+        # Two-phase training parameters
+        self.phase1_steps = args.phase1_steps if hasattr(args, 'phase1_steps') else 70000
+        self.balance_loss_alpha = args.balance_loss_alpha if hasattr(args, 'balance_loss_alpha') else 0.1
+
+        # Phase transition flag
+        self.phase_transitioned = False
+
+    def forward_propagation(self, batch, model):
+        """
+        Batch format from MultiModalDataLoader (all positive samples):
+        (raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_size)
+
+        Implements hard negative sampling for CMM task:
+        1. Forward encoders to get features
+        2. Use hard_negative_sampling() to select negatives
+        3. Construct 50% positive + 50% negative batch
+        4. Forward fusion and target modules
+        """
+        raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_size = batch
+        batch_size = raw_src.size(0)
+
+        # ===== Step 1: Forward Encoders (for hard negative sampling) =====
+        # Get embeddings
+        if hasattr(model, 'module'):  # DistributedDataParallel
+            raw_emb = model.module.embedding_raw(raw_src, raw_packet_ids, raw_directions)
+            size_emb = model.module.embedding_size(size_src)
+        else:
+            raw_emb = model.embedding_raw(raw_src, raw_packet_ids, raw_directions)
+            size_emb = model.embedding_size(size_src)
+
+        # Create attention masks
+        from uer.utils.constants import PAD_ID
+        raw_seg = (raw_src != PAD_ID).long()
+        size_seg = (size_src != PAD_ID).long()
+
+        # Forward encoders
+        if hasattr(model, 'module'):
+            raw_output = model.module.encoder_raw(raw_emb, raw_seg)
+            size_output = model.module.encoder_size(size_emb, size_seg)
+        else:
+            raw_output = model.encoder_raw(raw_emb, raw_seg)
+            size_output = model.encoder_size(size_emb, size_seg)
+
+        # ===== Step 2: Hard Negative Sampling for CMM =====
+        # Extract [CLS] features (position 0)
+        raw_cls = raw_output[:, 0, :]  # [batch, hidden]
+        size_cls = size_output[:, 0, :]  # [batch, hidden]
+
+        # Use hard negative sampling to select negatives
+        from uer.targets.multimodal_target import hard_negative_sampling
+        neg_indices = hard_negative_sampling(raw_cls, size_cls, temperature=0.07)  # [batch]
+
+        # ===== Step 3: Construct 50% Positive + 50% Negative Batch =====
+        # Determine which samples should be positive vs negative
+        import random
+        import torch
+        cmm_labels = []
+        final_size_output = []
+
+        for i in range(batch_size):
+            if random.random() < 0.5:
+                # Positive sample: use original matched Size
+                cmm_labels.append(1)
+                final_size_output.append(size_output[i])
+            else:
+                # Negative sample: use hard negative Size
+                cmm_labels.append(0)
+                neg_idx = neg_indices[i].item()
+                final_size_output.append(size_output[neg_idx])
+
+        tgt_cmm = torch.tensor(cmm_labels, dtype=torch.long, device=raw_src.device)
+        size_output_final = torch.stack(final_size_output, dim=0)  # [batch, seq_len, hidden]
+
+        # ===== Step 4: Forward Fusion and Target =====
+        if hasattr(model, 'module'):
+            fusion = model.module.fusion
+            target = model.module.target
+        else:
+            fusion = model.fusion
+            target = model.target
+
+        # Fusion
+        raw_fused, size_fused, (g_raw, g_size) = fusion(
+            raw_output, size_output_final, return_gate_weights=True
+        )
+
+        # Target (CMM + CMMP)
+        cmm_loss, cmmp_loss, cmm_correct, cmmp_correct, cmmp_denominator = target(
+            raw_fused, size_fused, tgt_cmm, tgt_cmmp_size
+        )
+
+        # Balance loss
+        from uer.layers.multimodal_fusion import compute_balance_loss
+        balance_loss = compute_balance_loss(g_raw, g_size, target_ratio=0.5)
+
+        # Combined loss
+        loss = cmm_loss + cmmp_loss + self.balance_loss_alpha * balance_loss
+
+        # Update statistics
+        self.total_loss += loss.item()
+        self.total_loss_cmm += cmm_loss.item()
+        self.total_loss_cmmp += cmmp_loss.item()
+        self.total_loss_balance += balance_loss.item()
+
+        self.total_correct_cmm += cmm_correct.item()
+        self.total_instances_cmm += batch_size
+
+        self.total_correct_cmmp += cmmp_correct.item()
+        self.total_denominator_cmmp += cmmp_denominator.item()
+
+        self.total_g_raw += g_raw.mean().item()
+        self.total_g_size += g_size.mean().item()
+
+        # Scale loss for gradient accumulation
+        loss = loss / self.accumulation_steps
+
+        return loss
+
+    def report_and_reset_stats(self):
+        done_tokens = self.batch_size * self.seq_length * self.report_steps
+        if self.dist_train:
+            done_tokens *= self.world_size
+
+        # Compute averages
+        avg_loss = self.total_loss / self.report_steps
+        avg_loss_cmm = self.total_loss_cmm / self.report_steps
+        avg_loss_cmmp = self.total_loss_cmmp / self.report_steps
+        avg_loss_balance = self.total_loss_balance / self.report_steps
+
+        acc_cmm = self.total_correct_cmm / self.total_instances_cmm if self.total_instances_cmm > 0 else 0.0
+        acc_cmmp = self.total_correct_cmmp / self.total_denominator_cmmp if self.total_denominator_cmmp > 0 else 0.0
+
+        avg_g_raw = self.total_g_raw / self.report_steps
+        avg_g_size = self.total_g_size / self.report_steps
+
+        # Determine current phase
+        phase = "Phase1" if self.current_step <= self.phase1_steps else "Phase2"
+
+        print("| {:8d}/{:8d} steps"
+              " | {} |"
+              " {:3.3f} s"
+              " | {:8.2f} tokens/s"
+              " | loss {:7.2f}"
+              " | cmm: {:3.3f}"
+              " | cmmp: {:3.3f}"
+              " | bal: {:3.3f}"
+              " | acc_cmm: {:3.3f}"
+              " | acc_cmmp: {:3.3f}"
+              " | g_raw: {:3.3f}"
+              " | g_size: {:3.3f}".format(
+            self.current_step,
+            self.total_steps,
+            phase,
+            (time.time() - self.start_time),
+            done_tokens / (time.time() - self.start_time),
+            avg_loss,
+            avg_loss_cmm,
+            avg_loss_cmmp,
+            avg_loss_balance,
+            acc_cmm,
+            acc_cmmp,
+            avg_g_raw,
+            avg_g_size
+        ))
+
+        # Reset statistics
+        self.total_loss = 0.0
+        self.total_loss_cmm = 0.0
+        self.total_loss_cmmp = 0.0
+        self.total_loss_balance = 0.0
+
+        self.total_correct_cmm = 0.0
+        self.total_instances_cmm = 0.0
+        self.total_correct_cmmp = 0.0
+        self.total_denominator_cmmp = 0.0
+
+        self.total_g_raw = 0.0
+        self.total_g_size = 0.0
+
+    def train(self, args, gpu_id, rank, loader, model, optimizer, scheduler):
+        """
+        Training loop with two-phase logic
+        """
+        model.train()
+        loader_iter = iter(loader)
+
+        while True:
+            if self.current_step == self.total_steps + 1:
+                break
+
+            # Phase transition: Unfreeze encoders at phase1_steps
+            if self.current_step == self.phase1_steps + 1 and not self.phase_transitioned:
+                print("TRANSITIONING TO PHASE 2: Unfreezing encoders")
+
+                if hasattr(model, 'module'):  # DistributedDataParallel
+                    model.module.unfreeze_encoders()
+                else:
+                    model.unfreeze_encoders()
+
+                self.phase_transitioned = True
+
+            batch = list(next(loader_iter))
+            self.seq_length = batch[0].size(1)  # Use raw_src length
+
+            if gpu_id is not None:
+                for i in range(len(batch)):
+                    batch[i] = batch[i].cuda(gpu_id)
+
+            loss = self.forward_propagation(batch, model)
+
+            if args.fp16:
+                with args.amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
+            if self.current_step % self.accumulation_steps == 0:
+                # Gradient clipping
+                if hasattr(args, 'clip_grad_norm') and args.clip_grad_norm > 0:
+                    if args.fp16:
+                        torch.nn.utils.clip_grad_norm_(
+                            args.amp.master_params(optimizer), args.clip_grad_norm
+                        )
+                    else:
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), args.clip_grad_norm
+                        )
+
+                optimizer.step()
+                scheduler.step()
+                model.zero_grad()
+
+            if self.current_step % self.report_steps == 0 and \
+                    (not self.dist_train or (self.dist_train and rank == 0)):
+                self.report_and_reset_stats()
+                self.start_time = time.time()
+
+            if self.current_step % self.save_checkpoint_steps == 0 and \
+                    (not self.dist_train or (self.dist_train and rank == 0)):
+                save_model(model, self.output_model_path + "-" + str(self.current_step))
+
+            self.current_step += 1
+
+
 str2trainer = {
     "bertflow": BertTrainer,
     "raw_packet": RawPacketMlmTrainer,
-    "packet_size": PacketSizeMlmTrainer
+    "packet_size": PacketSizeMlmTrainer,
+    "multimodal": MultiModalTrainer
 }
 
 def worker(proc_id, gpu_ranks, args, model):    

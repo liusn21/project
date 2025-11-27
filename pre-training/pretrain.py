@@ -62,7 +62,7 @@ def main():
     parser.add_argument("--decoder", choices=["transformer"], default="transformer", help="Decoder type.")
     parser.add_argument("--pooling", choices=["mean", "max", "first", "last"], default="first",
                         help="Pooling type.")
-    parser.add_argument("--target", choices=["bert","bertflow","lm", "mlm", "bilm", "albert", "seq2seq", "t5", "cls", "prefixlm", "raw_packet", "packet_size"], default="bert",
+    parser.add_argument("--target", choices=["bert","bertflow","lm", "mlm", "bilm", "albert", "seq2seq", "t5", "cls", "prefixlm", "raw_packet", "packet_size", "multimodal"], default="bert",
                         help="The training target of the pretraining model.")
     parser.add_argument("--tie_weights", action="store_true",
                         help="Tie the word embedding and softmax weights.")
@@ -89,6 +89,26 @@ def main():
 
     # Optimizer options.
     optimization_opts(parser)
+
+    # Multi-Modal options (Stage 2).
+    parser.add_argument("--vocab_path_raw", default=None, type=str,
+                        help="Path of the vocabulary file for Raw Packet modality.")
+    parser.add_argument("--vocab_path_size", default=None, type=str,
+                        help="Path of the vocabulary file for Packet Size modality.")
+    parser.add_argument("--corpus_path_raw", default=None, type=str,
+                        help="Path of the corpus file for Raw Packet modality.")
+    parser.add_argument("--corpus_path_size", default=None, type=str,
+                        help="Path of the corpus file for Packet Size modality.")
+    parser.add_argument("--pretrained_raw_path", default=None, type=str,
+                        help="Path of the pretrained Raw Packet encoder.")
+    parser.add_argument("--pretrained_size_path", default=None, type=str,
+                        help="Path of the pretrained Packet Size encoder.")
+    parser.add_argument("--freeze_encoders", action="store_true",
+                        help="Freeze encoder parameters in Phase 1 (multimodal only).")
+    parser.add_argument("--phase1_steps", type=int, default=70000,
+                        help="Number of steps for Phase 1 with frozen encoders (multimodal only).")
+    parser.add_argument("--balance_loss_alpha", type=float, default=0.1,
+                        help="Weight for balance loss in multimodal training.")
 
     # GPU options.
     parser.add_argument("--world_size", type=int, default=1, help="Total number of processes (GPUs) for training.")

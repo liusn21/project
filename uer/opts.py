@@ -46,6 +46,8 @@ def optimization_opts(parser):
     parser.add_argument("--scheduler", choices=["linear", "cosine", "cosine_with_restarts", "polynomial",
                                                 "constant", "constant_with_warmup"],
                         default="linear", help="Scheduler type.")
+    parser.add_argument("--clip_grad_norm", type=float, default=1.0,
+                        help="Maximum gradient norm for clipping. Set to 0 to disable.")
 
 
 def training_opts(parser):

@@ -1060,3 +1060,354 @@ class PacketSizeDataLoader(DataLoader):
 
             yield (torch.LongTensor(src),
                    torch.LongTensor(tgt_mlm))
+
+
+# ============================================================================
+# Stage 2: Multi-Modal Dataset (Raw Packet + Packet Size)
+# ============================================================================
+
+class MultiModalDataset(Dataset):
+    """
+    Dataset for Multi-Modal Pretraining (Stage 2)
+
+    Loads paired Raw Packet + Packet Size data for CMM and CMMP tasks
+
+    Requires:
+        - corpus_path_raw: Path to raw packet corpus
+        - corpus_path_size: Path to packet size corpus
+
+    Both corpora must have the same flows in the same order.
+    """
+
+    def __init__(self, args, vocab_raw, vocab_size, tokenizer_raw, tokenizer_size):
+        # Initialize base class with raw vocab/tokenizer (for compatibility)
+        super(MultiModalDataset, self).__init__(args, vocab_raw, tokenizer_raw)
+
+        # Store both vocabularies and tokenizers
+        self.vocab_raw = vocab_raw
+        self.vocab_size = vocab_size
+        self.tokenizer_raw = tokenizer_raw
+        self.tokenizer_size = tokenizer_size
+
+        # Corpus paths
+        self.corpus_path_raw = args.corpus_path_raw
+        self.corpus_path_size = args.corpus_path_size
+
+        self.short_seq_prob = args.short_seq_prob
+
+    def worker(self, proc_id, start, end):
+        print("Worker %d is building multi-modal dataset..." % proc_id)
+        set_seed(self.seed)
+
+        # Buffers for both modalities
+        raw_flow_buffer = []       # List of flows for Raw modality
+        raw_proto_buffer = []
+        raw_directions_buffer = []
+
+        size_flow_buffer = []      # List of flows for Size modality
+        size_proto_buffer = []
+
+        dataset_writer = open("/tmp/" + str(proc_id) + ".pt", "wb")
+
+        # Open both corpus files
+        with open(self.corpus_path_raw, mode="r", encoding="utf-8") as f_raw, \
+             open(self.corpus_path_size, mode="r", encoding="utf-8") as f_size:
+
+            # Skip to start position in both files
+            for _ in range(start):
+                f_raw.readline()
+                f_size.readline()
+
+            pos = start
+
+            while pos < end:
+                # Parse one flow from each modality
+                raw_packets, raw_proto, raw_directions = self._parse_raw_flow(f_raw)
+                size_tokens, size_proto = self._parse_size_flow(f_size)
+
+                pos += self._count_lines_in_flow(raw_packets)
+
+                if raw_packets is None or size_tokens is None:
+                    break
+
+                # Add to buffers
+                raw_flow_buffer.append(raw_packets)
+                raw_proto_buffer.append(raw_proto)
+                raw_directions_buffer.append(raw_directions)
+
+                size_flow_buffer.append(size_tokens)
+                size_proto_buffer.append(size_proto)
+
+                # Check if buffer is full
+                total_flows = len(raw_flow_buffer)
+                if total_flows > self.docs_buffer_size:
+                    instances = self.build_instances(
+                        raw_flow_buffer, raw_proto_buffer, raw_directions_buffer,
+                        size_flow_buffer, size_proto_buffer
+                    )
+                    for instance in instances:
+                        pickle.dump(instance, dataset_writer)
+
+                    # Clear buffers
+                    raw_flow_buffer = []
+                    raw_proto_buffer = []
+                    raw_directions_buffer = []
+                    size_flow_buffer = []
+                    size_proto_buffer = []
+
+            # Process remaining buffer
+            if len(raw_flow_buffer) > 0:
+                instances = self.build_instances(
+                    raw_flow_buffer, raw_proto_buffer, raw_directions_buffer,
+                    size_flow_buffer, size_proto_buffer
+                )
+                for instance in instances:
+                    pickle.dump(instance, dataset_writer)
+
+        dataset_writer.close()
+        print("Worker %d finished." % proc_id)
+
+    def _parse_raw_flow(self, f):
+        """Parse one flow from raw packet corpus"""
+        line = f.readline().strip()
+        if not line or line != "||":
+            return None, None, None
+
+        # Read protocol
+        proto_line = f.readline().strip()
+        try:
+            proto_num = int(proto_line)
+            protocol = 0 if proto_num == 6 else 1
+        except:
+            protocol = 0
+
+        # Read packets
+        packets = []
+        directions = []
+
+        while True:
+            line = f.readline()
+            if not line or line.strip() == "||":
+                # Put back the separator
+                if line and line.strip() == "||":
+                    f.seek(f.tell() - len(line))
+                break
+
+            line = line.strip()
+            if not line:
+                continue
+
+            parts = line.split(' ', 1)
+            if len(parts) < 2:
+                continue
+
+            try:
+                direction = int(parts[0])
+            except:
+                direction = 1
+
+            tokens = self.tokenizer_raw.convert_tokens_to_ids(
+                self.tokenizer_raw.tokenize(parts[1])
+            )
+
+            if len(tokens) > 0:
+                packets.append(tokens)
+                directions.append(direction)
+
+        return packets, protocol, directions
+
+    def _parse_size_flow(self, f):
+        """Parse one flow from packet size corpus"""
+        line = f.readline().strip()
+        if not line or line != "||":
+            return None, None
+
+        # Read protocol
+        proto_line = f.readline().strip()
+        try:
+            proto_num = int(proto_line)
+            protocol = 0 if proto_num == 6 else 1
+        except:
+            protocol = 0
+
+        # Read size tokens (single line)
+        line = f.readline().strip()
+        if not line:
+            return [], protocol
+
+        tokens = self.tokenizer_size.convert_tokens_to_ids(
+            self.tokenizer_size.tokenize(line)
+        )
+
+        return tokens, protocol
+
+    def _count_lines_in_flow(self, packets):
+        """Count lines in one flow (for position tracking)"""
+        return 2 + len(packets) + 1  # || + protocol + packets + (next ||)
+
+    def build_instances(self, raw_flows, raw_protos, raw_directions_list,
+                       size_flows, size_protos):
+        """Build paired instances from both modalities"""
+        instances = []
+
+        for _ in range(self.dup_factor):
+            for flow_idx in range(len(raw_flows)):
+                instance = self.create_ins_from_paired_flow(
+                    raw_flows[flow_idx], raw_protos[flow_idx], raw_directions_list[flow_idx],
+                    size_flows[flow_idx], size_protos[flow_idx]
+                )
+                if instance is not None:
+                    instances.append(instance)
+
+        return instances
+
+    def create_ins_from_paired_flow(self, raw_packets, raw_proto, raw_directions,
+                                     size_tokens, size_proto):
+        """
+        Create one instance from paired Raw + Size flow
+
+        Returns:
+            (raw_src, raw_packet_ids, raw_directions_seq, size_src)
+
+        Note: Masking is done in DataLoader using mask_seq()
+        """
+        max_raw_tokens = 512 - 2  # Raw Packet max length
+        max_size_tokens = 256 - 2  # Packet Size max length
+
+        # ===== Process Raw Packet =====
+        raw_tokens = []
+        raw_pkt_indices = []
+        raw_dir_values = []
+
+        for pkt_idx, pkt_tokens in enumerate(raw_packets):
+            if pkt_idx >= 8:  # Limit to 8 packets
+                break
+
+            pkt_direction = raw_directions[pkt_idx] if pkt_idx < len(raw_directions) else 1
+
+            raw_tokens.extend(pkt_tokens)
+            raw_pkt_indices.extend([pkt_idx] * len(pkt_tokens))
+            raw_dir_values.extend([pkt_direction] * len(pkt_tokens))
+
+        # Truncate
+        if len(raw_tokens) > max_raw_tokens:
+            raw_tokens = raw_tokens[:max_raw_tokens]
+            raw_pkt_indices = raw_pkt_indices[:max_raw_tokens]
+            raw_dir_values = raw_dir_values[:max_raw_tokens]
+
+        # Build Raw sequence
+        raw_src = [self.vocab_raw.get(CLS_TOKEN)] + raw_tokens + [self.vocab_raw.get(SEP_TOKEN)]
+
+        raw_packet_ids = [8] + raw_pkt_indices + [8]
+
+        raw_directions_seq = [1]  # [CLS] neutral
+        for d in raw_dir_values:
+            raw_directions_seq.append(0 if d == -1 else 2)
+        raw_directions_seq.append(1)  # [SEP] neutral
+
+        # Padding
+        while len(raw_src) < 512:
+            raw_src.append(PAD_ID)
+            raw_packet_ids.append(8)
+            raw_directions_seq.append(1)
+
+        # ===== Process Packet Size =====
+        # Truncate
+        if len(size_tokens) > max_size_tokens:
+            size_tokens = size_tokens[:max_size_tokens]
+
+        # Build Size sequence (NO masking - done in DataLoader)
+        size_src = [self.vocab_size.get(CLS_TOKEN)] + size_tokens + [self.vocab_size.get(SEP_TOKEN)]
+
+        # Padding
+        while len(size_src) < 256:
+            size_src.append(PAD_ID)
+
+        return (raw_src, raw_packet_ids, raw_directions_seq, size_src)
+
+
+class MultiModalDataLoader(DataLoader):
+    """
+    DataLoader for Multi-Modal Pretraining (Stage 2)
+
+    Returns positive (matching) samples only.
+    CMM negative sampling and hard negative mining are done in Trainer.
+
+    Returns:
+        raw_src: [batch, 512] - Raw Packet tokens (no masking)
+        raw_packet_ids: [batch, 512] - Packet indices
+        raw_directions: [batch, 512] - Direction indices
+        size_src: [batch, 256] - Size tokens (15% masked for CMMP)
+        tgt_cmmp_size: [batch, 256] - CMMP targets (0 for unmasked, token_id for masked)
+    """
+
+    def __init__(self, args, dataset_path, batch_size, proc_id, proc_num, shuffle=False):
+        super(MultiModalDataLoader, self).__init__(
+            args, dataset_path, batch_size, proc_id, proc_num, shuffle
+        )
+        # Store Size vocab and tokenizer for masking
+        self.vocab_size = args.vocab_size
+        self.tokenizer_size = args.tokenizer_size
+
+    def __iter__(self):
+        while True:
+            while self._empty():
+                self._fill_buf()
+
+            if self.start + self.batch_size >= self.end:
+                instances = self.buffer[self.start:]
+            else:
+                instances = self.buffer[self.start: self.start + self.batch_size]
+
+            self.start += self.batch_size
+
+            # Batch lists
+            raw_src_batch = []
+            raw_packet_ids_batch = []
+            raw_directions_batch = []
+            size_src_batch = []
+            tgt_cmmp_size_batch = []
+
+            masked_words_num = 0
+
+            for ins in instances:
+                # Instance format: (raw_src, raw_packet_ids, raw_directions_seq, size_src)
+                raw_src, raw_packet_ids, raw_directions_seq, size_src = ins
+
+                # Append Raw modality data (no masking)
+                raw_src_batch.append(raw_src)
+                raw_packet_ids_batch.append(raw_packet_ids)
+                raw_directions_batch.append(raw_directions_seq)
+
+                # ===== Apply CMMP Masking using mask_seq() =====
+                # mask_seq expects a list and returns (masked_src, tgt_mlm)
+                # tgt_mlm is list of (position, token) tuples
+                size_src_masked, tgt_mlm = mask_seq(
+                    size_src.copy(),  # Copy to avoid modifying original
+                    self.tokenizer_size,
+                    self.whole_word_masking,
+                    self.span_masking,
+                    self.span_geo_prob,
+                    self.span_max_length
+                )
+
+                masked_words_num += len(tgt_mlm)
+
+                # Convert tgt_mlm from list of tuples to full sequence format
+                # [0, 0, token_id, 0, ...] where token_id is the original token at masked positions
+                tgt_cmmp = [0] * len(size_src)
+                for pos, token in tgt_mlm:
+                    tgt_cmmp[pos] = token
+
+                size_src_batch.append(size_src_masked)
+                tgt_cmmp_size_batch.append(tgt_cmmp)
+
+            # Skip batch if no masked words (should rarely happen)
+            if masked_words_num == 0:
+                continue
+
+            yield (torch.LongTensor(raw_src_batch),
+                   torch.LongTensor(raw_packet_ids_batch),
+                   torch.LongTensor(raw_directions_batch),
+                   torch.LongTensor(size_src_batch),
+                   torch.LongTensor(tgt_cmmp_size_batch))
