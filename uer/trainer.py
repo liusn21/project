@@ -66,8 +66,6 @@ def train_and_validate(args):
     # Build model.
     print("Build model.")
     model = build_model(args)
-    # for name,parameters in model.named_parameters():
-    #     print(name,':',parameters.size())
 
     # Load or initialize parameters.
     if args.pretrained_model_path is not None:
@@ -111,11 +109,9 @@ class Trainer(object):
         self.world_size = args.world_size
 
     def forward_propagation(self, batch, model):
-
         raise NotImplementedError
 
     def report_and_reset_stats(self):
-
         raise NotImplementedError
 
     def train(self, args, gpu_id, rank, loader, model, optimizer, scheduler):
@@ -139,7 +135,6 @@ class Trainer(object):
                 loss.backward()
 
             if self.current_step % self.accumulation_steps == 0:
-                # Gradient clipping to prevent gradient explosion
                 if hasattr(args, 'clip_grad_norm') and args.clip_grad_norm > 0:
                     if args.fp16:
                         torch.nn.utils.clip_grad_norm_(
@@ -164,7 +159,7 @@ class Trainer(object):
                 save_model(model, self.output_model_path + "-" + str(self.current_step))
 
             self.current_step += 1
-        
+
 
 class BertTrainer(Trainer):
     def __init__(self, args):
@@ -236,16 +231,9 @@ class BertTrainer(Trainer):
         self.total_correct_mlm, self.total_denominator = 0.0, 0.0
         self.total_correct_sp, self.total_instances = 0.0, 0.0
 
-class RawPacketMlmTrainer(Trainer):
-    """
-    Trainer for Raw Packet modality - MLM only
 
-    New implementation using:
-    - token embedding
-    - position embedding
-    - packet embedding (0-7 for packets, 8 for special/padding)
-    - direction embedding (0=downlink, 1=neutral, 2=uplink)
-    """
+class RawPacketMlmTrainer(Trainer):
+    """Trainer for Raw Packet modality - MLM only"""
 
     def __init__(self, args):
         super(RawPacketMlmTrainer, self).__init__(args)
@@ -254,18 +242,7 @@ class RawPacketMlmTrainer(Trainer):
         self.total_denominator = 0.0
 
     def forward_propagation(self, batch, model):
-        """
-        Batch format from RawPacketDataLoader:
-        (src, tgt_mlm, packet_ids, directions)
-
-        src: [batch, seq_len] - token IDs
-        tgt_mlm: [batch, seq_len] - MLM targets
-        packet_ids: [batch, seq_len] - packet indices (0-7 for packets, 8 for special/padding)
-        directions: [batch, seq_len] - direction indices (0=downlink, 1=neutral, 2=uplink)
-        """
         src, tgt_mlm, packet_ids, directions = batch
-
-        # Forward pass with packet_ids and directions
         loss_mlm, correct_mlm, denominator = model(src, tgt_mlm, packet_ids, directions)
 
         self.total_loss += loss_mlm.item()
@@ -300,13 +277,7 @@ class RawPacketMlmTrainer(Trainer):
 
 
 class PacketSizeMlmTrainer(Trainer):
-    """
-    Trainer for Packet Size modality - MLM only
-
-    New implementation using:
-    - token embedding (direction already encoded in size tokens)
-    - position embedding
-    """
+    """Trainer for Packet Size modality - MLM only"""
 
     def __init__(self, args):
         super(PacketSizeMlmTrainer, self).__init__(args)
@@ -315,16 +286,7 @@ class PacketSizeMlmTrainer(Trainer):
         self.total_denominator = 0.0
 
     def forward_propagation(self, batch, model):
-        """
-        Batch format from PacketSizeDataLoader:
-        (src, tgt_mlm)
-
-        src: [batch, seq_len] - size token IDs (direction encoded)
-        tgt_mlm: [batch, seq_len] - MLM targets
-        """
         src, tgt_mlm = batch
-
-        # Forward pass (no additional inputs needed)
         loss_mlm, correct_mlm, denominator = model(src, tgt_mlm)
 
         self.total_loss += loss_mlm.item()
@@ -391,7 +353,7 @@ class MultiModalTrainer(Trainer):
         self.phase1_steps = args.phase1_steps if hasattr(args, 'phase1_steps') else 70000
         self.balance_loss_alpha = args.balance_loss_alpha if hasattr(args, 'balance_loss_alpha') else 0.1
 
-        # CMM temperature parameter (可配置，默认0.07)
+        # CMM temperature parameter
         self.cmm_temperature = getattr(args, 'cmm_temperature', 0.07)
 
         # Phase transition flag
@@ -399,47 +361,25 @@ class MultiModalTrainer(Trainer):
 
     def forward_propagation(self, batch, model):
         """
-        NEW ARCHITECTURE v2 (Both CMM and CMMP after Fusion)
+        Forward pass for multimodal pretraining
 
-        Batch format from MultiModalDataLoader (all positive samples):
-        (raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_size)
-
-        Key changes (v2):
-        1. Forward encoders (all samples are positive pairs)
-        2. Fusion on all positive samples
-        3. CMMP task AFTER Fusion (MLM on fused features)
-        4. CMM task AFTER Fusion (ITM with dynamic negative sampling)
-
-        This ensures:
-        - Phase 1 (freeze encoder): All losses can train fusion/target ✅
-        - CMM uses fused features (higher quality) ✅
-        - CMMP uses fused features (semantically correct) ✅
-        - Negative samples: Dynamic hard negative mining in batch ✅
-
-        Flow:
-        1. Forward encoders (only Size is masked, Raw is not masked)
-        2. Fusion on positive samples
-        3. CMMP task (MLM) using fused features
-        4. CMM task (ITM) using fused [CLS] with dynamic negative sampling
+        Batch format: (raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_size)
         """
         raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_size = batch
         batch_size = raw_src.size(0)
 
         # ===== Step 1: Forward Encoders =====
-        # Get embeddings
-        if hasattr(model, 'module'):  # DistributedDataParallel
+        if hasattr(model, 'module'):
             raw_emb = model.module.embedding_raw(raw_src, raw_packet_ids, raw_directions)
             size_emb = model.module.embedding_size(size_src)
         else:
             raw_emb = model.embedding_raw(raw_src, raw_packet_ids, raw_directions)
             size_emb = model.embedding_size(size_src)
 
-        # Create attention masks
         from uer.utils.constants import PAD_ID
         raw_seg = (raw_src != PAD_ID).long()
         size_seg = (size_src != PAD_ID).long()
 
-        # Forward encoders (only Size is masked, Raw is not masked)
         if hasattr(model, 'module'):
             raw_output = model.module.encoder_raw(raw_emb, raw_seg)
             size_output = model.module.encoder_size(size_emb, size_seg)
@@ -447,7 +387,7 @@ class MultiModalTrainer(Trainer):
             raw_output = model.encoder_raw(raw_emb, raw_seg)
             size_output = model.encoder_size(size_emb, size_seg)
 
-        # ===== Step 2: Fusion (All positive samples) =====
+        # ===== Step 2: Fusion =====
         if hasattr(model, 'module'):
             fusion = model.module.fusion
             target = model.module.target
@@ -455,8 +395,6 @@ class MultiModalTrainer(Trainer):
             fusion = model.fusion
             target = model.target
 
-        # Fusion processes all positive pairs
-        # 传递seg信息以正确mask padding positions
         raw_fused, size_fused, (g_raw, g_size) = fusion(
             raw_output, size_output,
             raw_seg=raw_seg,
@@ -464,13 +402,12 @@ class MultiModalTrainer(Trainer):
             return_gate_weights=True
         )
 
-        # ===== Step 3: CMMP Task (AFTER Fusion, MLM on positive samples) =====
+        # ===== Step 3: CMMP Task =====
         cmmp_loss, cmmp_correct, cmmp_denominator = target.forward_cmmp_only(
             size_fused, tgt_cmmp_size
         )
 
-        # ===== Step 4: CMM Task (AFTER Fusion, ITM with dynamic negatives) =====
-        # 使用fused [CLS] features，动态构建负样本
+        # ===== Step 4: CMM Task =====
         cmm_loss, cmm_correct = target.forward_cmm_itm(
             raw_fused, size_fused, temperature=self.cmm_temperature
         )
@@ -482,26 +419,22 @@ class MultiModalTrainer(Trainer):
         # ===== Step 6: Combined Loss =====
         loss = cmm_loss + cmmp_loss + self.balance_loss_alpha * balance_loss
 
-        # ===== Update Statistics =====
+        # Update Statistics
         self.total_loss += loss.item()
         self.total_loss_cmm += cmm_loss.item()
         self.total_loss_cmmp += cmmp_loss.item()
         self.total_loss_balance += balance_loss.item()
 
-        # CMM: batch_size samples (random 50% positive + 50% negative)
         self.total_correct_cmm += cmm_correct.item()
         self.total_instances_cmm += batch_size
 
-        # CMMP: only on positive samples
         self.total_correct_cmmp += cmmp_correct.item()
         self.total_denominator_cmmp += cmmp_denominator.item()
 
         self.total_g_raw += g_raw.mean().item()
         self.total_g_size += g_size.mean().item()
 
-        # Scale loss for gradient accumulation
         loss = loss / self.accumulation_steps
-
         return loss
 
     def report_and_reset_stats(self):
@@ -509,7 +442,6 @@ class MultiModalTrainer(Trainer):
         if self.dist_train:
             done_tokens *= self.world_size
 
-        # Compute averages
         avg_loss = self.total_loss / self.report_steps
         avg_loss_cmm = self.total_loss_cmm / self.report_steps
         avg_loss_cmmp = self.total_loss_cmmp / self.report_steps
@@ -521,7 +453,6 @@ class MultiModalTrainer(Trainer):
         avg_g_raw = self.total_g_raw / self.report_steps
         avg_g_size = self.total_g_size / self.report_steps
 
-        # Determine current phase
         phase = "Phase1" if self.current_step <= self.phase1_steps else "Phase2"
 
         print("| {:8d}/{:8d} steps"
@@ -536,19 +467,11 @@ class MultiModalTrainer(Trainer):
               " | acc_cmmp: {:3.3f}"
               " | g_raw: {:3.3f}"
               " | g_size: {:3.3f}".format(
-            self.current_step,
-            self.total_steps,
-            phase,
+            self.current_step, self.total_steps, phase,
             (time.time() - self.start_time),
             done_tokens / (time.time() - self.start_time),
-            avg_loss,
-            avg_loss_cmm,
-            avg_loss_cmmp,
-            avg_loss_balance,
-            acc_cmm,
-            acc_cmmp,
-            avg_g_raw,
-            avg_g_size
+            avg_loss, avg_loss_cmm, avg_loss_cmmp, avg_loss_balance,
+            acc_cmm, acc_cmmp, avg_g_raw, avg_g_size
         ))
 
         # Reset statistics
@@ -556,19 +479,15 @@ class MultiModalTrainer(Trainer):
         self.total_loss_cmm = 0.0
         self.total_loss_cmmp = 0.0
         self.total_loss_balance = 0.0
-
         self.total_correct_cmm = 0.0
         self.total_instances_cmm = 0.0
         self.total_correct_cmmp = 0.0
         self.total_denominator_cmmp = 0.0
-
         self.total_g_raw = 0.0
         self.total_g_size = 0.0
 
     def train(self, args, gpu_id, rank, loader, model, optimizer, scheduler):
-        """
-        Training loop with two-phase logic
-        """
+        """Training loop with two-phase logic"""
         model.train()
         loader_iter = iter(loader)
 
@@ -579,16 +498,14 @@ class MultiModalTrainer(Trainer):
             # Phase transition: Unfreeze encoders at phase1_steps
             if self.current_step == self.phase1_steps + 1 and not self.phase_transitioned:
                 print("TRANSITIONING TO PHASE 2: Unfreezing encoders")
-
-                if hasattr(model, 'module'):  # DistributedDataParallel
+                if hasattr(model, 'module'):
                     model.module.unfreeze_encoders()
                 else:
                     model.unfreeze_encoders()
-
                 self.phase_transitioned = True
 
             batch = list(next(loader_iter))
-            self.seq_length = batch[0].size(1)  # Use raw_src length
+            self.seq_length = batch[0].size(1)
 
             if gpu_id is not None:
                 for i in range(len(batch)):
@@ -603,7 +520,6 @@ class MultiModalTrainer(Trainer):
                 loss.backward()
 
             if self.current_step % self.accumulation_steps == 0:
-                # Gradient clipping
                 if hasattr(args, 'clip_grad_norm') and args.clip_grad_norm > 0:
                     if args.fp16:
                         torch.nn.utils.clip_grad_norm_(
@@ -637,8 +553,11 @@ str2trainer = {
     "multimodal": MultiModalTrainer
 }
 
+
 def worker(proc_id, gpu_ranks, args, model):    
     """
+    Worker function for training
+
     Args:
         proc_id: The id of GPU for single GPU mode;
                  The id of process (and GPU) for multiprocessing distributed mode.
@@ -657,6 +576,7 @@ def worker(proc_id, gpu_ranks, args, model):
     else:
         rank = None
         gpu_id = None
+
     print("train loader constructing...")
     if args.dist_train:
         train_loader = str2dataloader[args.target](args, args.dataset_path, args.batch_size, rank, args.world_size, True)
@@ -668,18 +588,60 @@ def worker(proc_id, gpu_ranks, args, model):
         model.cuda(gpu_id)
 
     # Build optimizer.
-    print("build optomizer...")
+    print("Building optimizer...")
     param_optimizer = list(model.named_parameters())
     no_decay = ["bias", "gamma", "beta"]
-    optimizer_grouped_parameters = [
-        {"params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], "weight_decay_rate": 0.01},
-        {"params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], "weight_decay_rate": 0.0}
-    ]
+
+    # 差异化学习率: multimodal 模式下 encoder 使用更小的学习率
+    if args.target == "multimodal":
+        encoder_lr_ratio = getattr(args, 'encoder_lr_ratio', 0.1)  # encoder 学习率倍率，默认 0.1
+        print(f"Using differential learning rate: encoder_lr_ratio={encoder_lr_ratio}")
+
+        # 分组: encoder vs non-encoder (fusion + target)
+        encoder_params_decay = []
+        encoder_params_no_decay = []
+        other_params_decay = []
+        other_params_no_decay = []
+
+        for n, p in param_optimizer:
+            is_encoder = "encoder_raw" in n or "encoder_size" in n or "embedding_raw" in n or "embedding_size" in n
+            is_no_decay = any(nd in n for nd in no_decay)
+
+            if is_encoder:
+                if is_no_decay:
+                    encoder_params_no_decay.append(p)
+                else:
+                    encoder_params_decay.append(p)
+            else:
+                if is_no_decay:
+                    other_params_no_decay.append(p)
+                else:
+                    other_params_decay.append(p)
+
+        optimizer_grouped_parameters = [
+            {"params": encoder_params_decay, "lr": args.learning_rate * encoder_lr_ratio, "weight_decay_rate": 0.01},
+            {"params": encoder_params_no_decay, "lr": args.learning_rate * encoder_lr_ratio, "weight_decay_rate": 0.0},
+            {"params": other_params_decay, "lr": args.learning_rate, "weight_decay_rate": 0.01},
+            {"params": other_params_no_decay, "lr": args.learning_rate, "weight_decay_rate": 0.0},
+        ]
+
+        print(f"  Encoder params (lr={args.learning_rate * encoder_lr_ratio:.2e}): "
+              f"{len(encoder_params_decay)} decay, {len(encoder_params_no_decay)} no_decay")
+        print(f"  Other params (lr={args.learning_rate:.2e}): "
+              f"{len(other_params_decay)} decay, {len(other_params_no_decay)} no_decay")
+    else:
+        # 原始逻辑: 所有参数使用相同学习率
+        optimizer_grouped_parameters = [
+            {"params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], "weight_decay_rate": 0.01},
+            {"params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], "weight_decay_rate": 0.0}
+        ]
+
     if args.optimizer in ["adamw"]:
         optimizer = str2optimizer[args.optimizer](optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False)
     else:
         optimizer = str2optimizer[args.optimizer](optimizer_grouped_parameters, lr=args.learning_rate,
                                                   scale_parameter=False, relative_step=False)
+
     if args.scheduler in ["constant"]:
         scheduler = str2scheduler[args.scheduler](optimizer)
     elif args.scheduler in ["constant_with_warmup"]:
@@ -697,7 +659,6 @@ def worker(proc_id, gpu_ranks, args, model):
 
     if args.dist_train:
         print("Initialize multiprocessing distributed training environment...")
-        # Initialize multiprocessing distributed training environment.
         dist.init_process_group(backend=args.backend,
                                 init_method=args.master_ip,
                                 world_size=args.world_size,

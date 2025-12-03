@@ -1,5 +1,5 @@
 """
-Multi-Modal Target for Stage 2 Pretraining
+Multi-Modal Target for Stage 2 Pretraining (v2)
 
 包含两个预训练任务:
 1. CMM (Cross-Modal Matching): 跨模态匹配，ITM二分类任务
@@ -8,6 +8,7 @@ Multi-Modal Target for Stage 2 Pretraining
 Architecture v2:
 - CMM和CMMP都在Fusion之后计算
 - CMM使用Element-wise Product + MLP进行二分类
+- CMM负样本构建已向量化优化
 - CMMP复用MlmTarget的实现逻辑
 """
 
@@ -32,6 +33,7 @@ class MultiModalTarget(nn.Module):
         vocab_size_raw: Vocabulary size for Raw Packet
         vocab_size_size: Vocabulary size for Packet Size
     """
+
     def __init__(self, args, hidden_size, vocab_size_raw, vocab_size_size):
         super(MultiModalTarget, self).__init__()
 
@@ -131,11 +133,11 @@ class MultiModalTarget(nn.Module):
 
     def forward_cmm_itm(self, raw_fused, size_fused, temperature=0.07):
         """
-        CMM作为标准ITM二分类任务
+        CMM作为标准ITM二分类任务 (向量化优化版本)
 
         实现步骤：
         1. 困难负样本挖掘（基于相似度，batch内采样）
-        2. 构建50% pos + 50% neg训练样本
+        2. 构建50% pos + 50% neg训练样本（向量化）
         3. Element-wise product作为交互特征
         4. MLP进行二分类
 
@@ -150,6 +152,13 @@ class MultiModalTarget(nn.Module):
         """
         batch_size = raw_fused.size(0)
         device = raw_fused.device
+
+        # Batch size check
+        if batch_size < 2:
+            # 无法构建负样本，返回零损失
+            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            zero_correct = torch.tensor(0.0, device=device)
+            return zero_loss, zero_correct
 
         # Extract fused [CLS] features
         raw_cls = raw_fused[:, 0, :]  # [batch, hidden]
@@ -169,30 +178,22 @@ class MultiModalTarget(nn.Module):
             probs = F.softmax(similarities / temperature, dim=1)
             neg_indices = torch.multinomial(probs, num_samples=1).squeeze(1)  # [batch]
 
-        # ===== Step 2: Construct Training Samples (50% pos + 50% neg) =====
-        raw_features = []
-        size_features = []
-        labels = []
-
+        # ===== Step 2: Construct Training Samples (Vectorized) =====
         # Random 50% pos + 50% neg
-        random_probs = torch.rand(batch_size, device=device)
-        is_positive = random_probs < 0.5
+        is_positive = torch.rand(batch_size, device=device) < 0.5  # [batch]
 
-        for i in range(batch_size):
-            if is_positive[i]:
-                # Positive sample: matched pair
-                raw_features.append(raw_cls[i])
-                size_features.append(size_cls[i])
-                labels.append(1.0)
-            else:
-                # Negative sample: hard negative
-                raw_features.append(raw_cls[i])
-                size_features.append(size_cls[neg_indices[i]])
-                labels.append(0.0)
+        # Vectorized selection
+        # For positive samples: use size_cls[i]
+        # For negative samples: use size_cls[neg_indices[i]]
+        neg_size_cls = size_cls[neg_indices]  # [batch, hidden]
 
-        raw_features = torch.stack(raw_features)  # [batch, hidden]
-        size_features = torch.stack(size_features)  # [batch, hidden]
-        labels = torch.tensor(labels, dtype=torch.float, device=device)  # [batch]
+        # Use where for vectorized selection
+        is_positive_expanded = is_positive.unsqueeze(1)  # [batch, 1]
+        size_features = torch.where(is_positive_expanded, size_cls, neg_size_cls)  # [batch, hidden]
+        raw_features = raw_cls  # [batch, hidden] (always use raw_cls[i])
+
+        # Labels: 1.0 for positive, 0.0 for negative
+        labels = is_positive.float()  # [batch]
 
         # ===== Step 3: Element-wise Product =====
         interaction = raw_features * size_features  # [batch, hidden]

@@ -113,6 +113,9 @@ def main():
                         help="Temperature for gate softmax in fusion module (multimodal only).")
     parser.add_argument("--cmm_temperature", type=float, default=0.07,
                         help="Temperature for CMM contrastive loss (multimodal only).")
+    parser.add_argument("--encoder_lr_ratio", type=float, default=0.1,
+                        help="Learning rate ratio for encoders relative to fusion/target (multimodal only). "
+                             "E.g., 0.1 means encoder LR = base_LR * 0.1")
 
     # GPU options.
     parser.add_argument("--world_size", type=int, default=1, help="Total number of processes (GPUs) for training.")
