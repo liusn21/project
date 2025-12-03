@@ -391,24 +391,41 @@ class MultiModalTrainer(Trainer):
         self.phase1_steps = args.phase1_steps if hasattr(args, 'phase1_steps') else 70000
         self.balance_loss_alpha = args.balance_loss_alpha if hasattr(args, 'balance_loss_alpha') else 0.1
 
+        # CMM temperature parameter (可配置，默认0.07)
+        self.cmm_temperature = getattr(args, 'cmm_temperature', 0.07)
+
         # Phase transition flag
         self.phase_transitioned = False
 
     def forward_propagation(self, batch, model):
         """
+        NEW ARCHITECTURE v2 (Both CMM and CMMP after Fusion)
+
         Batch format from MultiModalDataLoader (all positive samples):
         (raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_size)
 
-        Implements hard negative sampling for CMM task:
-        1. Forward encoders to get features
-        2. Use hard_negative_sampling() to select negatives
-        3. Construct 50% positive + 50% negative batch
-        4. Forward fusion and target modules
+        Key changes (v2):
+        1. Forward encoders (all samples are positive pairs)
+        2. Fusion on all positive samples
+        3. CMMP task AFTER Fusion (MLM on fused features)
+        4. CMM task AFTER Fusion (ITM with dynamic negative sampling)
+
+        This ensures:
+        - Phase 1 (freeze encoder): All losses can train fusion/target ✅
+        - CMM uses fused features (higher quality) ✅
+        - CMMP uses fused features (semantically correct) ✅
+        - Negative samples: Dynamic hard negative mining in batch ✅
+
+        Flow:
+        1. Forward encoders (only Size is masked, Raw is not masked)
+        2. Fusion on positive samples
+        3. CMMP task (MLM) using fused features
+        4. CMM task (ITM) using fused [CLS] with dynamic negative sampling
         """
         raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_size = batch
         batch_size = raw_src.size(0)
 
-        # ===== Step 1: Forward Encoders (for hard negative sampling) =====
+        # ===== Step 1: Forward Encoders =====
         # Get embeddings
         if hasattr(model, 'module'):  # DistributedDataParallel
             raw_emb = model.module.embedding_raw(raw_src, raw_packet_ids, raw_directions)
@@ -422,7 +439,7 @@ class MultiModalTrainer(Trainer):
         raw_seg = (raw_src != PAD_ID).long()
         size_seg = (size_src != PAD_ID).long()
 
-        # Forward encoders
+        # Forward encoders (only Size is masked, Raw is not masked)
         if hasattr(model, 'module'):
             raw_output = model.module.encoder_raw(raw_emb, raw_seg)
             size_output = model.module.encoder_size(size_emb, size_seg)
@@ -430,37 +447,7 @@ class MultiModalTrainer(Trainer):
             raw_output = model.encoder_raw(raw_emb, raw_seg)
             size_output = model.encoder_size(size_emb, size_seg)
 
-        # ===== Step 2: Hard Negative Sampling for CMM =====
-        # Extract [CLS] features (position 0)
-        raw_cls = raw_output[:, 0, :]  # [batch, hidden]
-        size_cls = size_output[:, 0, :]  # [batch, hidden]
-
-        # Use hard negative sampling to select negatives
-        from uer.targets.multimodal_target import hard_negative_sampling
-        neg_indices = hard_negative_sampling(raw_cls, size_cls, temperature=0.07)  # [batch]
-
-        # ===== Step 3: Construct 50% Positive + 50% Negative Batch =====
-        # Determine which samples should be positive vs negative
-        import random
-        import torch
-        cmm_labels = []
-        final_size_output = []
-
-        for i in range(batch_size):
-            if random.random() < 0.5:
-                # Positive sample: use original matched Size
-                cmm_labels.append(1)
-                final_size_output.append(size_output[i])
-            else:
-                # Negative sample: use hard negative Size
-                cmm_labels.append(0)
-                neg_idx = neg_indices[i].item()
-                final_size_output.append(size_output[neg_idx])
-
-        tgt_cmm = torch.tensor(cmm_labels, dtype=torch.long, device=raw_src.device)
-        size_output_final = torch.stack(final_size_output, dim=0)  # [batch, seq_len, hidden]
-
-        # ===== Step 4: Forward Fusion and Target =====
+        # ===== Step 2: Fusion (All positive samples) =====
         if hasattr(model, 'module'):
             fusion = model.module.fusion
             target = model.module.target
@@ -468,32 +455,44 @@ class MultiModalTrainer(Trainer):
             fusion = model.fusion
             target = model.target
 
-        # Fusion
+        # Fusion processes all positive pairs
+        # 传递seg信息以正确mask padding positions
         raw_fused, size_fused, (g_raw, g_size) = fusion(
-            raw_output, size_output_final, return_gate_weights=True
+            raw_output, size_output,
+            raw_seg=raw_seg,
+            size_seg=size_seg,
+            return_gate_weights=True
         )
 
-        # Target (CMM + CMMP)
-        cmm_loss, cmmp_loss, cmm_correct, cmmp_correct, cmmp_denominator = target(
-            raw_fused, size_fused, tgt_cmm, tgt_cmmp_size
+        # ===== Step 3: CMMP Task (AFTER Fusion, MLM on positive samples) =====
+        cmmp_loss, cmmp_correct, cmmp_denominator = target.forward_cmmp_only(
+            size_fused, tgt_cmmp_size
         )
 
-        # Balance loss
+        # ===== Step 4: CMM Task (AFTER Fusion, ITM with dynamic negatives) =====
+        # 使用fused [CLS] features，动态构建负样本
+        cmm_loss, cmm_correct = target.forward_cmm_itm(
+            raw_fused, size_fused, temperature=self.cmm_temperature
+        )
+
+        # ===== Step 5: Balance Loss =====
         from uer.layers.multimodal_fusion import compute_balance_loss
         balance_loss = compute_balance_loss(g_raw, g_size, target_ratio=0.5)
 
-        # Combined loss
+        # ===== Step 6: Combined Loss =====
         loss = cmm_loss + cmmp_loss + self.balance_loss_alpha * balance_loss
 
-        # Update statistics
+        # ===== Update Statistics =====
         self.total_loss += loss.item()
         self.total_loss_cmm += cmm_loss.item()
         self.total_loss_cmmp += cmmp_loss.item()
         self.total_loss_balance += balance_loss.item()
 
+        # CMM: batch_size samples (random 50% positive + 50% negative)
         self.total_correct_cmm += cmm_correct.item()
         self.total_instances_cmm += batch_size
 
+        # CMMP: only on positive samples
         self.total_correct_cmmp += cmmp_correct.item()
         self.total_denominator_cmmp += cmmp_denominator.item()
 

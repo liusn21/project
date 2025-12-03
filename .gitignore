@@ -3,3 +3,4 @@ papers/
 .DS_Store
 vocab_raw.txt
 vocab_size.txt
+test

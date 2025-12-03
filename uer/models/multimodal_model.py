@@ -105,8 +105,12 @@ class MultiModalModel(nn.Module):
         size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len_size, hidden]
 
         # ===== Fusion =====
+        # 传递seg信息以正确mask padding positions
         raw_fused, size_fused, (g_raw, g_size) = self.fusion(
-            raw_output, size_output, return_gate_weights=True
+            raw_output, size_output,
+            raw_seg=raw_seg,
+            size_seg=size_seg,
+            return_gate_weights=True
         )
 
         return raw_fused, size_fused, (g_raw, g_size)

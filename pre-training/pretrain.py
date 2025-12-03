@@ -109,6 +109,10 @@ def main():
                         help="Number of steps for Phase 1 with frozen encoders (multimodal only).")
     parser.add_argument("--balance_loss_alpha", type=float, default=0.1,
                         help="Weight for balance loss in multimodal training.")
+    parser.add_argument("--gate_temperature", type=float, default=0.5,
+                        help="Temperature for gate softmax in fusion module (multimodal only).")
+    parser.add_argument("--cmm_temperature", type=float, default=0.07,
+                        help="Temperature for CMM contrastive loss (multimodal only).")
 
     # GPU options.
     parser.add_argument("--world_size", type=int, default=1, help="Total number of processes (GPUs) for training.")

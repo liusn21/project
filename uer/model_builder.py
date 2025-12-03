@@ -28,12 +28,21 @@ def build_model(args):
         embedding_size = PacketSizeEmbedding(args, len(args.vocab_size))
         encoder_size = str2encoder[args.encoder](args)
 
-        # Build fusion module
+        # Build fusion module (使用原框架的MultiHeadedAttention)
         from uer.layers.multimodal_fusion import GatedMultiModalFusion
+
+        # Calculate attention_head_size
+        attention_head_size = args.hidden_size // args.heads_num
+
+        # Get gate_temperature from args (default 0.5)
+        gate_temperature = getattr(args, 'gate_temperature', 0.5)
+
         fusion = GatedMultiModalFusion(
             hidden_size=args.hidden_size,
             num_attention_heads=args.heads_num,
-            dropout=args.dropout
+            attention_head_size=attention_head_size,
+            dropout=args.dropout,
+            gate_temperature=gate_temperature
         )
 
         # Build target module

@@ -1093,18 +1093,83 @@ class MultiModalDataset(Dataset):
         self.corpus_path_raw = args.corpus_path_raw
         self.corpus_path_size = args.corpus_path_size
 
-        self.short_seq_prob = args.short_seq_prob
+        # Sequence lengths (separate for each modality)
+        self.seq_length_raw = getattr(args, 'seq_length_raw', 512)
+        self.seq_length_size = getattr(args, 'seq_length_size', 256)
 
-    def worker(self, proc_id, start, end):
-        print("Worker %d is building multi-modal dataset..." % proc_id)
+        self.short_seq_prob = args.short_seq_prob if hasattr(args, 'short_seq_prob') else 0.0
+
+    def build_and_save(self, workers_num):
+        """
+        Build multi-modal dataset from paired corpus files
+
+        Overrides base class to handle two corpus files.
+        Split by flow count (not line count).
+        """
+        # Count flows in both corpora (by counting '||' separators)
+        print("Counting flows in corpora...")
+        flow_count_raw = self._count_flows(self.corpus_path_raw)
+        flow_count_size = self._count_flows(self.corpus_path_size)
+
+        print(f"Raw corpus: {flow_count_raw} flows")
+        print(f"Size corpus: {flow_count_size} flows")
+
+        if flow_count_raw != flow_count_size:
+            print(f"WARNING: Flow counts don't match! Using minimum: {min(flow_count_raw, flow_count_size)}")
+            total_flows = min(flow_count_raw, flow_count_size)
+        else:
+            total_flows = flow_count_raw
+
+        print(f"Starting {workers_num} workers for building multi-modal dataset...")
+        print(f"Total flows to process: {total_flows}")
+        assert workers_num >= 1
+
+        if workers_num == 1:
+            self.worker(0, 0, total_flows)
+        else:
+            from multiprocessing import Pool
+            pool = Pool(workers_num)
+
+            # Split work evenly by flow count
+            for i in range(workers_num):
+                start_flow = i * total_flows // workers_num
+                end_flow = (i + 1) * total_flows // workers_num
+                pool.apply_async(func=self.worker, args=[i, start_flow, end_flow])
+
+            pool.close()
+            pool.join()
+
+        # Merge datasets
+        merge_dataset(self.dataset_path, workers_num)
+        print(f"Dataset saved to: {self.dataset_path}")
+
+    def _count_flows(self, corpus_path):
+        """Count number of flows (by counting '||' separators)"""
+        count = 0
+        with open(corpus_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip() == '||':
+                    count += 1
+        return count
+
+    def worker(self, proc_id, start_flow, end_flow):
+        """
+        Worker process to build dataset
+
+        Args:
+            proc_id: Process ID
+            start_flow: Starting flow index (inclusive)
+            end_flow: Ending flow index (exclusive)
+        """
+        print(f"Worker {proc_id} processing flows {start_flow} to {end_flow-1}...")
         set_seed(self.seed)
 
         # Buffers for both modalities
-        raw_flow_buffer = []       # List of flows for Raw modality
+        raw_flow_buffer = []
         raw_proto_buffer = []
         raw_directions_buffer = []
 
-        size_flow_buffer = []      # List of flows for Size modality
+        size_flow_buffer = []
         size_proto_buffer = []
 
         dataset_writer = open("/tmp/" + str(proc_id) + ".pt", "wb")
@@ -1113,22 +1178,29 @@ class MultiModalDataset(Dataset):
         with open(self.corpus_path_raw, mode="r", encoding="utf-8") as f_raw, \
              open(self.corpus_path_size, mode="r", encoding="utf-8") as f_size:
 
-            # Skip to start position in both files
-            for _ in range(start):
-                f_raw.readline()
-                f_size.readline()
+            # Skip to start_flow in both files
+            if start_flow > 0:
+                self._skip_flows(f_raw, start_flow)
+                self._skip_flows(f_size, start_flow)
 
-            pos = start
-
-            while pos < end:
-                # Parse one flow from each modality
+            # Process flows from start_flow to end_flow
+            flows_processed = 0
+            for flow_idx in range(start_flow, end_flow):
+                # Parse one flow from Raw corpus
                 raw_packets, raw_proto, raw_directions = self._parse_raw_flow(f_raw)
-                size_tokens, size_proto = self._parse_size_flow(f_size)
-
-                pos += self._count_lines_in_flow(raw_packets)
-
-                if raw_packets is None or size_tokens is None:
+                if raw_packets is None:
+                    print(f"Worker {proc_id}: Reached end of raw corpus at flow {flow_idx}")
                     break
+
+                # Parse one flow from Size corpus
+                size_tokens, size_proto = self._parse_size_flow(f_size)
+                if size_tokens is None:
+                    print(f"Worker {proc_id}: Reached end of size corpus at flow {flow_idx}")
+                    break
+
+                # Verify protocols match
+                if raw_proto != size_proto:
+                    print(f"Worker {proc_id} WARNING: Protocol mismatch at flow {flow_idx}: raw={raw_proto}, size={size_proto}")
 
                 # Add to buffers
                 raw_flow_buffer.append(raw_packets)
@@ -1138,9 +1210,10 @@ class MultiModalDataset(Dataset):
                 size_flow_buffer.append(size_tokens)
                 size_proto_buffer.append(size_proto)
 
+                flows_processed += 1
+
                 # Check if buffer is full
-                total_flows = len(raw_flow_buffer)
-                if total_flows > self.docs_buffer_size:
+                if len(raw_flow_buffer) >= self.docs_buffer_size:
                     instances = self.build_instances(
                         raw_flow_buffer, raw_proto_buffer, raw_directions_buffer,
                         size_flow_buffer, size_proto_buffer
@@ -1165,49 +1238,91 @@ class MultiModalDataset(Dataset):
                     pickle.dump(instance, dataset_writer)
 
         dataset_writer.close()
-        print("Worker %d finished." % proc_id)
+        print(f"Worker {proc_id} finished processing {flows_processed} flows.")
+
+    def _skip_flows(self, file_handle, num_flows):
+        """Skip num_flows in the corpus file"""
+        flows_skipped = 0
+        while flows_skipped < num_flows:
+            line = file_handle.readline()
+            if not line:  # EOF
+                break
+            if line.strip() == '||':
+                flows_skipped += 1
 
     def _parse_raw_flow(self, f):
-        """Parse one flow from raw packet corpus"""
-        line = f.readline().strip()
-        if not line or line != "||":
+        """
+        Parse one complete flow from raw packet corpus
+
+        Format:
+            ||
+            6 (or 17)
+            1 4500 0006 0683 ...
+            -1 4500 0000 003c ...
+            ... (more packets)
+
+        Returns:
+            (packets, protocol, directions) or (None, None, None) if EOF
+        """
+        # Read flow separator
+        line = f.readline()
+        if not line:  # EOF
             return None, None, None
 
-        # Read protocol
-        proto_line = f.readline().strip()
-        try:
-            proto_num = int(proto_line)
-            protocol = 0 if proto_num == 6 else 1
-        except:
-            protocol = 0
+        line = line.strip()
+        if line != "||":
+            # Skip until we find a flow separator
+            while line and line != "||":
+                line = f.readline().strip()
+            if not line:
+                return None, None, None
 
-        # Read packets
+        # Read protocol
+        proto_line = f.readline()
+        if not proto_line:
+            return None, None, None
+
+        proto_num = int(proto_line.strip())
+        protocol = 0 if proto_num == 6 else 1  # 0=TCP, 1=UDP]
+
+        # Read packets until next flow separator or EOF
         packets = []
         directions = []
 
         while True:
+            # Save current position
+            current_pos = f.tell()
             line = f.readline()
-            if not line or line.strip() == "||":
-                # Put back the separator
-                if line and line.strip() == "||":
-                    f.seek(f.tell() - len(line))
+
+            if not line:  # EOF
                 break
 
             line = line.strip()
-            if not line:
+
+            # Check if next flow starts
+            if line == "||":
+                # Put back the separator for next flow
+                f.seek(current_pos)
+                break
+
+            if not line:  # Empty line, skip
                 continue
 
+            # Parse packet line: "direction bigrams..."
             parts = line.split(' ', 1)
             if len(parts) < 2:
                 continue
 
             try:
-                direction = int(parts[0])
+                direction = int(parts[0])  # 1 or -1
             except:
-                direction = 1
+                direction = 1  # Default uplink
 
+            bigram_str = parts[1]
+
+            # Tokenize bigrams
             tokens = self.tokenizer_raw.convert_tokens_to_ids(
-                self.tokenizer_raw.tokenize(parts[1])
+                self.tokenizer_raw.tokenize(bigram_str)
             )
 
             if len(tokens) > 0:
@@ -1217,33 +1332,59 @@ class MultiModalDataset(Dataset):
         return packets, protocol, directions
 
     def _parse_size_flow(self, f):
-        """Parse one flow from packet size corpus"""
-        line = f.readline().strip()
-        if not line or line != "||":
+        """
+        Parse one complete flow from packet size corpus
+
+        Format:
+            ||
+            6 (or 17)
+            1672 2185 953 ...
+
+        Returns:
+            (tokens, protocol) or (None, None) if EOF
+        """
+        # Read flow separator
+        line = f.readline()
+        if not line:  # EOF
             return None, None
 
+        line = line.strip()
+        if line != "||":
+            # Skip until we find a flow separator
+            while line and line != "||":
+                line = f.readline().strip()
+            if not line:
+                return None, None
+
         # Read protocol
-        proto_line = f.readline().strip()
+        proto_line = f.readline()
+        if not proto_line:
+            print("Warning: Unexpected EOF when reading protocol")
+            return None, None
+
         try:
-            proto_num = int(proto_line)
-            protocol = 0 if proto_num == 6 else 1
+            proto_num = int(proto_line.strip())
+            protocol = 0 if proto_num == 6 else 1  # 0=TCP, 1=UDP
         except:
-            protocol = 0
+            protocol = 0  # Default TCP
 
         # Read size tokens (single line)
-        line = f.readline().strip()
-        if not line:
+        tokens_line = f.readline()
+        if not tokens_line:
+            print("Warning: Unexpected EOF when reading size tokens")
             return [], protocol
 
+        tokens_line = tokens_line.strip()
+        if not tokens_line:
+            print("Warning: Empty size tokens line")
+            return [], protocol
+
+        # Tokenize size tokens
         tokens = self.tokenizer_size.convert_tokens_to_ids(
-            self.tokenizer_size.tokenize(line)
+            self.tokenizer_size.tokenize(tokens_line)
         )
 
         return tokens, protocol
-
-    def _count_lines_in_flow(self, packets):
-        """Count lines in one flow (for position tracking)"""
-        return 2 + len(packets) + 1  # || + protocol + packets + (next ||)
 
     def build_instances(self, raw_flows, raw_protos, raw_directions_list,
                        size_flows, size_protos):
@@ -1267,12 +1408,14 @@ class MultiModalDataset(Dataset):
         Create one instance from paired Raw + Size flow
 
         Returns:
-            (raw_src, raw_packet_ids, raw_directions_seq, size_src)
+            Static masking: (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_size)
+            Dynamic masking: (raw_src, raw_packet_ids, raw_directions_seq, size_src)
 
-        Note: Masking is done in DataLoader using mask_seq()
+        Note: Only Size modality is masked (for CMMP task)
+              Raw is NOT masked (user preference)
         """
-        max_raw_tokens = 512 - 2  # Raw Packet max length
-        max_size_tokens = 256 - 2  # Packet Size max length
+        max_raw_tokens = self.seq_length_raw - 2  # Reserve for [CLS] and [SEP]
+        max_size_tokens = self.seq_length_size - 2  # Reserve for [CLS] and [SEP]
 
         # ===== Process Raw Packet =====
         raw_tokens = []
@@ -1305,8 +1448,8 @@ class MultiModalDataset(Dataset):
             raw_directions_seq.append(0 if d == -1 else 2)
         raw_directions_seq.append(1)  # [SEP] neutral
 
-        # Padding
-        while len(raw_src) < 512:
+        # Padding to seq_length_raw
+        while len(raw_src) < self.seq_length_raw:
             raw_src.append(PAD_ID)
             raw_packet_ids.append(8)
             raw_directions_seq.append(1)
@@ -1316,14 +1459,30 @@ class MultiModalDataset(Dataset):
         if len(size_tokens) > max_size_tokens:
             size_tokens = size_tokens[:max_size_tokens]
 
-        # Build Size sequence (NO masking - done in DataLoader)
+        # Build Size sequence
         size_src = [self.vocab_size.get(CLS_TOKEN)] + size_tokens + [self.vocab_size.get(SEP_TOKEN)]
 
-        # Padding
-        while len(size_src) < 256:
+        # Padding to seq_length_size
+        while len(size_src) < self.seq_length_size:
             size_src.append(PAD_ID)
 
-        return (raw_src, raw_packet_ids, raw_directions_seq, size_src)
+        # ===== Apply Masking to Size only =====
+        if not self.dynamic_masking:
+            # Static masking: apply mask_seq() here in Dataset
+            # Note: Raw is NOT masked (user preference)
+
+            # Mask Size (for CMMP task)
+            size_src, tgt_mlm_size = mask_seq(
+                size_src, self.tokenizer_size, self.whole_word_masking,
+                self.span_masking, self.span_geo_prob, self.span_max_length
+            )
+
+            # Return 5 elements (with tgt_mlm_size only)
+            return (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_size)
+        else:
+            # Dynamic masking: defer masking to DataLoader
+            # Return 4 elements (without tgt_mlm)
+            return (raw_src, raw_packet_ids, raw_directions_seq, size_src)
 
 
 class MultiModalDataLoader(DataLoader):
@@ -1332,6 +1491,8 @@ class MultiModalDataLoader(DataLoader):
 
     Returns positive (matching) samples only.
     CMM negative sampling and hard negative mining are done in Trainer.
+
+    Supports both static and dynamic masking (controlled by args.dynamic_masking).
 
     Returns:
         raw_src: [batch, 512] - Raw Packet tokens (no masking)
@@ -1345,8 +1506,10 @@ class MultiModalDataLoader(DataLoader):
         super(MultiModalDataLoader, self).__init__(
             args, dataset_path, batch_size, proc_id, proc_num, shuffle
         )
-        # Store Size vocab and tokenizer for masking
+        # Store both vocabs and tokenizers for masking
+        self.vocab_raw = args.vocab_raw
         self.vocab_size = args.vocab_size
+        self.tokenizer_raw = args.tokenizer_raw
         self.tokenizer_size = args.tokenizer_size
 
     def __iter__(self):
@@ -1371,36 +1534,56 @@ class MultiModalDataLoader(DataLoader):
             masked_words_num = 0
 
             for ins in instances:
-                # Instance format: (raw_src, raw_packet_ids, raw_directions_seq, size_src)
-                raw_src, raw_packet_ids, raw_directions_seq, size_src = ins
+                # Instance format depends on masking mode:
+                # Static masking (len=5): (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_size)
+                #   - Only size_src is masked in Dataset
+                # Dynamic masking (len=4): (raw_src, raw_packet_ids, raw_directions_seq, size_src)
+                #   - Need to mask size_src here
 
-                # Append Raw modality data (no masking)
-                raw_src_batch.append(raw_src)
-                raw_packet_ids_batch.append(raw_packet_ids)
-                raw_directions_batch.append(raw_directions_seq)
+                # ===== Process Raw modality (for CMM task) =====
+                # Raw is NOT masked
+                raw_src_batch.append(ins[0])
+                raw_packet_ids_batch.append(ins[1])
+                raw_directions_batch.append(ins[2])
 
-                # ===== Apply CMMP Masking using mask_seq() =====
-                # mask_seq expects a list and returns (masked_src, tgt_mlm)
-                # tgt_mlm is list of (position, token) tuples
-                size_src_masked, tgt_mlm = mask_seq(
-                    size_src.copy(),  # Copy to avoid modifying original
-                    self.tokenizer_size,
-                    self.whole_word_masking,
-                    self.span_masking,
-                    self.span_geo_prob,
-                    self.span_max_length
-                )
+                # ===== Process Size modality (for CMMP task) =====
+                if len(ins) == 5:
+                    # Static masking: Dataset already applied masking
+                    size_src = ins[3]
+                    tgt_mlm_size = ins[4]  # List of (position, token) tuples
 
-                masked_words_num += len(tgt_mlm)
+                    masked_words_num += len(tgt_mlm_size)
 
-                # Convert tgt_mlm from list of tuples to full sequence format
-                # [0, 0, token_id, 0, ...] where token_id is the original token at masked positions
-                tgt_cmmp = [0] * len(size_src)
-                for pos, token in tgt_mlm:
-                    tgt_cmmp[pos] = token
+                    # Convert tgt_mlm format: [(pos, token), ...] -> [0, 0, token, 0, ...]
+                    tgt_cmmp = [0] * len(size_src)
+                    for pos, token in tgt_mlm_size:
+                        tgt_cmmp[pos] = token
 
-                size_src_batch.append(size_src_masked)
-                tgt_cmmp_size_batch.append(tgt_cmmp)
+                    size_src_batch.append(size_src)
+                    tgt_cmmp_size_batch.append(tgt_cmmp)
+
+                else:  # len(ins) == 4
+                    # Dynamic masking: Apply mask_seq() here in DataLoader
+                    size_src = ins[3]
+
+                    size_src_masked, tgt_mlm = mask_seq(
+                        size_src.copy(),  # Copy to avoid modifying original
+                        self.tokenizer_size,
+                        self.whole_word_masking,
+                        self.span_masking,
+                        self.span_geo_prob,
+                        self.span_max_length
+                    )
+
+                    masked_words_num += len(tgt_mlm)
+
+                    # Convert tgt_mlm format: [(pos, token), ...] -> [0, 0, token, 0, ...]
+                    tgt_cmmp = [0] * len(size_src)
+                    for pos, token in tgt_mlm:
+                        tgt_cmmp[pos] = token
+
+                    size_src_batch.append(size_src_masked)
+                    tgt_cmmp_size_batch.append(tgt_cmmp)
 
             # Skip batch if no masked words (should rarely happen)
             if masked_words_num == 0:
