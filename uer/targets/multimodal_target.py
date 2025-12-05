@@ -153,12 +153,6 @@ class MultiModalTarget(nn.Module):
         batch_size = raw_fused.size(0)
         device = raw_fused.device
 
-        # Batch size check
-        if batch_size < 2:
-            # 无法构建负样本，返回零损失
-            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            zero_correct = torch.tensor(0.0, device=device)
-            return zero_loss, zero_correct
 
         # Extract fused [CLS] features
         raw_cls = raw_fused[:, 0, :]  # [batch, hidden]

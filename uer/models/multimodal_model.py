@@ -91,7 +91,7 @@ class MultiModalModel(nn.Module):
         Returns:
             raw_fused: [batch, seq_len_raw, hidden] - Fused Raw features
             size_fused: [batch, seq_len_size, hidden] - Fused Size features
-            (g_raw, g_size): Gate weights
+            (g_raw, g_size, gates): Gate weights and softmax distribution
         """
 
         # ===== Encode Raw Packet =====
@@ -106,11 +106,11 @@ class MultiModalModel(nn.Module):
 
         # ===== Fusion =====
         # 传递seg信息以正确mask padding positions
-        raw_fused, size_fused, (g_raw, g_size) = self.fusion(
+        raw_fused, size_fused, (g_raw, g_size, gates) = self.fusion(
             raw_output, size_output,
             raw_seg=raw_seg,
             size_seg=size_seg,
             return_gate_weights=True
         )
 
-        return raw_fused, size_fused, (g_raw, g_size)
+        return raw_fused, size_fused, (g_raw, g_size, gates)

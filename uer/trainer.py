@@ -10,6 +10,8 @@ from uer.utils.optimizers import *
 from uer.utils import *
 from uer.utils.vocab import Vocab
 from uer.utils.seed import set_seed
+from uer.utils.constants import PAD_ID
+from uer.layers.multimodal_fusion import compute_balance_loss
 from tqdm import tqdm
 
 def train_and_validate(args):
@@ -376,7 +378,6 @@ class MultiModalTrainer(Trainer):
             raw_emb = model.embedding_raw(raw_src, raw_packet_ids, raw_directions)
             size_emb = model.embedding_size(size_src)
 
-        from uer.utils.constants import PAD_ID
         raw_seg = (raw_src != PAD_ID).long()
         size_seg = (size_src != PAD_ID).long()
 
@@ -395,7 +396,7 @@ class MultiModalTrainer(Trainer):
             fusion = model.fusion
             target = model.target
 
-        raw_fused, size_fused, (g_raw, g_size) = fusion(
+        raw_fused, size_fused, (g_raw, g_size, gates) = fusion(
             raw_output, size_output,
             raw_seg=raw_seg,
             size_seg=size_seg,
@@ -412,9 +413,8 @@ class MultiModalTrainer(Trainer):
             raw_fused, size_fused, temperature=self.cmm_temperature
         )
 
-        # ===== Step 5: Balance Loss =====
-        from uer.layers.multimodal_fusion import compute_balance_loss
-        balance_loss = compute_balance_loss(g_raw, g_size, target_ratio=0.5)
+        # ===== Step 5: Balance Loss (v3: entropy-based) =====
+        balance_loss = compute_balance_loss(g_raw, g_size, gates=gates)
 
         # ===== Step 6: Combined Loss =====
         loss = cmm_loss + cmmp_loss + self.balance_loss_alpha * balance_loss
@@ -498,10 +498,37 @@ class MultiModalTrainer(Trainer):
             # Phase transition: Unfreeze encoders at phase1_steps
             if self.current_step == self.phase1_steps + 1 and not self.phase_transitioned:
                 print("TRANSITIONING TO PHASE 2: Unfreezing encoders")
+                
+                # Step 1: Unfreeze encoder parameters
                 if hasattr(model, 'module'):
                     model.module.unfreeze_encoders()
                 else:
                     model.unfreeze_encoders()
+                
+                # Step 2: Reset encoder learning rate in optimizer
+                if hasattr(args, 'encoder_param_group_indices') and hasattr(args, 'phase2_encoder_lr'):
+                    for idx in args.encoder_param_group_indices:
+                        old_lr = optimizer.param_groups[idx]['lr']
+                        optimizer.param_groups[idx]['lr'] = args.phase2_encoder_lr
+                        print(f"  Param group {idx} lr: {old_lr:.2e} -> {args.phase2_encoder_lr:.2e}")
+                
+                # Step 3: Create new scheduler for Phase 2
+                # Phase 2 steps: phase1_steps+1 to total_steps
+                phase2_steps = args.total_steps - self.phase1_steps
+                phase2_warmup_steps = int(phase2_steps * args.warmup)
+                
+                print(f"  Creating new scheduler for Phase 2:")
+                print(f"    Phase 2 steps: {phase2_steps}")
+                print(f"    Phase 2 warmup: {phase2_warmup_steps}")
+                
+
+                if args.scheduler in ["constant"]:
+                    scheduler = str2scheduler[args.scheduler](optimizer)
+                elif args.scheduler in ["constant_with_warmup"]:
+                    scheduler = str2scheduler[args.scheduler](optimizer, phase2_warmup_steps)
+                else:
+                    scheduler = str2scheduler[args.scheduler](optimizer, phase2_warmup_steps, phase2_steps)
+                
                 self.phase_transitioned = True
 
             batch = list(next(loader_iter))
@@ -592,10 +619,16 @@ def worker(proc_id, gpu_ranks, args, model):
     param_optimizer = list(model.named_parameters())
     no_decay = ["bias", "gamma", "beta"]
 
-    # 差异化学习率: multimodal 模式下 encoder 使用更小的学习率
+    # 差异化学习率: multimodal 模式下使用两阶段学习率策略
     if args.target == "multimodal":
         encoder_lr_ratio = getattr(args, 'encoder_lr_ratio', 0.1)  # encoder 学习率倍率，默认 0.1
-        print(f"Using differential learning rate: encoder_lr_ratio={encoder_lr_ratio}")
+        freeze_encoders = getattr(args, 'freeze_encoders', False)
+        
+        # Phase 1: encoder lr = 0 (frozen), Phase 2: encoder lr = base_lr * ratio
+        phase1_encoder_lr = 0.0 if freeze_encoders else args.learning_rate * encoder_lr_ratio
+        print(f"Using two-phase learning rate strategy:")
+        print(f"  Phase 1 encoder lr: {phase1_encoder_lr:.2e} (frozen={freeze_encoders})")
+        print(f"  Phase 2 encoder lr: {args.learning_rate * encoder_lr_ratio:.2e}")
 
         # 分组: encoder vs non-encoder (fusion + target)
         encoder_params_decay = []
@@ -618,14 +651,19 @@ def worker(proc_id, gpu_ranks, args, model):
                 else:
                     other_params_decay.append(p)
 
+        # Phase 1: encoder 使用 lr=0，这样 scheduler 的调度不会影响它
         optimizer_grouped_parameters = [
-            {"params": encoder_params_decay, "lr": args.learning_rate * encoder_lr_ratio, "weight_decay_rate": 0.01},
-            {"params": encoder_params_no_decay, "lr": args.learning_rate * encoder_lr_ratio, "weight_decay_rate": 0.0},
+            {"params": encoder_params_decay, "lr": phase1_encoder_lr, "weight_decay_rate": 0.01},
+            {"params": encoder_params_no_decay, "lr": phase1_encoder_lr, "weight_decay_rate": 0.0},
             {"params": other_params_decay, "lr": args.learning_rate, "weight_decay_rate": 0.01},
             {"params": other_params_no_decay, "lr": args.learning_rate, "weight_decay_rate": 0.0},
         ]
 
-        print(f"  Encoder params (lr={args.learning_rate * encoder_lr_ratio:.2e}): "
+        # 保存信息供 Phase 2 使用
+        args.encoder_param_group_indices = [0, 1]  # optimizer.param_groups 中 encoder 的索引
+        args.phase2_encoder_lr = args.learning_rate * encoder_lr_ratio
+
+        print(f"  Encoder params (phase1 lr={phase1_encoder_lr:.2e}): "
               f"{len(encoder_params_decay)} decay, {len(encoder_params_no_decay)} no_decay")
         print(f"  Other params (lr={args.learning_rate:.2e}): "
               f"{len(other_params_decay)} decay, {len(other_params_no_decay)} no_decay")
