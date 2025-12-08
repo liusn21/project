@@ -326,11 +326,12 @@ class MultiModalTrainer(Trainer):
     """
     Trainer for Multi-Modal Pretraining (Stage 2)
 
-    Implements two-phase training:
-    - Phase 1 (0-70K steps): Freeze encoders, train fusion only
-    - Phase 2 (70K-100K steps): Joint training with differential LR
+    Phase 1: Freeze encoders, train fusion + target only
+    Phase 2: Full parameter training with differential LR
 
-    Tasks: CMM + CMMP + Balance Loss
+    Tasks: CMM + CMMP_raw + CMMP_size + Balance Loss
+    
+    Phase is determined by args.phase1 or args.phase2 flags (mutually exclusive)
     """
 
     def __init__(self, args):
@@ -338,36 +339,47 @@ class MultiModalTrainer(Trainer):
 
         # Loss tracking
         self.total_loss_cmm = 0.0
-        self.total_loss_cmmp = 0.0
+        self.total_loss_cmmp_raw = 0.0
+        self.total_loss_cmmp_size = 0.0
         self.total_loss_balance = 0.0
 
         # Accuracy tracking
         self.total_correct_cmm = 0.0
         self.total_instances_cmm = 0.0
-        self.total_correct_cmmp = 0.0
-        self.total_denominator_cmmp = 0.0
+        self.total_correct_cmmp_raw = 0.0
+        self.total_denominator_cmmp_raw = 0.0
+        self.total_correct_cmmp_size = 0.0
+        self.total_denominator_cmmp_size = 0.0
 
         # Gate weight tracking
         self.total_g_raw = 0.0
         self.total_g_size = 0.0
 
-        # Two-phase training parameters
-        self.phase1_steps = args.phase1_steps if hasattr(args, 'phase1_steps') else 70000
-        self.balance_loss_alpha = args.balance_loss_alpha if hasattr(args, 'balance_loss_alpha') else 0.1
+        # Loss weights
+        self.balance_loss_alpha = getattr(args, 'balance_loss_alpha', 0.1)
+        self.cmmp_raw_weight = getattr(args, 'cmmp_raw_weight', 0.1)
+        self.cmmp_size_weight = getattr(args, 'cmmp_size_weight', 0.1)
 
         # CMM temperature parameter
         self.cmm_temperature = getattr(args, 'cmm_temperature', 0.07)
 
-        # Phase transition flag
-        self.phase_transitioned = False
+        # Phase detection (determined by args, no transition)
+        self.is_phase1 = getattr(args, 'phase1', False)
+        self.is_phase2 = getattr(args, 'phase2', False)
+        
+        # Validate phase flags
+        if self.is_phase1 and self.is_phase2:
+            raise ValueError("Cannot specify both --phase1 and --phase2")
+        if not self.is_phase1 and not self.is_phase2:
+            raise ValueError("Must specify either --phase1 or --phase2")
 
     def forward_propagation(self, batch, model):
         """
         Forward pass for multimodal pretraining
 
-        Batch format: (raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_size)
+        Batch format: (raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_raw, tgt_cmmp_size)
         """
-        raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_size = batch
+        raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_raw, tgt_cmmp_size = batch
         batch_size = raw_src.size(0)
 
         # ===== Step 1: Forward Encoders =====
@@ -403,33 +415,45 @@ class MultiModalTrainer(Trainer):
             return_gate_weights=True
         )
 
-        # ===== Step 3: CMMP Task =====
-        cmmp_loss, cmmp_correct, cmmp_denominator = target.forward_cmmp_only(
+        # ===== Step 3: CMMP_raw Task =====
+        cmmp_raw_loss, cmmp_raw_correct, cmmp_raw_denominator = target.forward_cmmp_raw(
+            raw_fused, tgt_cmmp_raw
+        )
+
+        # ===== Step 4: CMMP_size Task =====
+        cmmp_size_loss, cmmp_size_correct, cmmp_size_denominator = target.forward_cmmp_size(
             size_fused, tgt_cmmp_size
         )
 
-        # ===== Step 4: CMM Task =====
+        # ===== Step 5: CMM Task =====
         cmm_loss, cmm_correct = target.forward_cmm_itm(
             raw_fused, size_fused, temperature=self.cmm_temperature
         )
 
-        # ===== Step 5: Balance Loss (v3: entropy-based) =====
+        # ===== Step 6: Balance Loss (entropy-based) =====
         balance_loss = compute_balance_loss(g_raw, g_size, gates=gates)
 
-        # ===== Step 6: Combined Loss =====
-        loss = cmm_loss + cmmp_loss + self.balance_loss_alpha * balance_loss
+        # ===== Step 7: Combined Loss =====
+        loss = (cmm_loss + 
+                self.cmmp_raw_weight * cmmp_raw_loss + 
+                self.cmmp_size_weight * cmmp_size_loss + 
+                self.balance_loss_alpha * balance_loss)
 
         # Update Statistics
         self.total_loss += loss.item()
         self.total_loss_cmm += cmm_loss.item()
-        self.total_loss_cmmp += cmmp_loss.item()
+        self.total_loss_cmmp_raw += cmmp_raw_loss.item()
+        self.total_loss_cmmp_size += cmmp_size_loss.item()
         self.total_loss_balance += balance_loss.item()
 
         self.total_correct_cmm += cmm_correct.item()
         self.total_instances_cmm += batch_size
 
-        self.total_correct_cmmp += cmmp_correct.item()
-        self.total_denominator_cmmp += cmmp_denominator.item()
+        self.total_correct_cmmp_raw += cmmp_raw_correct.item()
+        self.total_denominator_cmmp_raw += cmmp_raw_denominator.item()
+
+        self.total_correct_cmmp_size += cmmp_size_correct.item()
+        self.total_denominator_cmmp_size += cmmp_size_denominator.item()
 
         self.total_g_raw += g_raw.mean().item()
         self.total_g_size += g_size.mean().item()
@@ -444,92 +468,61 @@ class MultiModalTrainer(Trainer):
 
         avg_loss = self.total_loss / self.report_steps
         avg_loss_cmm = self.total_loss_cmm / self.report_steps
-        avg_loss_cmmp = self.total_loss_cmmp / self.report_steps
+        avg_loss_cmmp_raw = self.total_loss_cmmp_raw / self.report_steps
+        avg_loss_cmmp_size = self.total_loss_cmmp_size / self.report_steps
         avg_loss_balance = self.total_loss_balance / self.report_steps
 
         acc_cmm = self.total_correct_cmm / self.total_instances_cmm if self.total_instances_cmm > 0 else 0.0
-        acc_cmmp = self.total_correct_cmmp / self.total_denominator_cmmp if self.total_denominator_cmmp > 0 else 0.0
+        acc_cmmp_raw = self.total_correct_cmmp_raw / self.total_denominator_cmmp_raw if self.total_denominator_cmmp_raw > 0 else 0.0
+        acc_cmmp_size = self.total_correct_cmmp_size / self.total_denominator_cmmp_size if self.total_denominator_cmmp_size > 0 else 0.0
 
         avg_g_raw = self.total_g_raw / self.report_steps
         avg_g_size = self.total_g_size / self.report_steps
 
-        phase = "Phase1" if self.current_step <= self.phase1_steps else "Phase2"
+        phase = "Phase1" if self.is_phase1 else "Phase2"
 
         print("| {:8d}/{:8d} steps"
               " | {} |"
               " {:3.3f} s"
-              " | {:8.2f} tokens/s"
               " | loss {:7.2f}"
               " | cmm: {:3.3f}"
-              " | cmmp: {:3.3f}"
+              " | cmmp_r: {:3.3f}"
+              " | cmmp_s: {:3.3f}"
               " | bal: {:3.3f}"
               " | acc_cmm: {:3.3f}"
-              " | acc_cmmp: {:3.3f}"
+              " | acc_r: {:3.3f}"
+              " | acc_s: {:3.3f}"
               " | g_raw: {:3.3f}"
               " | g_size: {:3.3f}".format(
             self.current_step, self.total_steps, phase,
             (time.time() - self.start_time),
-            done_tokens / (time.time() - self.start_time),
-            avg_loss, avg_loss_cmm, avg_loss_cmmp, avg_loss_balance,
-            acc_cmm, acc_cmmp, avg_g_raw, avg_g_size
+            avg_loss, avg_loss_cmm, avg_loss_cmmp_raw, avg_loss_cmmp_size, avg_loss_balance,
+            acc_cmm, acc_cmmp_raw, acc_cmmp_size, avg_g_raw, avg_g_size
         ))
 
         # Reset statistics
         self.total_loss = 0.0
         self.total_loss_cmm = 0.0
-        self.total_loss_cmmp = 0.0
+        self.total_loss_cmmp_raw = 0.0
+        self.total_loss_cmmp_size = 0.0
         self.total_loss_balance = 0.0
         self.total_correct_cmm = 0.0
         self.total_instances_cmm = 0.0
-        self.total_correct_cmmp = 0.0
-        self.total_denominator_cmmp = 0.0
+        self.total_correct_cmmp_raw = 0.0
+        self.total_denominator_cmmp_raw = 0.0
+        self.total_correct_cmmp_size = 0.0
+        self.total_denominator_cmmp_size = 0.0
         self.total_g_raw = 0.0
         self.total_g_size = 0.0
 
     def train(self, args, gpu_id, rank, loader, model, optimizer, scheduler):
-        """Training loop with two-phase logic"""
+        """Training loop - simplified without phase transition"""
         model.train()
         loader_iter = iter(loader)
 
         while True:
             if self.current_step == self.total_steps + 1:
                 break
-
-            # Phase transition: Unfreeze encoders at phase1_steps
-            if self.current_step == self.phase1_steps + 1 and not self.phase_transitioned:
-                print("TRANSITIONING TO PHASE 2: Unfreezing encoders")
-                
-                # Step 1: Unfreeze encoder parameters
-                if hasattr(model, 'module'):
-                    model.module.unfreeze_encoders()
-                else:
-                    model.unfreeze_encoders()
-                
-                # Step 2: Reset encoder learning rate in optimizer
-                if hasattr(args, 'encoder_param_group_indices') and hasattr(args, 'phase2_encoder_lr'):
-                    for idx in args.encoder_param_group_indices:
-                        old_lr = optimizer.param_groups[idx]['lr']
-                        optimizer.param_groups[idx]['lr'] = args.phase2_encoder_lr
-                        print(f"  Param group {idx} lr: {old_lr:.2e} -> {args.phase2_encoder_lr:.2e}")
-                
-                # Step 3: Create new scheduler for Phase 2
-                # Phase 2 steps: phase1_steps+1 to total_steps
-                phase2_steps = args.total_steps - self.phase1_steps
-                phase2_warmup_steps = int(phase2_steps * args.warmup)
-                
-                print(f"  Creating new scheduler for Phase 2:")
-                print(f"    Phase 2 steps: {phase2_steps}")
-                print(f"    Phase 2 warmup: {phase2_warmup_steps}")
-                
-
-                if args.scheduler in ["constant"]:
-                    scheduler = str2scheduler[args.scheduler](optimizer)
-                elif args.scheduler in ["constant_with_warmup"]:
-                    scheduler = str2scheduler[args.scheduler](optimizer, phase2_warmup_steps)
-                else:
-                    scheduler = str2scheduler[args.scheduler](optimizer, phase2_warmup_steps, phase2_steps)
-                
-                self.phase_transitioned = True
 
             batch = list(next(loader_iter))
             self.seq_length = batch[0].size(1)
@@ -619,18 +612,27 @@ def worker(proc_id, gpu_ranks, args, model):
     param_optimizer = list(model.named_parameters())
     no_decay = ["bias", "gamma", "beta"]
 
-    # 差异化学习率: multimodal 模式下使用两阶段学习率策略
+    # Multimodal: Phase-specific learning rate strategy
     if args.target == "multimodal":
-        encoder_lr_ratio = getattr(args, 'encoder_lr_ratio', 0.1)  # encoder 学习率倍率，默认 0.1
-        freeze_encoders = getattr(args, 'freeze_encoders', False)
+        encoder_lr_ratio = getattr(args, 'encoder_lr_ratio', 0.1)
+        is_phase1 = getattr(args, 'phase1', False)
+        is_phase2 = getattr(args, 'phase2', False)
         
-        # Phase 1: encoder lr = 0 (frozen), Phase 2: encoder lr = base_lr * ratio
-        phase1_encoder_lr = 0.0 if freeze_encoders else args.learning_rate * encoder_lr_ratio
-        print(f"Using two-phase learning rate strategy:")
-        print(f"  Phase 1 encoder lr: {phase1_encoder_lr:.2e} (frozen={freeze_encoders})")
-        print(f"  Phase 2 encoder lr: {args.learning_rate * encoder_lr_ratio:.2e}")
+        # Determine encoder learning rate based on phase
+        if is_phase1:
+            # Phase 1: Freeze encoders (lr = 0)
+            encoder_lr = 0.0
+            print(f"=== PHASE 1: Frozen Encoders ===")
+            print(f"  Encoder lr: {encoder_lr:.2e} (frozen)")
+            print(f"  Fusion/Target lr: {args.learning_rate:.2e}")
+        else:  # is_phase2
+            # Phase 2: Differential learning rate
+            encoder_lr = args.learning_rate * encoder_lr_ratio
+            print(f"=== PHASE 2: Full Parameter Training ===")
+            print(f"  Encoder lr: {encoder_lr:.2e} (ratio={encoder_lr_ratio})")
+            print(f"  Fusion/Target lr: {args.learning_rate:.2e}")
 
-        # 分组: encoder vs non-encoder (fusion + target)
+        # Group parameters: encoder vs non-encoder (fusion + target)
         encoder_params_decay = []
         encoder_params_no_decay = []
         other_params_decay = []
@@ -651,24 +653,19 @@ def worker(proc_id, gpu_ranks, args, model):
                 else:
                     other_params_decay.append(p)
 
-        # Phase 1: encoder 使用 lr=0，这样 scheduler 的调度不会影响它
         optimizer_grouped_parameters = [
-            {"params": encoder_params_decay, "lr": phase1_encoder_lr, "weight_decay_rate": 0.01},
-            {"params": encoder_params_no_decay, "lr": phase1_encoder_lr, "weight_decay_rate": 0.0},
+            {"params": encoder_params_decay, "lr": encoder_lr, "weight_decay_rate": 0.01},
+            {"params": encoder_params_no_decay, "lr": encoder_lr, "weight_decay_rate": 0.0},
             {"params": other_params_decay, "lr": args.learning_rate, "weight_decay_rate": 0.01},
             {"params": other_params_no_decay, "lr": args.learning_rate, "weight_decay_rate": 0.0},
         ]
 
-        # 保存信息供 Phase 2 使用
-        args.encoder_param_group_indices = [0, 1]  # optimizer.param_groups 中 encoder 的索引
-        args.phase2_encoder_lr = args.learning_rate * encoder_lr_ratio
-
-        print(f"  Encoder params (phase1 lr={phase1_encoder_lr:.2e}): "
+        print(f"  Encoder params (lr={encoder_lr:.2e}): "
               f"{len(encoder_params_decay)} decay, {len(encoder_params_no_decay)} no_decay")
         print(f"  Other params (lr={args.learning_rate:.2e}): "
               f"{len(other_params_decay)} decay, {len(other_params_no_decay)} no_decay")
     else:
-        # 原始逻辑: 所有参数使用相同学习率
+        # Non-multimodal: all parameters use same learning rate
         optimizer_grouped_parameters = [
             {"params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], "weight_decay_rate": 0.01},
             {"params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], "weight_decay_rate": 0.0}
@@ -680,6 +677,7 @@ def worker(proc_id, gpu_ranks, args, model):
         optimizer = str2optimizer[args.optimizer](optimizer_grouped_parameters, lr=args.learning_rate,
                                                   scale_parameter=False, relative_step=False)
 
+    # Create scheduler (same for both phases)
     if args.scheduler in ["constant"]:
         scheduler = str2scheduler[args.scheduler](optimizer)
     elif args.scheduler in ["constant_with_warmup"]:

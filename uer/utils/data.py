@@ -1408,11 +1408,10 @@ class MultiModalDataset(Dataset):
         Create one instance from paired Raw + Size flow
 
         Returns:
-            Static masking: (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_size)
+            Static masking: (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_cmmp_raw, tgt_cmmp_size)
             Dynamic masking: (raw_src, raw_packet_ids, raw_directions_seq, size_src)
 
-        Note: Only Size modality is masked (for CMMP task)
-              Raw is NOT masked (user preference)
+        Note: Both Raw and Size modalities are masked for CMMP tasks
         """
         max_raw_tokens = self.seq_length_raw - 2  # Reserve for [CLS] and [SEP]
         max_size_tokens = self.seq_length_size - 2  # Reserve for [CLS] and [SEP]
@@ -1466,19 +1465,24 @@ class MultiModalDataset(Dataset):
         while len(size_src) < self.seq_length_size:
             size_src.append(PAD_ID)
 
-        # ===== Apply Masking to Size only =====
+        # ===== Apply Masking to Both Modalities =====
         if not self.dynamic_masking:
             # Static masking: apply mask_seq() here in Dataset
-            # Note: Raw is NOT masked (user preference)
+            
+            # Mask Raw (for CMMP_raw task)
+            raw_src, tgt_mlm_raw = mask_seq(
+                raw_src, self.tokenizer_raw, self.whole_word_masking,
+                self.span_masking, self.span_geo_prob, self.span_max_length
+            )
 
-            # Mask Size (for CMMP task)
+            # Mask Size (for CMMP_size task)
             size_src, tgt_mlm_size = mask_seq(
                 size_src, self.tokenizer_size, self.whole_word_masking,
                 self.span_masking, self.span_geo_prob, self.span_max_length
             )
 
-            # Return 5 elements (with tgt_mlm_size only)
-            return (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_size)
+            # Return 6 elements (with both tgt_mlm_raw and tgt_mlm_size)
+            return (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_raw, tgt_mlm_size)
         else:
             # Dynamic masking: defer masking to DataLoader
             # Return 4 elements (without tgt_mlm)
@@ -1495,11 +1499,12 @@ class MultiModalDataLoader(DataLoader):
     Supports both static and dynamic masking (controlled by args.dynamic_masking).
 
     Returns:
-        raw_src: [batch, 512] - Raw Packet tokens (no masking)
+        raw_src: [batch, 512] - Raw Packet tokens (masked for CMMP_raw)
         raw_packet_ids: [batch, 512] - Packet indices
         raw_directions: [batch, 512] - Direction indices
-        size_src: [batch, 256] - Size tokens (15% masked for CMMP)
-        tgt_cmmp_size: [batch, 256] - CMMP targets (0 for unmasked, token_id for masked)
+        size_src: [batch, 256] - Size tokens (masked for CMMP_size)
+        tgt_cmmp_raw: [batch, 512] - CMMP_raw targets (0 for unmasked, token_id for masked)
+        tgt_cmmp_size: [batch, 256] - CMMP_size targets (0 for unmasked, token_id for masked)
     """
 
     def __init__(self, args, dataset_path, batch_size, proc_id, proc_num, shuffle=False):
@@ -1529,45 +1534,60 @@ class MultiModalDataLoader(DataLoader):
             raw_packet_ids_batch = []
             raw_directions_batch = []
             size_src_batch = []
+            tgt_cmmp_raw_batch = []
             tgt_cmmp_size_batch = []
 
             masked_words_num = 0
 
             for ins in instances:
                 # Instance format depends on masking mode:
-                # Static masking (len=5): (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_size)
-                #   - Only size_src is masked in Dataset
+                # Static masking (len=6): (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_raw, tgt_mlm_size)
                 # Dynamic masking (len=4): (raw_src, raw_packet_ids, raw_directions_seq, size_src)
-                #   - Need to mask size_src here
 
-                # ===== Process Raw modality (for CMM task) =====
-                # Raw is NOT masked
-                raw_src_batch.append(ins[0])
-                raw_packet_ids_batch.append(ins[1])
-                raw_directions_batch.append(ins[2])
-
-                # ===== Process Size modality (for CMMP task) =====
-                if len(ins) == 5:
+                if len(ins) == 6:
                     # Static masking: Dataset already applied masking
+                    raw_src = ins[0]
+                    tgt_mlm_raw = ins[4]  # List of (position, token) tuples
                     size_src = ins[3]
-                    tgt_mlm_size = ins[4]  # List of (position, token) tuples
+                    tgt_mlm_size = ins[5]  # List of (position, token) tuples
 
-                    masked_words_num += len(tgt_mlm_size)
+                    masked_words_num += len(tgt_mlm_raw) + len(tgt_mlm_size)
 
-                    # Convert tgt_mlm format: [(pos, token), ...] -> [0, 0, token, 0, ...]
-                    tgt_cmmp = [0] * len(size_src)
+                    # Convert tgt_mlm format for raw: [(pos, token), ...] -> [0, 0, token, 0, ...]
+                    tgt_cmmp_raw = [0] * len(raw_src)
+                    for pos, token in tgt_mlm_raw:
+                        tgt_cmmp_raw[pos] = token
+
+                    # Convert tgt_mlm format for size: [(pos, token), ...] -> [0, 0, token, 0, ...]
+                    tgt_cmmp_size = [0] * len(size_src)
                     for pos, token in tgt_mlm_size:
-                        tgt_cmmp[pos] = token
+                        tgt_cmmp_size[pos] = token
 
+                    raw_src_batch.append(raw_src)
+                    raw_packet_ids_batch.append(ins[1])
+                    raw_directions_batch.append(ins[2])
                     size_src_batch.append(size_src)
-                    tgt_cmmp_size_batch.append(tgt_cmmp)
+                    tgt_cmmp_raw_batch.append(tgt_cmmp_raw)
+                    tgt_cmmp_size_batch.append(tgt_cmmp_size)
 
                 else:  # len(ins) == 4
                     # Dynamic masking: Apply mask_seq() here in DataLoader
-                    size_src = ins[3]
+                    raw_src = list(ins[0])  # Copy to avoid modifying original
+                    size_src = list(ins[3])
 
-                    size_src_masked, tgt_mlm = mask_seq(
-                        size_src.copy(),  # Copy to avoid modifying original
+                    # Mask raw
+                    raw_src_masked, tgt_mlm_raw = mask_seq(
+                        raw_src,
+                        self.tokenizer_raw,
+                        self.whole_word_masking,
+                        self.span_masking,
+                        self.span_geo_prob,
+                        self.span_max_length
+                    )
+
+                    # Mask size
+                    size_src_masked, tgt_mlm_size = mask_seq(
+                        size_src,
                         self.tokenizer_size,
                         self.whole_word_masking,
                         self.span_masking,
@@ -1575,15 +1595,24 @@ class MultiModalDataLoader(DataLoader):
                         self.span_max_length
                     )
 
-                    masked_words_num += len(tgt_mlm)
+                    masked_words_num += len(tgt_mlm_raw) + len(tgt_mlm_size)
 
-                    # Convert tgt_mlm format: [(pos, token), ...] -> [0, 0, token, 0, ...]
-                    tgt_cmmp = [0] * len(size_src)
-                    for pos, token in tgt_mlm:
-                        tgt_cmmp[pos] = token
+                    # Convert tgt_mlm format for raw
+                    tgt_cmmp_raw = [0] * len(raw_src)
+                    for pos, token in tgt_mlm_raw:
+                        tgt_cmmp_raw[pos] = token
 
+                    # Convert tgt_mlm format for size
+                    tgt_cmmp_size = [0] * len(size_src)
+                    for pos, token in tgt_mlm_size:
+                        tgt_cmmp_size[pos] = token
+
+                    raw_src_batch.append(raw_src_masked)
+                    raw_packet_ids_batch.append(ins[1])
+                    raw_directions_batch.append(ins[2])
                     size_src_batch.append(size_src_masked)
-                    tgt_cmmp_size_batch.append(tgt_cmmp)
+                    tgt_cmmp_raw_batch.append(tgt_cmmp_raw)
+                    tgt_cmmp_size_batch.append(tgt_cmmp_size)
 
             # Skip batch if no masked words (should rarely happen)
             if masked_words_num == 0:
@@ -1593,4 +1622,5 @@ class MultiModalDataLoader(DataLoader):
                    torch.LongTensor(raw_packet_ids_batch),
                    torch.LongTensor(raw_directions_batch),
                    torch.LongTensor(size_src_batch),
+                   torch.LongTensor(tgt_cmmp_raw_batch),
                    torch.LongTensor(tgt_cmmp_size_batch))

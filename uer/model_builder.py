@@ -61,36 +61,49 @@ def build_model(args):
             fusion, target
         )
 
-        # Load pretrained encoders (if specified)
-        if hasattr(args, 'pretrained_raw_path') and args.pretrained_raw_path:
-            print(f"Loading pretrained Raw encoder from {args.pretrained_raw_path}")
-            # Load state dict
-            raw_state = torch.load(args.pretrained_raw_path, map_location="cpu")
+        # Phase-specific loading
+        is_phase1 = getattr(args, 'phase1', False)
+        is_phase2 = getattr(args, 'phase2', False)
 
-            # Load embedding and encoder weights
-            model.embedding_raw.load_state_dict(
-                {k.replace('embedding.', ''): v for k, v in raw_state.items() if k.startswith('embedding.')},
-                strict=False
-            )
-            model.encoder_raw.load_state_dict(
-                {k.replace('encoder.', ''): v for k, v in raw_state.items() if k.startswith('encoder.')},
-                strict=False
-            )
+        if is_phase1:
+            # Phase 1: Load pretrained encoders from Stage 1
+            if hasattr(args, 'pretrained_raw_path') and args.pretrained_raw_path:
+                print(f"[Phase 1] Loading pretrained Raw encoder from {args.pretrained_raw_path}")
+                raw_state = torch.load(args.pretrained_raw_path, map_location="cpu")
+                model.embedding_raw.load_state_dict(
+                    {k.replace('embedding.', ''): v for k, v in raw_state.items() if k.startswith('embedding.')},
+                    strict=False
+                )
+                model.encoder_raw.load_state_dict(
+                    {k.replace('encoder.', ''): v for k, v in raw_state.items() if k.startswith('encoder.')},
+                    strict=False
+                )
+            else:
+                print("WARNING: Phase 1 without pretrained_raw_path - encoders will be randomly initialized")
 
-        if hasattr(args, 'pretrained_size_path') and args.pretrained_size_path:
-            print(f"Loading pretrained Size encoder from {args.pretrained_size_path}")
-            # Load state dict
-            size_state = torch.load(args.pretrained_size_path, map_location="cpu")
+            if hasattr(args, 'pretrained_size_path') and args.pretrained_size_path:
+                print(f"[Phase 1] Loading pretrained Size encoder from {args.pretrained_size_path}")
+                size_state = torch.load(args.pretrained_size_path, map_location="cpu")
+                model.embedding_size.load_state_dict(
+                    {k.replace('embedding.', ''): v for k, v in size_state.items() if k.startswith('embedding.')},
+                    strict=False
+                )
+                model.encoder_size.load_state_dict(
+                    {k.replace('encoder.', ''): v for k, v in size_state.items() if k.startswith('encoder.')},
+                    strict=False
+                )
+            else:
+                print("WARNING: Phase 1 without pretrained_size_path - encoders will be randomly initialized")
 
-            # Load embedding and encoder weights
-            model.embedding_size.load_state_dict(
-                {k.replace('embedding.', ''): v for k, v in size_state.items() if k.startswith('embedding.')},
-                strict=False
-            )
-            model.encoder_size.load_state_dict(
-                {k.replace('encoder.', ''): v for k, v in size_state.items() if k.startswith('encoder.')},
-                strict=False
-            )
+            # Freeze encoders for Phase 1
+            model._freeze_encoders()
+            print("[Phase 1] Encoders frozen")
+
+        elif is_phase2:
+            # Phase 2: Full model will be loaded via --pretrained_model_path in trainer.py
+            # Encoders should NOT be frozen
+            print("[Phase 2] Full parameter training mode")
+            print("  Note: Phase 1 checkpoint should be loaded via --pretrained_model_path")
 
     # For raw_packet target, use RawPacketEmbedding and RawPacketModel
     elif args.target == "raw_packet":

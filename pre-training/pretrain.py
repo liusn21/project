@@ -103,18 +103,32 @@ def main():
                         help="Path of the pretrained Raw Packet encoder.")
     parser.add_argument("--pretrained_size_path", default=None, type=str,
                         help="Path of the pretrained Packet Size encoder.")
-    parser.add_argument("--freeze_encoders", action="store_true",
-                        help="Freeze encoder parameters in Phase 1 (multimodal only).")
-    parser.add_argument("--phase1_steps", type=int, default=70000,
-                        help="Number of steps for Phase 1 with frozen encoders (multimodal only).")
+    
+    # Phase selection (mutually exclusive)
+    parser.add_argument("--phase1", action="store_true",
+                        help="Run Phase 1: Freeze encoders, train fusion + target only. "
+                             "Requires --pretrained_raw_path and --pretrained_size_path.")
+    parser.add_argument("--phase2", action="store_true",
+                        help="Run Phase 2: Full parameter training with differential LR. "
+                             "Requires --pretrained_model_path pointing to Phase 1 checkpoint.")
+    
+    # Loss weights
     parser.add_argument("--balance_loss_alpha", type=float, default=0.1,
                         help="Weight for balance loss in multimodal training.")
+    parser.add_argument("--cmmp_raw_weight", type=float, default=0.1,
+                        help="Weight for CMMP_raw loss (multimodal only).")
+    parser.add_argument("--cmmp_size_weight", type=float, default=0.1,
+                        help="Weight for CMMP_size loss (multimodal only).")
+    
+    # Temperature parameters
     parser.add_argument("--gate_temperature", type=float, default=0.5,
                         help="Temperature for gate softmax in fusion module (multimodal only).")
     parser.add_argument("--cmm_temperature", type=float, default=0.07,
                         help="Temperature for CMM contrastive loss (multimodal only).")
+    
+    # Learning rate
     parser.add_argument("--encoder_lr_ratio", type=float, default=0.1,
-                        help="Learning rate ratio for encoders relative to fusion/target (multimodal only). "
+                        help="Learning rate ratio for encoders in Phase 2 (multimodal only). "
                              "E.g., 0.1 means encoder LR = base_LR * 0.1")
 
     # GPU options.
