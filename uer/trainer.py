@@ -11,7 +11,7 @@ from uer.utils import *
 from uer.utils.vocab import Vocab
 from uer.utils.seed import set_seed
 from uer.utils.constants import PAD_ID
-from uer.layers.multimodal_fusion import compute_balance_loss
+# Note: Old compute_balance_loss removed in ALBEF-style implementation
 from tqdm import tqdm
 
 def train_and_validate(args):
@@ -324,139 +324,86 @@ class PacketSizeMlmTrainer(Trainer):
 
 class MultiModalTrainer(Trainer):
     """
-    Trainer for Multi-Modal Pretraining (Stage 2)
+    Trainer for Multi-Modal Pretraining (Stage 2) - ALBEF-style
 
-    Phase 1: Freeze encoders, train fusion + target only
-    Phase 2: Full parameter training with differential LR
+    Tasks: ITC + ITM + MLM_raw + MLM_size
 
-    Tasks: CMM + CMMP_raw + CMMP_size + Balance Loss
-    
-    Phase is determined by args.phase1 or args.phase2 flags (mutually exclusive)
+    Features:
+    - Momentum distillation with EMA update
+    - Feature queues for contrastive learning
+    - Hard negative mining for ITM
+    - Full parameter training with differential LR
     """
 
     def __init__(self, args):
         super(MultiModalTrainer, self).__init__(args)
 
         # Loss tracking
-        self.total_loss_cmm = 0.0
-        self.total_loss_cmmp_raw = 0.0
-        self.total_loss_cmmp_size = 0.0
-        self.total_loss_balance = 0.0
+        self.total_loss_itc = 0.0
+        self.total_loss_itm = 0.0
+        self.total_loss_mlm_raw = 0.0
+        self.total_loss_mlm_size = 0.0
 
         # Accuracy tracking
-        self.total_correct_cmm = 0.0
-        self.total_instances_cmm = 0.0
-        self.total_correct_cmmp_raw = 0.0
-        self.total_denominator_cmmp_raw = 0.0
-        self.total_correct_cmmp_size = 0.0
-        self.total_denominator_cmmp_size = 0.0
-
-        # Gate weight tracking
-        self.total_g_raw = 0.0
-        self.total_g_size = 0.0
+        self.total_acc_itm = 0.0
+        self.total_correct_mlm_raw = 0.0
+        self.total_denominator_mlm_raw = 0.0
+        self.total_correct_mlm_size = 0.0
+        self.total_denominator_mlm_size = 0.0
 
         # Loss weights
-        self.balance_loss_alpha = getattr(args, 'balance_loss_alpha', 0.1)
-        self.cmmp_raw_weight = getattr(args, 'cmmp_raw_weight', 0.1)
-        self.cmmp_size_weight = getattr(args, 'cmmp_size_weight', 0.1)
+        self.lambda_itc = getattr(args, 'lambda_itc', 1.0)
+        self.lambda_itm = getattr(args, 'lambda_itm', 1.0)
+        self.lambda_mlm = getattr(args, 'lambda_mlm', 1.0)
 
-        # CMM temperature parameter
-        self.cmm_temperature = getattr(args, 'cmm_temperature', 0.07)
-
-        # Phase detection (determined by args, no transition)
-        self.is_phase1 = getattr(args, 'phase1', False)
-        self.is_phase2 = getattr(args, 'phase2', False)
-        
-        # Validate phase flags
-        if self.is_phase1 and self.is_phase2:
-            raise ValueError("Cannot specify both --phase1 and --phase2")
-        if not self.is_phase1 and not self.is_phase2:
-            raise ValueError("Must specify either --phase1 or --phase2")
+        # Count batches for averaging
+        self.batch_count = 0
 
     def forward_propagation(self, batch, model):
         """
-        Forward pass for multimodal pretraining
+        Forward pass for ALBEF-style multimodal pretraining
 
-        Batch format: (raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_raw, tgt_cmmp_size)
+        Batch format: (raw_src, raw_packet_ids, raw_directions, size_src, tgt_mlm_raw, tgt_mlm_size)
         """
-        raw_src, raw_packet_ids, raw_directions, size_src, tgt_cmmp_raw, tgt_cmmp_size = batch
-        batch_size = raw_src.size(0)
+        raw_src, raw_packet_ids, raw_directions, size_src, tgt_mlm_raw, tgt_mlm_size = batch
 
-        # ===== Step 1: Forward Encoders =====
+        # Forward through model
         if hasattr(model, 'module'):
-            raw_emb = model.module.embedding_raw(raw_src, raw_packet_ids, raw_directions)
-            size_emb = model.module.embedding_size(size_src)
+            loss_dict = model.module(
+                raw_src, raw_packet_ids, raw_directions, size_src,
+                tgt_mlm_raw, tgt_mlm_size
+            )
         else:
-            raw_emb = model.embedding_raw(raw_src, raw_packet_ids, raw_directions)
-            size_emb = model.embedding_size(size_src)
+            loss_dict = model(
+                raw_src, raw_packet_ids, raw_directions, size_src,
+                tgt_mlm_raw, tgt_mlm_size
+            )
 
-        raw_seg = (raw_src != PAD_ID).long()
-        size_seg = (size_src != PAD_ID).long()
+        # Extract losses
+        itc_loss = loss_dict['itc_loss']
+        itm_loss = loss_dict['itm_loss']
+        mlm_raw_loss = loss_dict['mlm_raw_loss']
+        mlm_size_loss = loss_dict['mlm_size_loss']
 
-        if hasattr(model, 'module'):
-            raw_output = model.module.encoder_raw(raw_emb, raw_seg)
-            size_output = model.module.encoder_size(size_emb, size_seg)
-        else:
-            raw_output = model.encoder_raw(raw_emb, raw_seg)
-            size_output = model.encoder_size(size_emb, size_seg)
+        # Combined loss
+        loss = (self.lambda_itc * itc_loss +
+                self.lambda_itm * itm_loss +
+                self.lambda_mlm * (mlm_raw_loss + mlm_size_loss))
 
-        # ===== Step 2: Fusion =====
-        if hasattr(model, 'module'):
-            fusion = model.module.fusion
-            target = model.module.target
-        else:
-            fusion = model.fusion
-            target = model.target
-
-        raw_fused, size_fused, (g_raw, g_size, gates) = fusion(
-            raw_output, size_output,
-            raw_seg=raw_seg,
-            size_seg=size_seg,
-            return_gate_weights=True
-        )
-
-        # ===== Step 3: CMMP_raw Task =====
-        cmmp_raw_loss, cmmp_raw_correct, cmmp_raw_denominator = target.forward_cmmp_raw(
-            raw_fused, tgt_cmmp_raw
-        )
-
-        # ===== Step 4: CMMP_size Task =====
-        cmmp_size_loss, cmmp_size_correct, cmmp_size_denominator = target.forward_cmmp_size(
-            size_fused, tgt_cmmp_size
-        )
-
-        # ===== Step 5: CMM Task =====
-        cmm_loss, cmm_correct = target.forward_cmm_itm(
-            raw_fused, size_fused, temperature=self.cmm_temperature
-        )
-
-        # ===== Step 6: Balance Loss (entropy-based) =====
-        balance_loss = compute_balance_loss(g_raw, g_size, gates=gates)
-
-        # ===== Step 7: Combined Loss =====
-        loss = (cmm_loss + 
-                self.cmmp_raw_weight * cmmp_raw_loss + 
-                self.cmmp_size_weight * cmmp_size_loss + 
-                self.balance_loss_alpha * balance_loss)
-
-        # Update Statistics
+        # Update statistics
         self.total_loss += loss.item()
-        self.total_loss_cmm += cmm_loss.item()
-        self.total_loss_cmmp_raw += cmmp_raw_loss.item()
-        self.total_loss_cmmp_size += cmmp_size_loss.item()
-        self.total_loss_balance += balance_loss.item()
+        self.total_loss_itc += itc_loss.item()
+        self.total_loss_itm += itm_loss.item()
+        self.total_loss_mlm_raw += mlm_raw_loss.item()
+        self.total_loss_mlm_size += mlm_size_loss.item()
 
-        self.total_correct_cmm += cmm_correct.item()
-        self.total_instances_cmm += batch_size
+        self.total_acc_itm += loss_dict['itm_acc'].item()
+        self.total_correct_mlm_raw += loss_dict['mlm_raw_correct'].item()
+        self.total_denominator_mlm_raw += loss_dict['mlm_raw_denom'].item()
+        self.total_correct_mlm_size += loss_dict['mlm_size_correct'].item()
+        self.total_denominator_mlm_size += loss_dict['mlm_size_denom'].item()
 
-        self.total_correct_cmmp_raw += cmmp_raw_correct.item()
-        self.total_denominator_cmmp_raw += cmmp_raw_denominator.item()
-
-        self.total_correct_cmmp_size += cmmp_size_correct.item()
-        self.total_denominator_cmmp_size += cmmp_size_denominator.item()
-
-        self.total_g_raw += g_raw.mean().item()
-        self.total_g_size += g_size.mean().item()
+        self.batch_count += 1
 
         loss = loss / self.accumulation_steps
         return loss
@@ -466,104 +413,46 @@ class MultiModalTrainer(Trainer):
         if self.dist_train:
             done_tokens *= self.world_size
 
-        avg_loss = self.total_loss / self.report_steps
-        avg_loss_cmm = self.total_loss_cmm / self.report_steps
-        avg_loss_cmmp_raw = self.total_loss_cmmp_raw / self.report_steps
-        avg_loss_cmmp_size = self.total_loss_cmmp_size / self.report_steps
-        avg_loss_balance = self.total_loss_balance / self.report_steps
+        n = self.batch_count if self.batch_count > 0 else 1
 
-        acc_cmm = self.total_correct_cmm / self.total_instances_cmm if self.total_instances_cmm > 0 else 0.0
-        acc_cmmp_raw = self.total_correct_cmmp_raw / self.total_denominator_cmmp_raw if self.total_denominator_cmmp_raw > 0 else 0.0
-        acc_cmmp_size = self.total_correct_cmmp_size / self.total_denominator_cmmp_size if self.total_denominator_cmmp_size > 0 else 0.0
+        avg_loss = self.total_loss / n
+        avg_loss_itc = self.total_loss_itc / n
+        avg_loss_itm = self.total_loss_itm / n
+        avg_loss_mlm_raw = self.total_loss_mlm_raw / n
+        avg_loss_mlm_size = self.total_loss_mlm_size / n
 
-        avg_g_raw = self.total_g_raw / self.report_steps
-        avg_g_size = self.total_g_size / self.report_steps
-
-        phase = "Phase1" if self.is_phase1 else "Phase2"
+        avg_acc_itm = self.total_acc_itm / n
+        acc_mlm_raw = self.total_correct_mlm_raw / self.total_denominator_mlm_raw if self.total_denominator_mlm_raw > 0 else 0.0
+        acc_mlm_size = self.total_correct_mlm_size / self.total_denominator_mlm_size if self.total_denominator_mlm_size > 0 else 0.0
 
         print("| {:8d}/{:8d} steps"
-              " | {} |"
-              " {:3.3f} s"
-              " | loss {:7.2f}"
-              " | cmm: {:3.3f}"
-              " | cmmp_r: {:3.3f}"
-              " | cmmp_s: {:3.3f}"
-              " | bal: {:3.3f}"
-              " | acc_cmm: {:3.3f}"
-              " | acc_r: {:3.3f}"
-              " | acc_s: {:3.3f}"
-              " | g_raw: {:3.3f}"
-              " | g_size: {:3.3f}".format(
-            self.current_step, self.total_steps, phase,
+              " | {:3.3f} s"
+              " | loss {:7.3f}"
+              " | itc: {:5.3f}"
+              " | itm: {:5.3f}"
+              " | mlm_r: {:5.3f}"
+              " | mlm_s: {:5.3f}"
+              " | acc_itm: {:5.3f}"
+              " | acc_mlm_r: {:5.3f}"
+              " | acc_mlm_s: {:5.3f}".format(
+            self.current_step, self.total_steps,
             (time.time() - self.start_time),
-            avg_loss, avg_loss_cmm, avg_loss_cmmp_raw, avg_loss_cmmp_size, avg_loss_balance,
-            acc_cmm, acc_cmmp_raw, acc_cmmp_size, avg_g_raw, avg_g_size
+            avg_loss, avg_loss_itc, avg_loss_itm, avg_loss_mlm_raw, avg_loss_mlm_size,
+            avg_acc_itm, acc_mlm_raw, acc_mlm_size
         ))
 
         # Reset statistics
         self.total_loss = 0.0
-        self.total_loss_cmm = 0.0
-        self.total_loss_cmmp_raw = 0.0
-        self.total_loss_cmmp_size = 0.0
-        self.total_loss_balance = 0.0
-        self.total_correct_cmm = 0.0
-        self.total_instances_cmm = 0.0
-        self.total_correct_cmmp_raw = 0.0
-        self.total_denominator_cmmp_raw = 0.0
-        self.total_correct_cmmp_size = 0.0
-        self.total_denominator_cmmp_size = 0.0
-        self.total_g_raw = 0.0
-        self.total_g_size = 0.0
-
-    def train(self, args, gpu_id, rank, loader, model, optimizer, scheduler):
-        """Training loop - simplified without phase transition"""
-        model.train()
-        loader_iter = iter(loader)
-
-        while True:
-            if self.current_step == self.total_steps + 1:
-                break
-
-            batch = list(next(loader_iter))
-            self.seq_length = batch[0].size(1)
-
-            if gpu_id is not None:
-                for i in range(len(batch)):
-                    batch[i] = batch[i].cuda(gpu_id)
-
-            loss = self.forward_propagation(batch, model)
-
-            if args.fp16:
-                with args.amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
-
-            if self.current_step % self.accumulation_steps == 0:
-                if hasattr(args, 'clip_grad_norm') and args.clip_grad_norm > 0:
-                    if args.fp16:
-                        torch.nn.utils.clip_grad_norm_(
-                            args.amp.master_params(optimizer), args.clip_grad_norm
-                        )
-                    else:
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), args.clip_grad_norm
-                        )
-
-                optimizer.step()
-                scheduler.step()
-                model.zero_grad()
-
-            if self.current_step % self.report_steps == 0 and \
-                    (not self.dist_train or (self.dist_train and rank == 0)):
-                self.report_and_reset_stats()
-                self.start_time = time.time()
-
-            if self.current_step % self.save_checkpoint_steps == 0 and \
-                    (not self.dist_train or (self.dist_train and rank == 0)):
-                save_model(model, self.output_model_path + "-" + str(self.current_step))
-
-            self.current_step += 1
+        self.total_loss_itc = 0.0
+        self.total_loss_itm = 0.0
+        self.total_loss_mlm_raw = 0.0
+        self.total_loss_mlm_size = 0.0
+        self.total_acc_itm = 0.0
+        self.total_correct_mlm_raw = 0.0
+        self.total_denominator_mlm_raw = 0.0
+        self.total_correct_mlm_size = 0.0
+        self.total_denominator_mlm_size = 0.0
+        self.batch_count = 0
 
 
 str2trainer = {
@@ -612,37 +501,33 @@ def worker(proc_id, gpu_ranks, args, model):
     param_optimizer = list(model.named_parameters())
     no_decay = ["bias", "gamma", "beta"]
 
-    # Multimodal: Phase-specific learning rate strategy
+    # Multimodal: Differential learning rate (ALBEF-style)
     if args.target == "multimodal":
         encoder_lr_ratio = getattr(args, 'encoder_lr_ratio', 0.1)
-        is_phase1 = getattr(args, 'phase1', False)
-        is_phase2 = getattr(args, 'phase2', False)
-        
-        # Determine encoder learning rate based on phase
-        if is_phase1:
-            # Phase 1: Freeze encoders (lr = 0)
-            encoder_lr = 0.0
-            print(f"=== PHASE 1: Frozen Encoders ===")
-            print(f"  Encoder lr: {encoder_lr:.2e} (frozen)")
-            print(f"  Fusion/Target lr: {args.learning_rate:.2e}")
-        else:  # is_phase2
-            # Phase 2: Differential learning rate
-            encoder_lr = args.learning_rate * encoder_lr_ratio
-            print(f"=== PHASE 2: Full Parameter Training ===")
-            print(f"  Encoder lr: {encoder_lr:.2e} (ratio={encoder_lr_ratio})")
-            print(f"  Fusion/Target lr: {args.learning_rate:.2e}")
+        encoder_lr = args.learning_rate * encoder_lr_ratio
+
+        print(f"=== ALBEF-style Multi-Modal Training ===")
+        print(f"  Encoder lr: {encoder_lr:.2e} (ratio={encoder_lr_ratio})")
+        print(f"  Fusion/Target lr: {args.learning_rate:.2e}")
 
         # Group parameters: encoder vs non-encoder (fusion + target)
+        # Note: Momentum encoders are not trained (requires_grad=False)
         encoder_params_decay = []
         encoder_params_no_decay = []
         other_params_decay = []
         other_params_no_decay = []
 
         for n, p in param_optimizer:
-            is_encoder = "encoder_raw" in n or "encoder_size" in n or "embedding_raw" in n or "embedding_size" in n
+            if not p.requires_grad:
+                continue  # Skip momentum encoder parameters
+
+            # Check if this is a main encoder parameter (not momentum)
+            is_main_encoder = (("encoder_raw" in n or "encoder_size" in n or
+                               "embedding_raw" in n or "embedding_size" in n) and
+                              "_m" not in n)  # Exclude momentum encoders
             is_no_decay = any(nd in n for nd in no_decay)
 
-            if is_encoder:
+            if is_main_encoder:
                 if is_no_decay:
                     encoder_params_no_decay.append(p)
                 else:

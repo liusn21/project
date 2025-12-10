@@ -1,200 +1,233 @@
 """
-Multi-Modal Fusion Module for Stage 2 Pretraining (v3)
+Multi-Modal Fusion Module for Stage 2 Pretraining (ALBEF-style)
 
-设计要点：
-1. 标准双向 Cross-Attention：raw ↔ size 双向信息交换
-2. Joint Gated Fusion：Gate 同时看两个模态，用 softmax 约束平衡
-3. Entropy-based Balance Loss：最大化熵，鼓励均匀分布
+Architecture:
+- 6层双向Cross-Attention Fusion
+- 每层包含: Self-Attention + Cross-Attention (双向) + FFN
+- 参考LXMERT的双向设计
 
-改进 (v3):
-- Gate 输入从单模态改为双模态拼接，能感知两个模态的状态
-- 使用 softmax 让两个 gate 和为 1，形成竞争约束
-- Balance loss 改为熵最大化，鼓励 [0.5, 0.5] 的均匀分布
+改进点 (相比原版本):
+1. 去掉Gate机制，采用标准的残差连接
+2. 6层深度融合，而非单层
+3. 双向Cross-Attention: Raw↔Size
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from uer.layers.multi_headed_attn import MultiHeadedAttention
 from uer.layers.layer_norm import LayerNorm
+from uer.layers.position_ffn import PositionwiseFeedForward
 
 
-class GatedMultiModalFusion(nn.Module):
+class BidirectionalFusionLayer(nn.Module):
     """
-    Gated Bidirectional Cross-Attention Fusion (v3)
+    单层双向Cross-Attention Fusion
 
-    Architecture:
-    1. Bidirectional Cross-Attention:
-       - cross_raw = CrossAttn(Q=raw, K=size, V=size)  # raw 从 size 获取信息
-       - cross_size = CrossAttn(Q=size, K=raw, V=raw)  # size 从 raw 获取信息
-    
-    2. Joint Gated Fusion (改进):
-       - 输入: concat([raw_cls, size_cls]) 同时看两个模态
-       - 输出: softmax([g_raw, g_size])，和为 1，形成竞争
-       - g_raw 控制 raw 吸收多少 size 的信息
-       - g_size 控制 size 吸收多少 raw 的信息
-    
-    3. Output:
-       - raw_fused = LayerNorm(raw + g_raw * cross_raw)
-       - size_fused = LayerNorm(size + g_size * cross_size)
+    结构:
+        Raw Branch:  Self-Attn → Cross-Attn(Q=raw, KV=size) → FFN
+        Size Branch: Self-Attn → Cross-Attn(Q=size, KV=raw) → FFN
+
+    采用Post-LayerNorm结构 (与原框架一致)
     """
 
-    def __init__(self, hidden_size=768, num_attention_heads=12, attention_head_size=64,
-                 dropout=0.1, gate_temperature=1.0):
-        super(GatedMultiModalFusion, self).__init__()
+    def __init__(self, hidden_size, heads_num, feedforward_size, hidden_act, dropout):
+        super(BidirectionalFusionLayer, self).__init__()
 
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.attention_head_size = attention_head_size
-        self.gate_temperature = gate_temperature
+        attention_head_size = hidden_size // heads_num
 
-        # Bidirectional Cross-Attention layers
-        self.cross_attn_raw2size = MultiHeadedAttention(
+        # ===== Raw Branch =====
+        # Self-Attention
+        self.self_attn_raw = MultiHeadedAttention(
             hidden_size=hidden_size,
-            heads_num=num_attention_heads,
+            heads_num=heads_num,
             attention_head_size=attention_head_size,
             dropout=dropout,
             has_bias=True,
             with_scale=True
         )
-        self.cross_attn_size2raw = MultiHeadedAttention(
+        self.layer_norm_raw_1 = LayerNorm(hidden_size)
+        self.dropout_raw_1 = nn.Dropout(dropout)
+
+        # Cross-Attention (Q=raw, KV=size)
+        self.cross_attn_raw = MultiHeadedAttention(
             hidden_size=hidden_size,
-            heads_num=num_attention_heads,
+            heads_num=heads_num,
             attention_head_size=attention_head_size,
             dropout=dropout,
             has_bias=True,
             with_scale=True
         )
+        self.layer_norm_raw_2 = LayerNorm(hidden_size)
+        self.dropout_raw_2 = nn.Dropout(dropout)
 
-        # Layer normalization
-        self.layer_norm_raw = LayerNorm(hidden_size)
-        self.layer_norm_size = LayerNorm(hidden_size)
-
-        self.gate_net = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 2)  # 输出 2 个 logits
+        # FFN
+        self.ffn_raw = PositionwiseFeedForward(
+            hidden_size=hidden_size,
+            feedforward_size=feedforward_size,
+            hidden_act=hidden_act,
+            has_bias=True
         )
+        self.layer_norm_raw_3 = LayerNorm(hidden_size)
+        self.dropout_raw_3 = nn.Dropout(dropout)
 
-    def forward(self, raw_feat, size_feat, raw_seg=None, size_seg=None, return_gate_weights=False):
+        # ===== Size Branch =====
+        # Self-Attention
+        self.self_attn_size = MultiHeadedAttention(
+            hidden_size=hidden_size,
+            heads_num=heads_num,
+            attention_head_size=attention_head_size,
+            dropout=dropout,
+            has_bias=True,
+            with_scale=True
+        )
+        self.layer_norm_size_1 = LayerNorm(hidden_size)
+        self.dropout_size_1 = nn.Dropout(dropout)
+
+        # Cross-Attention (Q=size, KV=raw)
+        self.cross_attn_size = MultiHeadedAttention(
+            hidden_size=hidden_size,
+            heads_num=heads_num,
+            attention_head_size=attention_head_size,
+            dropout=dropout,
+            has_bias=True,
+            with_scale=True
+        )
+        self.layer_norm_size_2 = LayerNorm(hidden_size)
+        self.dropout_size_2 = nn.Dropout(dropout)
+
+        # FFN
+        self.ffn_size = PositionwiseFeedForward(
+            hidden_size=hidden_size,
+            feedforward_size=feedforward_size,
+            hidden_act=hidden_act,
+            has_bias=True
+        )
+        self.layer_norm_size_3 = LayerNorm(hidden_size)
+        self.dropout_size_3 = nn.Dropout(dropout)
+
+    def forward(self, raw_feat, size_feat, raw_mask, size_mask, cross_mask_r2s, cross_mask_s2r):
         """
-        Forward pass with bidirectional cross-attention and joint gated fusion
-
         Args:
-            raw_feat: [batch, seq_len_raw, hidden] - Raw Packet features
-            size_feat: [batch, seq_len_size, hidden] - Packet Size features
-            raw_seg: [batch, seq_len_raw] - Raw segment indicators
-            size_seg: [batch, seq_len_size] - Size segment indicators
-            return_gate_weights: Whether to return gate weights for balance loss
+            raw_feat: [batch, seq_len_raw, hidden] - Raw特征
+            size_feat: [batch, seq_len_size, hidden] - Size特征
+            raw_mask: [batch, 1, seq_len_raw, seq_len_raw] - Raw self-attention mask
+            size_mask: [batch, 1, seq_len_size, seq_len_size] - Size self-attention mask
+            cross_mask_r2s: [batch, 1, seq_len_raw, seq_len_size] - Raw attend to Size的mask
+            cross_mask_s2r: [batch, 1, seq_len_size, seq_len_raw] - Size attend to Raw的mask
 
         Returns:
-            raw_fused: [batch, seq_len_raw, hidden]
-            size_fused: [batch, seq_len_size, hidden]
-            gate_weights: (g_raw, g_size, gates) if return_gate_weights=True
-                - g_raw: [batch, 1] 
-                - g_size: [batch, 1]
-                - gates: [batch, 2] softmax 分布，用于计算 entropy loss
+            raw_out: [batch, seq_len_raw, hidden]
+            size_out: [batch, seq_len_size, hidden]
+        """
+        # ===== Raw Branch =====
+        # Self-Attention
+        raw_self, _ = self.self_attn_raw(raw_feat, raw_feat, raw_feat, raw_mask, None)
+        raw_self = self.dropout_raw_1(raw_self)
+        raw_feat = self.layer_norm_raw_1(raw_feat + raw_self)
+
+        # Cross-Attention (Q=raw, KV=size)
+        raw_cross, _ = self.cross_attn_raw(size_feat, size_feat, raw_feat, cross_mask_r2s, None)
+        raw_cross = self.dropout_raw_2(raw_cross)
+        raw_feat = self.layer_norm_raw_2(raw_feat + raw_cross)
+
+        # FFN
+        raw_ffn = self.ffn_raw(raw_feat)
+        raw_ffn = self.dropout_raw_3(raw_ffn)
+        raw_out = self.layer_norm_raw_3(raw_feat + raw_ffn)
+
+        # ===== Size Branch =====
+        # Self-Attention
+        size_self, _ = self.self_attn_size(size_feat, size_feat, size_feat, size_mask, None)
+        size_self = self.dropout_size_1(size_self)
+        size_feat = self.layer_norm_size_1(size_feat + size_self)
+
+        # Cross-Attention (Q=size, KV=raw)
+        size_cross, _ = self.cross_attn_size(raw_feat, raw_feat, size_feat, cross_mask_s2r, None)
+        size_cross = self.dropout_size_2(size_cross)
+        size_feat = self.layer_norm_size_2(size_feat + size_cross)
+
+        # FFN
+        size_ffn = self.ffn_size(size_feat)
+        size_ffn = self.dropout_size_3(size_ffn)
+        size_out = self.layer_norm_size_3(size_feat + size_ffn)
+
+        return raw_out, size_out
+
+
+class MultiModalFusionEncoder(nn.Module):
+    """
+    多层双向Cross-Attention Fusion Encoder
+
+    包含6层BidirectionalFusionLayer
+    """
+
+    def __init__(self, args, num_layers=6):
+        super(MultiModalFusionEncoder, self).__init__()
+
+        self.num_layers = num_layers
+        self.hidden_size = args.hidden_size
+
+        # 构建6层Fusion
+        self.fusion_layers = nn.ModuleList([
+            BidirectionalFusionLayer(
+                hidden_size=args.hidden_size,
+                heads_num=args.heads_num,
+                feedforward_size=args.feedforward_size,
+                hidden_act=args.hidden_act,
+                dropout=args.dropout
+            )
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, raw_feat, size_feat, raw_seg, size_seg):
+        """
+        Args:
+            raw_feat: [batch, seq_len_raw, hidden] - Encoder输出的Raw特征
+            size_feat: [batch, seq_len_size, hidden] - Encoder输出的Size特征
+            raw_seg: [batch, seq_len_raw] - Raw segment (用于生成mask)
+            size_seg: [batch, seq_len_size] - Size segment (用于生成mask)
+
+        Returns:
+            raw_fused: [batch, seq_len_raw, hidden] - Fusion后的Raw特征
+            size_fused: [batch, seq_len_size, hidden] - Fusion后的Size特征
         """
         batch_size = raw_feat.size(0)
         seq_len_raw = raw_feat.size(1)
         seq_len_size = size_feat.size(1)
+        device = raw_feat.device
 
-        # ===== Step 1: Extract [CLS] tokens =====
-        raw_cls = raw_feat[:, 0, :]    # [batch, hidden]
-        size_cls = size_feat[:, 0, :]  # [batch, hidden]
+        # ===== 生成Attention Masks =====
+        # Raw self-attention mask: [batch, 1, seq_len_raw, seq_len_raw]
+        raw_mask = (raw_seg > 0).unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len_raw]
+        raw_mask = raw_mask.expand(-1, -1, seq_len_raw, -1).float()  # [batch, 1, seq_len_raw, seq_len_raw]
+        raw_mask = (1.0 - raw_mask) * -10000.0
 
-        # ===== Step 2: Joint Gate Computation (v3 改进) =====
-        # 拼接两个模态的 CLS，让 gate 能同时感知两者状态
-        combined_cls = torch.cat([raw_cls, size_cls], dim=-1)  # [batch, hidden * 2]
-        gate_logits = self.gate_net(combined_cls)  # [batch, 2]
-        
-        # Softmax with temperature: 和为 1，形成竞争约束
-        gates = F.softmax(gate_logits / self.gate_temperature, dim=-1)  # [batch, 2]
-        
-        g_raw = gates[:, 0:1]   # [batch, 1] - raw 从 size 吸收的权重
-        g_size = gates[:, 1:2]  # [batch, 1] - size 从 raw 吸收的权重
+        # Size self-attention mask: [batch, 1, seq_len_size, seq_len_size]
+        size_mask = (size_seg > 0).unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len_size]
+        size_mask = size_mask.expand(-1, -1, seq_len_size, -1).float()  # [batch, 1, seq_len_size, seq_len_size]
+        size_mask = (1.0 - size_mask) * -10000.0
 
-        # ===== Step 3: Create Attention Masks =====
-        if size_seg is not None:
-            size_mask = (size_seg > 0).unsqueeze(1).unsqueeze(1)
-            size_mask = size_mask.expand(-1, -1, seq_len_raw, -1).float()
-            size_mask = (1.0 - size_mask) * -10000.0
-        else:
-            size_mask = torch.zeros(batch_size, 1, seq_len_raw, seq_len_size, device=raw_feat.device)
+        # Cross-attention mask: Raw attend to Size
+        # [batch, 1, seq_len_raw, seq_len_size]
+        cross_mask_r2s = (size_seg > 0).unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len_size]
+        cross_mask_r2s = cross_mask_r2s.expand(-1, -1, seq_len_raw, -1).float()
+        cross_mask_r2s = (1.0 - cross_mask_r2s) * -10000.0
 
-        if raw_seg is not None:
-            raw_mask = (raw_seg > 0).unsqueeze(1).unsqueeze(1)
-            raw_mask = raw_mask.expand(-1, -1, seq_len_size, -1).float()
-            raw_mask = (1.0 - raw_mask) * -10000.0
-        else:
-            raw_mask = torch.zeros(batch_size, 1, seq_len_size, seq_len_raw, device=size_feat.device)
+        # Cross-attention mask: Size attend to Raw
+        # [batch, 1, seq_len_size, seq_len_raw]
+        cross_mask_s2r = (raw_seg > 0).unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len_raw]
+        cross_mask_s2r = cross_mask_s2r.expand(-1, -1, seq_len_size, -1).float()
+        cross_mask_s2r = (1.0 - cross_mask_s2r) * -10000.0
 
-        # ===== Step 4: Bidirectional Cross-Attention =====
-        # raw attend to size: raw 从 size 获取信息
-        cross_raw, _ = self.cross_attn_raw2size(
-            key=size_feat,
-            value=size_feat,
-            query=raw_feat,
-            mask=size_mask,
-            position_bias=None
-        )  # [batch, seq_len_raw, hidden]
+        # ===== 逐层Fusion =====
+        raw_hidden = raw_feat
+        size_hidden = size_feat
 
-        # size attend to raw: size 从 raw 获取信息
-        cross_size, _ = self.cross_attn_size2raw(
-            key=raw_feat,
-            value=raw_feat,
-            query=size_feat,
-            mask=raw_mask,
-            position_bias=None
-        )  # [batch, seq_len_size, hidden]
+        for layer in self.fusion_layers:
+            raw_hidden, size_hidden = layer(
+                raw_hidden, size_hidden,
+                raw_mask, size_mask,
+                cross_mask_r2s, cross_mask_s2r
+            )
 
-        # ===== Step 5: Gated Fusion =====
-        g_raw_expanded = g_raw.unsqueeze(-1)    # [batch, 1, 1]
-        g_size_expanded = g_size.unsqueeze(-1)  # [batch, 1, 1]
-
-        # Residual connection with gated cross-modal information
-        raw_fused = self.layer_norm_raw(raw_feat + g_raw_expanded * cross_raw)
-        size_fused = self.layer_norm_size(size_feat + g_size_expanded * cross_size)
-
-        if return_gate_weights:
-            # 返回 gates 用于计算 entropy-based balance loss
-            return raw_fused, size_fused, (g_raw, g_size, gates)
-        else:
-            return raw_fused, size_fused
-
-
-def compute_balance_loss(g_raw, g_size, gates=None):
-    """
-    Entropy-based Balance Loss (v3 改进)
-    
-    最大化 softmax 分布的熵，鼓励 [0.5, 0.5] 的均匀分布
-    
-    熵公式: H = -sum(p * log(p))
-    均匀分布 [0.5, 0.5] 时熵最大 = log(2) ≈ 0.693
-    极端分布 [1, 0] 或 [0, 1] 时熵最小 = 0
-    
-    Args:
-        g_raw: [batch, 1] - 兼容旧接口，但不再使用
-        g_size: [batch, 1] - 兼容旧接口，但不再使用
-        gates: [batch, 2] - softmax 分布，用于计算熵
-        
-    Returns:
-        loss: Scalar，负熵（最小化 loss = 最大化熵 = 鼓励均匀）
-    """
-    if gates is not None:
-        # 计算每个样本的熵，然后取 batch 平均
-        entropy = -(gates * torch.log(gates + 1e-8)).sum(dim=-1)  # [batch]
-        mean_entropy = entropy.mean()
-        
-
-        max_entropy = torch.log(torch.tensor(2.0, device=gates.device))
-        loss = 1.0 - mean_entropy / max_entropy
-        
-        return loss
-    else:
-        # 兼容旧接口：如果没有传入 gates，使用 L2 loss
-        mean_g_raw = g_raw.mean()
-        mean_g_size = g_size.mean()
-        loss = (mean_g_raw - 0.5) ** 2 + (mean_g_size - 0.5) ** 2
-        return loss
+        return raw_hidden, size_hidden

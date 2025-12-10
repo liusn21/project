@@ -90,7 +90,7 @@ def main():
     # Optimizer options.
     optimization_opts(parser)
 
-    # Multi-Modal options (Stage 2).
+    # Multi-Modal options (Stage 2 - ALBEF-style).
     parser.add_argument("--vocab_path_raw", default=None, type=str,
                         help="Path of the vocabulary file for Raw Packet modality.")
     parser.add_argument("--vocab_path_size", default=None, type=str,
@@ -100,35 +100,35 @@ def main():
     parser.add_argument("--corpus_path_size", default=None, type=str,
                         help="Path of the corpus file for Packet Size modality.")
     parser.add_argument("--pretrained_raw_path", default=None, type=str,
-                        help="Path of the pretrained Raw Packet encoder.")
+                        help="Path of the pretrained Raw Packet encoder (from Stage 1).")
     parser.add_argument("--pretrained_size_path", default=None, type=str,
-                        help="Path of the pretrained Packet Size encoder.")
-    
-    # Phase selection (mutually exclusive)
-    parser.add_argument("--phase1", action="store_true",
-                        help="Run Phase 1: Freeze encoders, train fusion + target only. "
-                             "Requires --pretrained_raw_path and --pretrained_size_path.")
-    parser.add_argument("--phase2", action="store_true",
-                        help="Run Phase 2: Full parameter training with differential LR. "
-                             "Requires --pretrained_model_path pointing to Phase 1 checkpoint.")
-    
+                        help="Path of the pretrained Packet Size encoder (from Stage 1).")
+
+    # ALBEF-style architecture parameters
+    parser.add_argument("--num_fusion_layers", type=int, default=6,
+                        help="Number of bidirectional cross-attention fusion layers.")
+    parser.add_argument("--queue_size", type=int, default=4096,
+                        help="Size of the feature queue for ITC contrastive learning.")
+    parser.add_argument("--momentum", type=float, default=0.995,
+                        help="Momentum coefficient for EMA update of momentum encoders.")
+
     # Loss weights
-    parser.add_argument("--balance_loss_alpha", type=float, default=0.1,
-                        help="Weight for balance loss in multimodal training.")
-    parser.add_argument("--cmmp_raw_weight", type=float, default=0.1,
-                        help="Weight for CMMP_raw loss (multimodal only).")
-    parser.add_argument("--cmmp_size_weight", type=float, default=0.1,
-                        help="Weight for CMMP_size loss (multimodal only).")
-    
+    parser.add_argument("--lambda_itc", type=float, default=1.0,
+                        help="Weight for ITC (contrastive) loss.")
+    parser.add_argument("--lambda_itm", type=float, default=1.0,
+                        help="Weight for ITM (matching) loss.")
+    parser.add_argument("--lambda_mlm", type=float, default=1.0,
+                        help="Weight for MLM losses (both raw and size).")
+
     # Temperature parameters
-    parser.add_argument("--gate_temperature", type=float, default=0.5,
-                        help="Temperature for gate softmax in fusion module (multimodal only).")
-    parser.add_argument("--cmm_temperature", type=float, default=0.07,
-                        help="Temperature for CMM contrastive loss (multimodal only).")
-    
+    parser.add_argument("--itc_temperature", type=float, default=0.07,
+                        help="Temperature for ITC contrastive loss.")
+    parser.add_argument("--itm_temperature", type=float, default=0.07,
+                        help="Temperature for ITM hard negative sampling.")
+
     # Learning rate
     parser.add_argument("--encoder_lr_ratio", type=float, default=0.1,
-                        help="Learning rate ratio for encoders in Phase 2 (multimodal only). "
+                        help="Learning rate ratio for encoders. "
                              "E.g., 0.1 means encoder LR = base_LR * 0.1")
 
     # GPU options.

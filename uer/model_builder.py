@@ -18,34 +18,23 @@ def build_model(args):
     We could select suitable one for downstream tasks.
     """
 
-    # For multimodal target, use MultiModalModel with two encoders
+    # For multimodal target, use MultiModalModel (ALBEF-style)
     if args.target == "multimodal":
-        # Build Raw Packet encoder (to be loaded from pretrained)
+        # Build Raw Packet encoder
         embedding_raw = RawPacketEmbedding(args, len(args.vocab_raw))
         encoder_raw = str2encoder[args.encoder](args)
 
-        # Build Packet Size encoder (to be loaded from pretrained)
+        # Build Packet Size encoder
         embedding_size = PacketSizeEmbedding(args, len(args.vocab_size))
         encoder_size = str2encoder[args.encoder](args)
 
-        # Build fusion module (使用原框架的MultiHeadedAttention)
-        from uer.layers.multimodal_fusion import GatedMultiModalFusion
+        # Build fusion module (6-layer bidirectional cross-attention)
+        from uer.layers.multimodal_fusion import MultiModalFusionEncoder
 
-        # Calculate attention_head_size
-        attention_head_size = args.hidden_size // args.heads_num
+        num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
+        fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers)
 
-        # Get gate_temperature from args (default 0.5)
-        gate_temperature = getattr(args, 'gate_temperature', 0.5)
-
-        fusion = GatedMultiModalFusion(
-            hidden_size=args.hidden_size,
-            num_attention_heads=args.heads_num,
-            attention_head_size=attention_head_size,
-            dropout=args.dropout,
-            gate_temperature=gate_temperature
-        )
-
-        # Build target module
+        # Build target module (ITC + ITM + MLM)
         target = str2target[args.target](
             args,
             hidden_size=args.hidden_size,
@@ -53,57 +42,68 @@ def build_model(args):
             vocab_size_size=len(args.vocab_size)
         )
 
+        # Get queue and momentum parameters
+        queue_size = getattr(args, 'queue_size', 4096)
+        momentum = getattr(args, 'momentum', 0.995)
+
         # Build model
         model = MultiModalModel(
             args,
             embedding_raw, encoder_raw,
             embedding_size, encoder_size,
-            fusion, target
+            fusion, target,
+            queue_size=queue_size,
+            momentum=momentum
         )
 
-        # Phase-specific loading
-        is_phase1 = getattr(args, 'phase1', False)
-        is_phase2 = getattr(args, 'phase2', False)
+        # Load pretrained encoders if specified
+        if hasattr(args, 'pretrained_raw_path') and args.pretrained_raw_path:
+            print(f"Loading pretrained Raw encoder from {args.pretrained_raw_path}")
+            raw_state = torch.load(args.pretrained_raw_path, map_location="cpu")
+            model.embedding_raw.load_state_dict(
+                {k.replace('embedding.', ''): v for k, v in raw_state.items() if k.startswith('embedding.')},
+                strict=False
+            )
+            model.encoder_raw.load_state_dict(
+                {k.replace('encoder.', ''): v for k, v in raw_state.items() if k.startswith('encoder.')},
+                strict=False
+            )
+            # Also load into momentum encoder
+            model.embedding_raw_m.load_state_dict(
+                {k.replace('embedding.', ''): v for k, v in raw_state.items() if k.startswith('embedding.')},
+                strict=False
+            )
+            model.encoder_raw_m.load_state_dict(
+                {k.replace('encoder.', ''): v for k, v in raw_state.items() if k.startswith('encoder.')},
+                strict=False
+            )
 
-        if is_phase1:
-            # Phase 1: Load pretrained encoders from Stage 1
-            if hasattr(args, 'pretrained_raw_path') and args.pretrained_raw_path:
-                print(f"[Phase 1] Loading pretrained Raw encoder from {args.pretrained_raw_path}")
-                raw_state = torch.load(args.pretrained_raw_path, map_location="cpu")
-                model.embedding_raw.load_state_dict(
-                    {k.replace('embedding.', ''): v for k, v in raw_state.items() if k.startswith('embedding.')},
-                    strict=False
-                )
-                model.encoder_raw.load_state_dict(
-                    {k.replace('encoder.', ''): v for k, v in raw_state.items() if k.startswith('encoder.')},
-                    strict=False
-                )
-            else:
-                print("WARNING: Phase 1 without pretrained_raw_path - encoders will be randomly initialized")
+        if hasattr(args, 'pretrained_size_path') and args.pretrained_size_path:
+            print(f"Loading pretrained Size encoder from {args.pretrained_size_path}")
+            size_state = torch.load(args.pretrained_size_path, map_location="cpu")
+            model.embedding_size.load_state_dict(
+                {k.replace('embedding.', ''): v for k, v in size_state.items() if k.startswith('embedding.')},
+                strict=False
+            )
+            model.encoder_size.load_state_dict(
+                {k.replace('encoder.', ''): v for k, v in size_state.items() if k.startswith('encoder.')},
+                strict=False
+            )
+            # Also load into momentum encoder
+            model.embedding_size_m.load_state_dict(
+                {k.replace('embedding.', ''): v for k, v in size_state.items() if k.startswith('embedding.')},
+                strict=False
+            )
+            model.encoder_size_m.load_state_dict(
+                {k.replace('encoder.', ''): v for k, v in size_state.items() if k.startswith('encoder.')},
+                strict=False
+            )
 
-            if hasattr(args, 'pretrained_size_path') and args.pretrained_size_path:
-                print(f"[Phase 1] Loading pretrained Size encoder from {args.pretrained_size_path}")
-                size_state = torch.load(args.pretrained_size_path, map_location="cpu")
-                model.embedding_size.load_state_dict(
-                    {k.replace('embedding.', ''): v for k, v in size_state.items() if k.startswith('embedding.')},
-                    strict=False
-                )
-                model.encoder_size.load_state_dict(
-                    {k.replace('encoder.', ''): v for k, v in size_state.items() if k.startswith('encoder.')},
-                    strict=False
-                )
-            else:
-                print("WARNING: Phase 1 without pretrained_size_path - encoders will be randomly initialized")
-
-            # Freeze encoders for Phase 1
-            model._freeze_encoders()
-            print("[Phase 1] Encoders frozen")
-
-        elif is_phase2:
-            # Phase 2: Full model will be loaded via --pretrained_model_path in trainer.py
-            # Encoders should NOT be frozen
-            print("[Phase 2] Full parameter training mode")
-            print("  Note: Phase 1 checkpoint should be loaded via --pretrained_model_path")
+        print(f"  Fusion layers: {num_fusion_layers}")
+        print(f"  Queue size: {queue_size}")
+        print(f"  Momentum: {momentum}")
+        print(f"  ITC temperature: {getattr(args, 'itc_temperature', 0.07)}")
+        print(f"  ITM temperature: {getattr(args, 'itm_temperature', 0.07)}")
 
     # For raw_packet target, use RawPacketEmbedding and RawPacketModel
     elif args.target == "raw_packet":
