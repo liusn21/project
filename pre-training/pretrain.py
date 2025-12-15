@@ -91,6 +91,10 @@ def main():
     optimization_opts(parser)
 
     # Multi-Modal options (Stage 2 - ALBEF-style).
+    parser.add_argument("--seq_length_raw", type=int, default=512,
+                        help="Sequence length for Raw Packet modality.")
+    parser.add_argument("--seq_length_size", type=int, default=256,
+                        help="Sequence length for Packet Size modality.")
     parser.add_argument("--vocab_path_raw", default=None, type=str,
                         help="Path of the vocabulary file for Raw Packet modality.")
     parser.add_argument("--vocab_path_size", default=None, type=str,

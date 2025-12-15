@@ -189,22 +189,54 @@ class MultiModalModel(nn.Module):
         with torch.no_grad():
             self._dequeue_and_enqueue(raw_cls_m_proj, size_cls_m_proj)
 
-        # ===== Step 5: Fusion =====
+        # ===== Step 5: Fusion for Positive Samples =====
+        # Positive pairs: (raw_i, size_i)
         raw_fused, size_fused = self.fusion(raw_output, size_output, raw_seg, size_seg)
 
-        # Extract fused CLS tokens
-        raw_fused_cls = raw_fused[:, 0, :]  # [batch, hidden]
-        size_fused_cls = size_fused[:, 0, :]  # [batch, hidden]
+        # Extract fused CLS tokens for positive samples
+        pos_raw_cls = raw_fused[:, 0, :]  # [batch, hidden]
+        pos_size_cls = size_fused[:, 0, :]  # [batch, hidden]
 
-        # ===== Step 6: ITM Loss =====
-        itm_loss, itm_acc = self.target.forward_itm(
-            raw_fused_cls, size_fused_cls,
-            sim_r2s, sim_s2r,
-            raw_fused_cls, size_fused_cls,  # Use same features for negative sampling
-            temperature=self.itm_temp
+        # ===== Step 6: Hard Negative Sampling for ITM =====
+        # Sample hard negative indices based on ITC similarity
+        neg_size_idx, neg_raw_idx = self.target.sample_hard_negatives(
+            sim_r2s, sim_s2r, batch_size, temperature=self.itm_temp
         )
 
-        # ===== Step 7: MLM Losses =====
+        # ===== Step 7: Fusion for Negative Samples =====
+        # Negative type 1: (raw_i, size_neg) - each raw_i paired with its hard negative size
+        # Gather negative size encoder outputs and segments
+        neg_size_output_1 = size_output[neg_size_idx]  # [batch, seq_len_size, hidden]
+        neg_size_seg_1 = size_seg[neg_size_idx]  # [batch, seq_len_size]
+
+        # Run fusion for negative type 1
+        neg1_raw_fused, neg1_size_fused = self.fusion(
+            raw_output, neg_size_output_1, raw_seg, neg_size_seg_1
+        )
+        neg1_raw_cls = neg1_raw_fused[:, 0, :]  # [batch, hidden]
+        neg1_size_cls = neg1_size_fused[:, 0, :]  # [batch, hidden]
+
+        # Negative type 2: (raw_neg, size_i) - each size_i paired with its hard negative raw
+        # Gather negative raw encoder outputs and segments
+        neg_raw_output_2 = raw_output[neg_raw_idx]  # [batch, seq_len_raw, hidden]
+        neg_raw_seg_2 = raw_seg[neg_raw_idx]  # [batch, seq_len_raw]
+
+        # Run fusion for negative type 2
+        neg2_raw_fused, neg2_size_fused = self.fusion(
+            neg_raw_output_2, size_output, neg_raw_seg_2, size_seg
+        )
+        neg2_raw_cls = neg2_raw_fused[:, 0, :]  # [batch, hidden]
+        neg2_size_cls = neg2_size_fused[:, 0, :]  # [batch, hidden]
+
+        # ===== Step 8: ITM Loss =====
+        # Pass all fused CLS tokens (positive + 2 types of negatives)
+        itm_loss, itm_acc = self.target.forward_itm(
+            pos_raw_cls, pos_size_cls,      # Positive: (raw_i, size_i)
+            neg1_raw_cls, neg1_size_cls,    # Negative 1: (raw_i, size_neg)
+            neg2_raw_cls, neg2_size_cls     # Negative 2: (raw_neg, size_i)
+        )
+
+        # ===== Step 9: MLM Losses =====
         mlm_raw_loss, mlm_raw_correct, mlm_raw_denom = self.target.forward_mlm_raw(
             raw_fused, tgt_mlm_raw
         )

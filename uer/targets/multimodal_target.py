@@ -50,13 +50,16 @@ class MultiModalTarget(nn.Module):
         self.itc_proj_size = nn.Linear(hidden_size, hidden_size)
 
         # ===== ITM: Binary Classification Head =====
+        # Input: element-wise product of raw_fused_cls and size_fused_cls [hidden_size]
+        # Multiplication directly captures alignment/similarity between modalities
         self.itm_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(args.dropout),
             nn.Linear(hidden_size // 2, 2)  # Binary classification
         )
-        self.itm_criterion = nn.CrossEntropyLoss()
+        # Class-weighted loss: positive:negative = 1:2, so weight positive class 2x
+        self.itm_criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.0]))
 
         # ===== MLM_raw: MLM Head for Raw modality =====
         if self.factorized_embedding_parameterization:
@@ -135,30 +138,20 @@ class MultiModalTarget(nn.Module):
 
         return itc_loss, sim_r2s, sim_s2r
 
-    def forward_itm(self, raw_fused_cls, size_fused_cls, sim_r2s, sim_s2r,
-                    raw_fused_all, size_fused_all, temperature=0.07):
+    def sample_hard_negatives(self, sim_r2s, sim_s2r, batch_size, temperature=0.07):
         """
-        ITM (Image-Text Matching) Loss with Hard Negative Mining
-
-        使用ITC的相似度矩阵进行hard negative采样
+        Sample hard negative indices based on ITC similarity
 
         Args:
-            raw_fused_cls: [batch, hidden] - Fusion后的Raw CLS (正样本)
-            size_fused_cls: [batch, hidden] - Fusion后的Size CLS (正样本)
-            sim_r2s: [batch, batch] - Raw到Size的相似度矩阵 (来自ITC，只取batch内部分)
-            sim_s2r: [batch, batch] - Size到Raw的相似度矩阵
-            raw_fused_all: [batch, hidden] - 所有Raw fused features (用于构建负样本)
-            size_fused_all: [batch, hidden] - 所有Size fused features
-            temperature: hard negative采样温度
+            sim_r2s: [batch, batch+queue] - Raw到Size的相似度矩阵
+            sim_s2r: [batch, batch+queue] - Size到Raw的相似度矩阵
+            batch_size: batch size
+            temperature: sampling temperature
 
         Returns:
-            itm_loss: ITM loss
-            itm_acc: ITM accuracy
+            neg_size_idx: [batch] - hard negative size indices for each raw
+            neg_raw_idx: [batch] - hard negative raw indices for each size
         """
-        batch_size = raw_fused_cls.size(0)
-        device = raw_fused_cls.device
-
-        # ===== Hard Negative Mining =====
         with torch.no_grad():
             # 只使用batch内的相似度 (取前batch_size列)
             sim_r2s_batch = sim_r2s[:, :batch_size].clone()
@@ -177,32 +170,55 @@ class MultiModalTarget(nn.Module):
             # For each size, sample a hard negative raw
             neg_raw_idx = torch.multinomial(weights_s2r, 1).squeeze(1)  # [batch]
 
-        # ===== Construct ITM Training Samples =====
-        # Positive pairs: (raw_i, size_i) with label 1
-        # Negative pairs: (raw_i, size_neg[i]) and (raw_neg[i], size_i) with label 0
+        return neg_size_idx, neg_raw_idx
+
+    def forward_itm(self, pos_raw_cls, pos_size_cls, neg1_raw_cls, neg1_size_cls, neg2_raw_cls, neg2_size_cls):
+        """
+        ITM (Image-Text Matching) Loss - ALBEF style
+
+        所有输入都是经过Fusion后的CLS特征（正样本和负样本都经过了各自的Fusion）
+
+        Args:
+            pos_raw_cls: [batch, hidden] - 正样本raw经过Fusion后的CLS
+            pos_size_cls: [batch, hidden] - 正样本size经过Fusion后的CLS
+            neg1_raw_cls: [batch, hidden] - 负样本1的raw经过Fusion后的CLS (raw_i with size_neg)
+            neg1_size_cls: [batch, hidden] - 负样本1的size经过Fusion后的CLS
+            neg2_raw_cls: [batch, hidden] - 负样本2的raw经过Fusion后的CLS (raw_neg with size_i)
+            neg2_size_cls: [batch, hidden] - 负样本2的size经过Fusion后的CLS
+
+        Returns:
+            itm_loss: ITM loss
+            itm_acc: ITM accuracy
+        """
+        batch_size = pos_raw_cls.size(0)
+        device = pos_raw_cls.device
+
+        # Element-wise multiplication to capture alignment between modalities
+        # Matched pairs: aligned vectors → larger product values
+        # Mismatched pairs: misaligned vectors → smaller/different product values
+        pos_feat = pos_raw_cls * pos_size_cls  # [batch, hidden]
+        neg1_feat = neg1_raw_cls * neg1_size_cls  # [batch, hidden]
+        neg2_feat = neg2_raw_cls * neg2_size_cls  # [batch, hidden]
 
         # Positive samples
-        pos_interaction = raw_fused_cls * size_fused_cls  # [batch, hidden]
-        pos_logits = self.itm_head(pos_interaction)  # [batch, 2]
+        pos_logits = self.itm_head(pos_feat)  # [batch, 2]
         pos_labels = torch.ones(batch_size, dtype=torch.long, device=device)
 
-        # Negative samples (raw with wrong size)
-        neg_size_feat = size_fused_all[neg_size_idx]  # [batch, hidden]
-        neg_interaction_1 = raw_fused_cls * neg_size_feat  # [batch, hidden]
-        neg_logits_1 = self.itm_head(neg_interaction_1)  # [batch, 2]
-        neg_labels_1 = torch.zeros(batch_size, dtype=torch.long, device=device)
+        # Negative samples 1: (raw_i, size_neg)
+        neg1_logits = self.itm_head(neg1_feat)  # [batch, 2]
+        neg1_labels = torch.zeros(batch_size, dtype=torch.long, device=device)
 
-        # Negative samples (size with wrong raw)
-        neg_raw_feat = raw_fused_all[neg_raw_idx]  # [batch, hidden]
-        neg_interaction_2 = neg_raw_feat * size_fused_cls  # [batch, hidden]
-        neg_logits_2 = self.itm_head(neg_interaction_2)  # [batch, 2]
-        neg_labels_2 = torch.zeros(batch_size, dtype=torch.long, device=device)
+        # Negative samples 2: (raw_neg, size_i)
+        neg2_logits = self.itm_head(neg2_feat)  # [batch, 2]
+        neg2_labels = torch.zeros(batch_size, dtype=torch.long, device=device)
 
         # Combine all
-        all_logits = torch.cat([pos_logits, neg_logits_1, neg_logits_2], dim=0)  # [3*batch, 2]
-        all_labels = torch.cat([pos_labels, neg_labels_1, neg_labels_2], dim=0)  # [3*batch]
+        all_logits = torch.cat([pos_logits, neg1_logits, neg2_logits], dim=0)  # [3*batch, 2]
+        all_labels = torch.cat([pos_labels, neg1_labels, neg2_labels], dim=0)  # [3*batch]
 
-        # ITM Loss
+        # ITM Loss (ensure weight is on correct device)
+        if self.itm_criterion.weight is not None and self.itm_criterion.weight.device != device:
+            self.itm_criterion.weight = self.itm_criterion.weight.to(device)
         itm_loss = self.itm_criterion(all_logits, all_labels)
 
         # ITM Accuracy

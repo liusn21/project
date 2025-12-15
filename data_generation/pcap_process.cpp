@@ -18,7 +18,7 @@
 
 namespace fs = std::filesystem;
 
-// DLT (Data Link Type) constants - some may not be in older pcap.h
+// DLT (Data Link Type) constants
 #ifndef DLT_IPV4
 #define DLT_IPV4 228
 #endif
@@ -33,13 +33,12 @@ namespace fs = std::filesystem;
 
 // Flow key structure preserving first packet direction (client->server)
 struct FlowKey {
-    uint8_t protocol;      // TCP or UDP
-    uint32_t ip1;          // First packet source IP (typically client)
-    uint16_t port1;        // First packet source port
-    uint32_t ip2;          // First packet destination IP (typically server)
-    uint16_t port2;        // First packet destination port
+    uint8_t protocol;
+    uint32_t ip1;
+    uint16_t port1;
+    uint32_t ip2;
+    uint16_t port2;
     
-    // Constructor: preserve original packet direction (no normalization)
     FlowKey(uint8_t proto, uint32_t src_ip, uint16_t src_port, 
             uint32_t dst_ip, uint16_t dst_port) 
         : protocol(proto), ip1(src_ip), port1(src_port), 
@@ -51,12 +50,10 @@ struct FlowKey {
                ip2 == other.ip2 && port2 == other.port2;
     }
     
-    // Get reverse direction key (for bidirectional flow matching)
     FlowKey reverse() const {
         return FlowKey(protocol, ip2, port2, ip1, port1);
     }
     
-    // Convert to filename string (first packet direction)
     std::string to_filename() const {
         char ip1_str[INET_ADDRSTRLEN], ip2_str[INET_ADDRSTRLEN];
         struct in_addr addr;
@@ -75,7 +72,6 @@ struct FlowKey {
     }
 };
 
-// Hash function for FlowKey
 namespace std {
     template<>
     struct hash<FlowKey> {
@@ -90,11 +86,10 @@ namespace std {
     };
 }
 
-// Structure to store packet data for later writing
 struct PacketData {
     std::vector<uint8_t> data;
     struct pcap_pkthdr header;
-    bool has_payload;  // Whether packet contains transport layer payload
+    bool has_payload;
     
     PacketData(const struct pcap_pkthdr* h, const uint8_t* packet, bool payload) {
         header = *h;
@@ -103,22 +98,10 @@ struct PacketData {
     }
 };
 
-// Result of packet parsing
-struct ParseResult {
-    std::unique_ptr<FlowKey> flow_key;
-    bool has_payload;  // True if packet has transport layer payload data
-    
-    ParseResult() : flow_key(nullptr), has_payload(false) {}
-    ParseResult(std::unique_ptr<FlowKey> key, bool payload) 
-        : flow_key(std::move(key)), has_payload(payload) {}
-};
-
-// Check if packet has transport layer payload (data beyond headers)
-// Returns true if packet contains actual data (not just control packets like SYN/ACK/FIN)
+// Check if packet has transport layer payload
 bool has_transport_payload(const uint8_t* packet, int len, int linktype) {
     int offset = 0;
     
-    // Determine offset based on link type
     if (linktype == DLT_EN10MB) {
         if (len < sizeof(struct ether_header)) return false;
         const struct ether_header* eth = (struct ether_header*)packet;
@@ -135,7 +118,6 @@ bool has_transport_payload(const uint8_t* packet, int len, int linktype) {
         return false;
     }
     
-    // Check minimum IP header length
     if (len < offset + sizeof(struct ip)) return false;
     
     const struct ip* ip_hdr = (struct ip*)(packet + offset);
@@ -144,7 +126,6 @@ bool has_transport_payload(const uint8_t* packet, int len, int linktype) {
     uint8_t protocol = ip_hdr->ip_p;
     if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) return false;
     
-    // Get total IP packet length
     uint16_t ip_total_len = ntohs(ip_hdr->ip_len);
     int ip_header_len = ip_hdr->ip_hl * 4;
     
@@ -154,66 +135,42 @@ bool has_transport_payload(const uint8_t* packet, int len, int linktype) {
         if (len < offset + ip_header_len + sizeof(struct tcphdr)) return false;
         const struct tcphdr* tcp = (struct tcphdr*)(packet + offset + ip_header_len);
         int tcp_header_len = tcp->th_off * 4;
-        
-        // Calculate TCP payload length
         payload_len = ip_total_len - ip_header_len - tcp_header_len;
-    } else { // UDP
+    } else {
         if (len < offset + ip_header_len + sizeof(struct udphdr)) return false;
-        const struct udphdr* udp = (struct udphdr*)(packet + offset + ip_header_len);
-        
-        // Calculate UDP payload length
-        // UDP header is 8 bytes
         payload_len = ip_total_len - ip_header_len - 8;
     }
     
-    // Return true only if there's actual payload data
     return payload_len > 0;
 }
 
-// Parse packet and extract flow key, return nullptr if not TCP/UDP IPv4 or if it's DNS
-// Supports both Ethernet frames and Raw IP packets
+// Parse packet and extract flow key
 std::unique_ptr<FlowKey> parse_packet(const uint8_t* packet, int len, int linktype) {
     const struct ip* ip_hdr = nullptr;
     int offset = 0;
     
-    // Determine offset based on link type
     if (linktype == DLT_EN10MB) {
-        // Ethernet frame
         if (len < sizeof(struct ether_header)) return nullptr;
-        
         const struct ether_header* eth = (struct ether_header*)packet;
-        
-        // Check if it's IPv4
         if (ntohs(eth->ether_type) != ETHERTYPE_IP) return nullptr;
-        
         offset = sizeof(struct ether_header);
     } else if (linktype == DLT_RAW || linktype == DLT_IPV4 || linktype == 101) {
-        // Raw IP packet (no link layer header)
-        // DLT_RAW = 12, DLT_IPV4 = 228, or Linux cooked capture (101) raw IP mode
         offset = 0;
     } else if (linktype == DLT_LINUX_SLL) {
-        // Linux cooked capture
         if (len < 16) return nullptr;
-        // SLL header is 16 bytes, check protocol type at offset 14-15
         uint16_t proto = (packet[14] << 8) | packet[15];
         if (proto != ETHERTYPE_IP) return nullptr;
         offset = 16;
     } else {
-        // Unsupported link type
         return nullptr;
     }
     
-    // Check minimum IP header length
     if (len < offset + sizeof(struct ip)) return nullptr;
     
     ip_hdr = (struct ip*)(packet + offset);
-    
-    // Verify IP version is 4
     if (ip_hdr->ip_v != 4) return nullptr;
     
     uint8_t protocol = ip_hdr->ip_p;
-    
-    // Only process TCP and UDP
     if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) return nullptr;
     
     uint32_t src_ip = ip_hdr->ip_src.s_addr;
@@ -230,14 +187,13 @@ std::unique_ptr<FlowKey> parse_packet(const uint8_t* packet, int len, int linkty
         const struct tcphdr* tcp = (struct tcphdr*)transport_hdr;
         src_port = ntohs(tcp->th_sport);
         dst_port = ntohs(tcp->th_dport);
-    } else { // UDP
+    } else {
         if (len < offset + ip_header_len + sizeof(struct udphdr)) 
             return nullptr;
         const struct udphdr* udp = (struct udphdr*)transport_hdr;
         src_port = ntohs(udp->uh_sport);
         dst_port = ntohs(udp->uh_dport);
         
-        // Filter out DNS packets (port 53)
         if (src_port == 53 || dst_port == 53) {
             return nullptr;
         }
@@ -247,12 +203,13 @@ std::unique_ptr<FlowKey> parse_packet(const uint8_t* packet, int len, int linkty
 }
 
 // Process a single pcap file
-void process_pcap(const std::string& input_pcap, const std::string& output_dir) {
+// output_subdir: in label mode, this is the label directory; in normal mode, this is pcap stem name
+void process_pcap(const std::string& input_pcap, const std::string& output_dir, 
+                  const std::string& output_subdir) {
     std::cout << "Processing: " << input_pcap << std::endl;
     
     char errbuf[PCAP_ERRBUF_SIZE];
     
-    // Open pcap to get link type first
     pcap_t* handle = pcap_open_offline(input_pcap.c_str(), errbuf);
     if (!handle) {
         std::cerr << "Error opening pcap file: " << input_pcap << " - " << errbuf << std::endl;
@@ -262,49 +219,41 @@ void process_pcap(const std::string& input_pcap, const std::string& output_dir) 
     int linktype = pcap_datalink(handle);
     int snapshot = pcap_snapshot(handle);
     
-    std::unordered_map<FlowKey, int> flow_counts;  // Count only packets with payload
-    std::unordered_map<FlowKey, std::vector<PacketData>> flow_packets;  // Store all packets
+    std::unordered_map<FlowKey, int> flow_counts;
+    std::unordered_map<FlowKey, std::vector<PacketData>> flow_packets;
     
     struct pcap_pkthdr* header;
     const uint8_t* packet;
     int result;
     
-    // First pass: collect all packets, but count only those with payload
-    // Check both forward and reverse directions for bidirectional flow aggregation
     while ((result = pcap_next_ex(handle, &header, &packet)) >= 0) {
-        if (result == 0) continue; // Timeout
+        if (result == 0) continue;
         
         auto flow_key = parse_packet(packet, header->caplen, linktype);
         if (flow_key) {
-            // Check if packet has transport layer payload
             bool has_payload = has_transport_payload(packet, header->caplen, linktype);
             
-            // Check if this flow key already exists
             auto it = flow_counts.find(*flow_key);
             if (it != flow_counts.end()) {
-                // Forward direction exists, use it
                 if (has_payload) {
-                    flow_counts[*flow_key]++;  // Only count if has payload
+                    flow_counts[*flow_key]++;
                 }
-                flow_packets[*flow_key].emplace_back(header, packet);  // Save all packets
+                flow_packets[*flow_key].emplace_back(header, packet, has_payload);
             } else {
-                // Check if reverse direction exists
                 FlowKey reverse_key = flow_key->reverse();
                 auto reverse_it = flow_counts.find(reverse_key);
                 if (reverse_it != flow_counts.end()) {
-                    // Reverse direction exists, aggregate into it
                     if (has_payload) {
-                        flow_counts[reverse_key]++;  // Only count if has payload
+                        flow_counts[reverse_key]++;
                     }
-                    flow_packets[reverse_key].emplace_back(header, packet);  // Save all packets
+                    flow_packets[reverse_key].emplace_back(header, packet, has_payload);
                 } else {
-                    // New flow (first packet determines direction)
                     if (has_payload) {
-                        flow_counts[*flow_key] = 1;  // Initialize count
+                        flow_counts[*flow_key] = 1;
                     } else {
-                        flow_counts[*flow_key] = 0;  // Initialize with 0 for control packet
+                        flow_counts[*flow_key] = 0;
                     }
-                    flow_packets[*flow_key].emplace_back(header, packet);  // Save all packets
+                    flow_packets[*flow_key].emplace_back(header, packet, has_payload);
                 }
             }
         }
@@ -312,7 +261,6 @@ void process_pcap(const std::string& input_pcap, const std::string& output_dir) 
     
     pcap_close(handle);
     
-    // Filter flows with packet count >= 5
     std::unordered_map<FlowKey, std::vector<PacketData>> valid_flows;
     for (auto& [key, packets] : flow_packets) {
         if (flow_counts[key] >= 5) {
@@ -328,9 +276,8 @@ void process_pcap(const std::string& input_pcap, const std::string& output_dir) 
         return;
     }
     
-    // Create output directory for this pcap
-    std::string pcap_name = fs::path(input_pcap).stem().string();
-    std::string pcap_output_dir = output_dir + "/" + pcap_name;
+    // Create output directory using the provided subdirectory
+    std::string pcap_output_dir = output_dir + "/" + output_subdir;
     
     try {
         fs::create_directories(pcap_output_dir);
@@ -339,7 +286,6 @@ void process_pcap(const std::string& input_pcap, const std::string& output_dir) 
         return;
     }
     
-    // Write each valid flow to separate file
     for (const auto& [flow_key, packets] : valid_flows) {
         std::string flow_filename = pcap_output_dir + "/" + flow_key.to_filename();
         
@@ -356,7 +302,6 @@ void process_pcap(const std::string& input_pcap, const std::string& output_dir) 
             continue;
         }
         
-        // Write all packets for this flow
         for (const auto& pkt : packets) {
             pcap_dump((u_char*)dumper, &pkt.header, pkt.data.data());
         }
@@ -365,7 +310,7 @@ void process_pcap(const std::string& input_pcap, const std::string& output_dir) 
         pcap_close(out_handle);
     }
     
-    std::cout << "  Completed: " << pcap_name << " (" << valid_flows.size() << " flows)" << std::endl;
+    std::cout << "  Completed: " << output_subdir << " (" << valid_flows.size() << " flows)" << std::endl;
 }
 
 // Thread pool worker
@@ -421,16 +366,37 @@ public:
     }
 };
 
-// Recursively find all pcap files
-void find_pcap_files(const std::string& dir, std::vector<std::string>& pcap_files) {
+// Structure to hold pcap file info with its label (parent directory)
+struct PcapFileInfo {
+    std::string filepath;
+    std::string label;  // Parent directory name (used in label mode)
+    std::string stem;   // File stem without extension (used in normal mode)
+};
+
+// Recursively find all pcap files and extract label info
+void find_pcap_files(const std::string& dir, std::vector<PcapFileInfo>& pcap_files, 
+                     const std::string& base_dir) {
     try {
         for (const auto& entry : fs::recursive_directory_iterator(dir)) {
             if (entry.is_regular_file()) {
                 std::string ext = entry.path().extension().string();
-                // Convert to lowercase for comparison
                 std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
                 if (ext == ".pcap" || ext == ".pcapng") {
-                    pcap_files.push_back(entry.path().string());
+                    PcapFileInfo info;
+                    info.filepath = entry.path().string();
+                    info.stem = entry.path().stem().string();
+                    
+                    // Get label from parent directory relative to base_dir
+                    // e.g., base_dir/label/xxx.pcap -> label = "label"
+                    fs::path rel_path = fs::relative(entry.path().parent_path(), base_dir);
+                    info.label = rel_path.string();
+                    
+                    // Handle case where pcap is directly in base_dir (no label)
+                    if (info.label == "." || info.label.empty()) {
+                        info.label = "unlabeled";
+                    }
+                    
+                    pcap_files.push_back(info);
                 }
             }
         }
@@ -439,24 +405,53 @@ void find_pcap_files(const std::string& dir, std::vector<std::string>& pcap_file
     }
 }
 
+void print_usage(const char* prog_name) {
+    std::cerr << "Usage: " << prog_name << " [OPTIONS] <input_pcap_dir> <output_pcap_dir>" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "Options:" << std::endl;
+    std::cerr << "  -l, --label-mode    Preserve label directory structure" << std::endl;
+    std::cerr << "                      Input:  input_dir/label/xxx.pcap" << std::endl;
+    std::cerr << "                      Output: output_dir/label/flow1.pcap, flow2.pcap, ..." << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "Default mode (without -l):" << std::endl;
+    std::cerr << "                      Output: output_dir/xxx/flow1.pcap, flow2.pcap, ..." << std::endl;
+    std::cerr << "                      (Each input pcap gets its own subdirectory)" << std::endl;
+}
+
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <input_pcap_dir> <output_pcap_dir>" << std::endl;
-        std::cerr << "  input_pcap_dir: Directory containing pcap files (will be recursively scanned)" << std::endl;
-        std::cerr << "  output_pcap_dir: Output directory for filtered flows" << std::endl;
+    bool label_mode = false;
+    std::vector<std::string> positional_args;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-l" || arg == "--label-mode") {
+            label_mode = true;
+        } else if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg[0] == '-') {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            print_usage(argv[0]);
+            return 1;
+        } else {
+            positional_args.push_back(arg);
+        }
+    }
+    
+    if (positional_args.size() != 2) {
+        print_usage(argv[0]);
         return 1;
     }
     
-    std::string input_dir = argv[1];
-    std::string output_dir = argv[2];
+    std::string input_dir = positional_args[0];
+    std::string output_dir = positional_args[1];
     
-    // Check if input directory exists
     if (!fs::exists(input_dir) || !fs::is_directory(input_dir)) {
         std::cerr << "Error: Input directory does not exist: " << input_dir << std::endl;
         return 1;
     }
     
-    // Create output directory
     try {
         fs::create_directories(output_dir);
     } catch (const std::exception& e) {
@@ -464,34 +459,49 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Find all pcap files recursively
-    std::vector<std::string> pcap_files;
+    std::vector<PcapFileInfo> pcap_files;
     std::cout << "Scanning for pcap files in: " << input_dir << std::endl;
-    find_pcap_files(input_dir, pcap_files);
+    find_pcap_files(input_dir, pcap_files, input_dir);
     
     std::cout << "Found " << pcap_files.size() << " pcap files" << std::endl;
+    
+    if (label_mode) {
+        std::cout << "Mode: Label-preserving (output grouped by label directory)" << std::endl;
+        
+        // Print label statistics
+        std::unordered_map<std::string, int> label_counts;
+        for (const auto& info : pcap_files) {
+            label_counts[info.label]++;
+        }
+        std::cout << "Labels found:" << std::endl;
+        for (const auto& [label, count] : label_counts) {
+            std::cout << "  " << label << ": " << count << " files" << std::endl;
+        }
+    } else {
+        std::cout << "Mode: Default (output grouped by pcap filename)" << std::endl;
+    }
     
     if (pcap_files.empty()) {
         std::cout << "No pcap files found. Exiting." << std::endl;
         return 0;
     }
     
-    // Determine number of threads (use hardware concurrency)
     size_t num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4; // Fallback
+    if (num_threads == 0) num_threads = 4;
     
     std::cout << "Using " << num_threads << " threads for parallel processing" << std::endl;
     
-    // Create thread pool and process files
     ThreadPool pool(num_threads);
     
-    for (const auto& pcap_file : pcap_files) {
-        pool.enqueue([pcap_file, output_dir] {
-            process_pcap(pcap_file, output_dir);
+    for (const auto& pcap_info : pcap_files) {
+        // Determine output subdirectory based on mode
+        std::string output_subdir = label_mode ? pcap_info.label : pcap_info.stem;
+        
+        pool.enqueue([pcap_info, output_dir, output_subdir] {
+            process_pcap(pcap_info.filepath, output_dir, output_subdir);
         });
     }
     
-    // Wait for all tasks to complete (ThreadPool destructor will join all threads)
     std::cout << "Processing complete!" << std::endl;
     
     return 0;

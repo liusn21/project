@@ -214,6 +214,8 @@ python pre-training/pretrain.py \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| `seq_length_raw` | 512 | Raw模态序列长度 |
+| `seq_length_size` | 256 | Size模态序列长度 |
 | `num_fusion_layers` | 6 | Fusion层数 |
 | `queue_size` | 4096 | ITC feature queue大小 |
 | `momentum` | 0.995 | Momentum encoder EMA系数 |
@@ -269,12 +271,30 @@ size_queue = concat(size_queue, size_feat_m)
 
 ### 3. Hard Negative Mining (ITM)
 
+**重要**: ITM任务要求负样本也经过Fusion，这样模型才能学到"不匹配的模态融合后有什么特征"。
+
 ```python
-# 使用ITC相似度矩阵采样hard negatives
+# Step 1: 使用ITC相似度矩阵采样hard negative indices
 sim_r2s.fill_diagonal_(-inf)  # mask正样本
 weights = softmax(sim_r2s / temperature)
-neg_idx = multinomial(weights, 1)  # 按相似度采样
+neg_size_idx = multinomial(weights, 1)  # 按相似度为每个raw采样hard negative size
+neg_raw_idx = multinomial(weights_s2r, 1)  # 按相似度为每个size采样hard negative raw
+
+# Step 2: 为负样本运行Fusion (额外2次fusion forward)
+# Negative type 1: (raw_i, size_neg)
+neg1_raw_fused, neg1_size_fused = fusion(raw_output, size_output[neg_size_idx])
+
+# Negative type 2: (raw_neg, size_i)
+neg2_raw_fused, neg2_size_fused = fusion(raw_output[neg_raw_idx], size_output)
+
+# Step 3: ITM分类 (正样本1份 + 负样本2份)
+# ITM head: Linear(2*hidden -> hidden) -> ReLU -> Dropout -> Linear(hidden -> 2)
+pos_feat = concat(pos_raw_cls, pos_size_cls)  # [batch, 2*hidden]
+neg1_feat = concat(neg1_raw_cls, neg1_size_cls)
+neg2_feat = concat(neg2_raw_cls, neg2_size_cls)
 ```
+
+**计算量说明**: 由于负样本需要重新fusion，每个batch会执行3次fusion forward（1次正样本+2次负样本）。
 
 ### 4. Differential Learning Rate
 
@@ -294,7 +314,7 @@ fusion_lr = base_lr
 | Fusion | 1层 + Gate | 6层双向Cross-Attention |
 | 对齐方式 | 无 (仅CMM in fusion后) | ITC (fusion前对比学习) |
 | 负样本 | batch内 | batch + queue (扩大负样本) |
-| ITM | 简单负样本 | Hard negative mining |
+| ITM | 简单负样本 | Hard negative mining + 负样本fusion |
 | Phase训练 | Phase1冻结 + Phase2全参 | 统一全参 + differential LR |
 | MLM | CMMP (fusion后) | 同样fusion后，但有ITC对齐支持 |
 
@@ -305,9 +325,11 @@ fusion_lr = base_lr
 1. **数据格式**: 确保MultiModalDataset返回的batch格式为:
    `(raw_src, raw_packet_ids, raw_directions, size_src, tgt_mlm_raw, tgt_mlm_size)`
 
-2. **显存占用**: 由于有momentum encoder (双倍encoder参数) 和 queue，显存占用较大。
+2. **显存占用**: 由于有momentum encoder (双倍encoder参数)、queue、以及ITM的3次fusion，显存占用较大。
    - 建议batch_size从16开始尝试
    - queue_size可以根据显存调整
+   - ITM的正确实现需要3次fusion forward（正样本1次+负样本2次），进一步增加显存
+   - 可使用梯度累积 `--accumulation_steps 4` 和混合精度 `--fp16` 来缓解
 
 3. **训练稳定性**:
    - ITC在初期可能不稳定，建议warmup

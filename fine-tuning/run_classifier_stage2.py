@@ -1,0 +1,471 @@
+"""
+Stage 2 Multi-Modal Classifier
+
+Uses the full multimodal model with fusion (ALBEF-style).
+Classification is done by concatenating fused CLS tokens from both modalities.
+
+Usage:
+    python fine-tuning/run_classifier_stage2.py \
+        --train_path datasets/processed/train.pkl \
+        --dev_path datasets/processed/val.pkl \
+        --test_path datasets/processed/test.pkl \
+        --label2id_path datasets/processed/label2id.pkl \
+        --vocab_path_raw models/vocab_raw.txt \
+        --vocab_path_size models/vocab_size.txt \
+        --pretrained_model_path models/multimodal_stage2.bin \
+        --output_model_path models/classifier_stage2.bin \
+        --config_path models/bert/base_config.json \
+        --epochs_num 10 \
+        --batch_size 32
+"""
+
+import os
+import sys
+sys.path.append(os.getcwd())
+
+import random
+import argparse
+import torch
+import torch.nn as nn
+import pickle
+from tqdm import tqdm
+import numpy as np
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+from uer.layers import RawPacketEmbedding, PacketSizeEmbedding
+from uer.layers.multimodal_fusion import MultiModalFusionEncoder
+from uer.encoders import str2encoder
+from uer.utils.vocab import Vocab
+from uer.utils.config import load_hyperparam
+from uer.utils.seed import set_seed
+from uer.utils.optimizers import str2optimizer, str2scheduler
+from uer.model_saver import save_model
+from uer.utils.constants import PAD_ID
+
+
+class Stage2Classifier(nn.Module):
+    """
+    Stage 2 Multi-Modal Classifier
+
+    Architecture:
+        - Raw encoder (pretrained): embedding + transformer
+        - Size encoder (pretrained): embedding + transformer
+        - Fusion module (pretrained): 6-layer bidirectional cross-attention
+        - Concat fused CLS tokens -> Classification head
+    """
+
+    def __init__(self, args, vocab_size_raw, vocab_size_size, labels_num):
+        super(Stage2Classifier, self).__init__()
+
+        self.hidden_size = args.hidden_size
+        self.labels_num = labels_num
+
+        # Raw modality encoder
+        self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
+        self.encoder_raw = str2encoder[args.encoder](args)
+
+        # Size modality encoder
+        self.embedding_size = PacketSizeEmbedding(args, vocab_size_size)
+        self.encoder_size = str2encoder[args.encoder](args)
+
+        # Fusion module
+        num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
+        self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers)
+
+        # Classification head (concat fused CLS tokens)
+        # Input: [batch, 2 * hidden_size]
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * args.hidden_size, args.hidden_size),
+            nn.Tanh(),
+            nn.Dropout(args.dropout),
+            nn.Linear(args.hidden_size, labels_num)
+        )
+
+    def forward(self, raw_src, packet_ids, directions, size_src, tgt=None):
+        """
+        Args:
+            raw_src: [batch, seq_len_raw] - Raw token IDs
+            packet_ids: [batch, seq_len_raw] - Packet indices
+            directions: [batch, seq_len_raw] - Direction indices
+            size_src: [batch, seq_len_size] - Size token IDs
+            tgt: [batch] - Labels (optional)
+
+        Returns:
+            loss, logits if tgt is provided, else None, logits
+        """
+        # Raw encoder
+        raw_emb = self.embedding_raw(raw_src, packet_ids, directions)
+        raw_seg = (raw_src != PAD_ID).long()
+        raw_output = self.encoder_raw(raw_emb, raw_seg)  # [batch, seq_len, hidden]
+
+        # Size encoder
+        size_emb = self.embedding_size(size_src)
+        size_seg = (size_src != PAD_ID).long()
+        size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len, hidden]
+
+        # Fusion
+        raw_fused, size_fused = self.fusion(raw_output, size_output, raw_seg, size_seg)
+
+        # Extract fused CLS tokens
+        raw_cls = raw_fused[:, 0, :]  # [batch, hidden]
+        size_cls = size_fused[:, 0, :]  # [batch, hidden]
+
+        # Concat CLS tokens
+        combined_cls = torch.cat([raw_cls, size_cls], dim=-1)  # [batch, 2*hidden]
+
+        # Classification
+        logits = self.classifier(combined_cls)  # [batch, labels_num]
+
+        if tgt is not None:
+            loss = nn.NLLLoss()(nn.LogSoftmax(dim=-1)(logits), tgt)
+            return loss, logits
+        else:
+            return None, logits
+
+
+def load_pretrained_model(model, pretrained_path):
+    """
+    Load pretrained Stage 2 multimodal model weights
+
+    The pretrained model contains:
+        - embedding_raw, encoder_raw
+        - embedding_size, encoder_size
+        - fusion
+        - (momentum encoders and target are not needed for classification)
+    """
+    if pretrained_path is None:
+        return
+
+    print(f"Loading pretrained multimodal model from {pretrained_path}")
+    state_dict = torch.load(pretrained_path, map_location='cpu')
+
+    # Filter out momentum encoders and target (not needed for classification)
+    exclude_prefixes = ['embedding_raw_m', 'encoder_raw_m',
+                        'embedding_size_m', 'encoder_size_m',
+                        'target', 'raw_queue', 'size_queue', 'queue_ptr']
+
+    filtered_state = {}
+    for k, v in state_dict.items():
+        if not any(k.startswith(prefix) for prefix in exclude_prefixes):
+            filtered_state[k] = v
+
+    # Load into model
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+
+    # Only classifier weights should be missing (they are randomly initialized)
+    classifier_missing = [k for k in missing if k.startswith('classifier')]
+    other_missing = [k for k in missing if not k.startswith('classifier')]
+
+    if other_missing:
+        print(f"  Warning: Missing non-classifier keys: {other_missing[:5]}...")
+
+    print(f"  Loaded {len(filtered_state)} params")
+    print(f"  Missing (classifier, expected): {len(classifier_missing)}")
+
+
+def load_dataset(path):
+    """Load dataset from pickle file"""
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def batch_loader(batch_size, dataset, shuffle=False):
+    """Generate batches from dataset"""
+    if shuffle:
+        random.shuffle(dataset)
+
+    num_batches = (len(dataset) + batch_size - 1) // batch_size
+
+    for i in range(num_batches):
+        batch = dataset[i * batch_size: (i + 1) * batch_size]
+
+        raw_src = torch.LongTensor([s['raw_src'] for s in batch])
+        packet_ids = torch.LongTensor([s['packet_ids'] for s in batch])
+        directions = torch.LongTensor([s['directions'] for s in batch])
+        size_src = torch.LongTensor([s['size_src'] for s in batch])
+        tgt = torch.LongTensor([s['label'] for s in batch])
+
+        yield raw_src, packet_ids, directions, size_src, tgt
+
+
+def train_epoch(args, model, optimizer, scheduler, train_data):
+    """Train for one epoch"""
+    model.train()
+    total_loss = 0.0
+    step = 0
+
+    for raw_src, packet_ids, directions, size_src, tgt in batch_loader(args.batch_size, train_data, shuffle=True):
+        raw_src = raw_src.to(args.device)
+        packet_ids = packet_ids.to(args.device)
+        directions = directions.to(args.device)
+        size_src = size_src.to(args.device)
+        tgt = tgt.to(args.device)
+
+        model.zero_grad()
+        loss, _ = model(raw_src, packet_ids, directions, size_src, tgt)
+
+        if torch.cuda.device_count() > 1:
+            loss = torch.mean(loss)
+
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item()
+        step += 1
+
+        if step % args.report_steps == 0:
+            print(f"  Step {step}, Avg loss: {total_loss / step:.4f}")
+
+    return total_loss / step
+
+
+def evaluate(args, model, eval_data, print_confusion=False):
+    """Evaluate model on dataset"""
+    model.eval()
+
+    y_true, y_pred = [], []
+    confusion = torch.zeros(args.labels_num, args.labels_num, dtype=torch.long)
+
+    with torch.no_grad():
+        for raw_src, packet_ids, directions, size_src, tgt in batch_loader(args.batch_size, eval_data):
+            raw_src = raw_src.to(args.device)
+            packet_ids = packet_ids.to(args.device)
+            directions = directions.to(args.device)
+            size_src = size_src.to(args.device)
+            tgt = tgt.to(args.device)
+
+            _, logits = model(raw_src, packet_ids, directions, size_src, None)
+            pred = torch.argmax(logits, dim=-1)
+
+            for p, g in zip(pred.cpu().tolist(), tgt.cpu().tolist()):
+                confusion[g, p] += 1  # [ground_truth, predicted] - 标准惯例
+                y_pred.append(p)
+                y_true.append(g)
+
+    # Compute metrics
+    correct = sum(1 for p, g in zip(y_pred, y_true) if p == g)
+    acc = correct / len(y_true)
+
+    macro_f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    micro_f1 = f1_score(y_true, y_pred, average='micro', zero_division=0)
+    weighted_f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+
+    macro_p = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    micro_p = precision_score(y_true, y_pred, average='micro', zero_division=0)
+    weighted_p = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+
+    macro_r = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    micro_r = recall_score(y_true, y_pred, average='micro', zero_division=0)
+    weighted_r = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+
+    print(f"Acc: {acc:.4f} ({correct}/{len(y_true)})")
+    print(f"Precision - Macro: {macro_p:.4f}, Micro: {micro_p:.4f}, Weighted: {weighted_p:.4f}")
+    print(f"Recall - Macro: {macro_r:.4f}, Micro: {micro_r:.4f}, Weighted: {weighted_r:.4f}")
+    print(f"F1 - Macro: {macro_f1:.4f}, Micro: {micro_f1:.4f}, Weighted: {weighted_f1:.4f}")
+
+    if print_confusion:
+        print("\nConfusion Matrix:")
+        print(confusion)
+
+        print("\nPer-class metrics:")
+        eps = 1e-9
+        for i in range(args.labels_num):
+            # confusion[g, p]: 行=ground_truth, 列=predicted
+            # Precision = TP / (TP + FP) = 预测为i的中有多少是对的
+            # Recall = TP / (TP + FN) = 真实为i的中有多少被预测对了
+            p = confusion[i, i].item() / (confusion[:, i].sum().item() + eps)  # 列和
+            r = confusion[i, i].item() / (confusion[i, :].sum().item() + eps)  # 行和
+            f1 = 2 * p * r / (p + r + eps)
+            print(f"  Label {i}: P={p:.3f}, R={r:.3f}, F1={f1:.3f}")
+
+    return macro_f1, confusion
+
+
+def build_optimizer(args, model):
+    """Build optimizer and scheduler"""
+    param_optimizer = list(model.named_parameters())
+    no_decay = ['bias', 'gamma', 'beta']
+
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+         'weight_decay_rate': 0.01},
+        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+         'weight_decay_rate': 0.0}
+    ]
+
+    if args.optimizer in ["adamw"]:
+        optimizer = str2optimizer[args.optimizer](
+            optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False
+        )
+    else:
+        optimizer = str2optimizer[args.optimizer](
+            optimizer_grouped_parameters, lr=args.learning_rate,
+            scale_parameter=False, relative_step=False
+        )
+
+    if args.scheduler in ["constant"]:
+        scheduler = str2scheduler[args.scheduler](optimizer)
+    elif args.scheduler in ["constant_with_warmup"]:
+        scheduler = str2scheduler[args.scheduler](optimizer, args.train_steps * args.warmup)
+    else:
+        scheduler = str2scheduler[args.scheduler](
+            optimizer, args.train_steps * args.warmup, args.train_steps
+        )
+
+    return optimizer, scheduler
+
+
+def main():
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    # Path options
+    parser.add_argument("--train_path", type=str, required=True,
+                        help="Path to training data (pickle)")
+    parser.add_argument("--dev_path", type=str, required=True,
+                        help="Path to validation data (pickle)")
+    parser.add_argument("--test_path", type=str, default=None,
+                        help="Path to test data (pickle)")
+    parser.add_argument("--label2id_path", type=str, required=True,
+                        help="Path to label2id mapping (pickle)")
+    parser.add_argument("--vocab_path_raw", type=str, required=True,
+                        help="Path to raw modality vocabulary")
+    parser.add_argument("--vocab_path_size", type=str, required=True,
+                        help="Path to size modality vocabulary")
+    parser.add_argument("--pretrained_model_path", type=str, default=None,
+                        help="Path to pretrained Stage 2 multimodal model checkpoint")
+    parser.add_argument("--output_model_path", type=str, required=True,
+                        help="Path to save the best model")
+    parser.add_argument("--config_path", type=str, default="models/bert/base_config.json",
+                        help="Path to model config")
+
+    # Training options
+    parser.add_argument("--epochs_num", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--warmup", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--report_steps", type=int, default=100)
+    parser.add_argument("--earlystop", type=int, default=5)
+
+    # Model options
+    parser.add_argument("--encoder", type=str, default="transformer")
+    parser.add_argument("--optimizer", type=str, default="adamw")
+    parser.add_argument("--scheduler", type=str, default="linear")
+    parser.add_argument("--num_fusion_layers", type=int, default=6,
+                        help="Number of fusion layers (should match pretrained model)")
+
+    # Sequence lengths
+    parser.add_argument("--seq_length_raw", type=int, default=512)
+    parser.add_argument("--seq_length_size", type=int, default=256)
+
+    args = parser.parse_args()
+
+    # Load hyperparameters from config
+    if args.config_path:
+        args = load_hyperparam(args)
+
+    # Set max_seq_length for embedding layers
+    args.max_seq_length = max(args.seq_length_raw, args.seq_length_size)
+
+    set_seed(args.seed)
+
+    # Load vocabularies
+    print("Loading vocabularies...")
+    vocab_raw = Vocab()
+    vocab_raw.load(args.vocab_path_raw)
+    vocab_size = Vocab()
+    vocab_size.load(args.vocab_path_size)
+
+    # Load label mapping
+    print("Loading label mapping...")
+    label2id = load_dataset(args.label2id_path)
+    args.labels_num = len(label2id)
+    print(f"Number of labels: {args.labels_num}")
+
+    # Load datasets
+    print("Loading datasets...")
+    train_data = load_dataset(args.train_path)
+    dev_data = load_dataset(args.dev_path)
+    test_data = load_dataset(args.test_path) if args.test_path else None
+
+    print(f"Train: {len(train_data)}, Dev: {len(dev_data)}, Test: {len(test_data) if test_data else 0}")
+
+    # Build model
+    print("Building model...")
+    model = Stage2Classifier(args, len(vocab_raw), len(vocab_size), args.labels_num)
+
+    # Load pretrained model
+    load_pretrained_model(model, args.pretrained_model_path)
+
+    # Move to device
+    args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {args.device}")
+    model = model.to(args.device)
+
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
+
+    # Build optimizer
+    args.train_steps = int(len(train_data) * args.epochs_num / args.batch_size) + 1
+    optimizer, scheduler = build_optimizer(args, model)
+
+    # Training loop
+    print("\n" + "=" * 50)
+    print("Starting training...")
+    print("=" * 50)
+
+    best_f1 = 0.0
+    best_epoch = 0
+    patience_counter = 0  # 连续没有改进的 epoch 数
+
+    for epoch in range(1, args.epochs_num + 1):
+        print(f"\nEpoch {epoch}/{args.epochs_num}")
+        print("-" * 30)
+
+        # Train
+        avg_loss = train_epoch(args, model, optimizer, scheduler, train_data)
+        print(f"Training loss: {avg_loss:.4f}")
+
+        # Evaluate on dev set
+        print("\nValidation:")
+        f1, _ = evaluate(args, model, dev_data)
+
+        # Save best model
+        if f1 > best_f1:
+            best_f1 = f1
+            best_epoch = epoch
+            patience_counter = 0  # 重置计数器
+            save_model(model, args.output_model_path)
+            print(f"New best model saved! F1: {best_f1:.4f}")
+        else:
+            patience_counter += 1
+            print(f"No improvement. Patience: {patience_counter}/{args.earlystop}")
+
+        # Early stopping
+        if patience_counter >= args.earlystop:
+            print(f"Early stopping at epoch {epoch} (no improvement for {args.earlystop} epochs)")
+            break
+
+    # Final evaluation on test set
+    if test_data:
+        print("\n" + "=" * 50)
+        print("Test Set Evaluation")
+        print("=" * 50)
+
+        # Load best model
+        if torch.cuda.device_count() > 1:
+            model.module.load_state_dict(torch.load(args.output_model_path))
+        else:
+            model.load_state_dict(torch.load(args.output_model_path))
+
+        evaluate(args, model, test_data, print_confusion=True)
+
+    print("\nTraining complete!")
+    print(f"Best validation F1: {best_f1:.4f} at epoch {best_epoch}")
+
+
+if __name__ == "__main__":
+    main()
