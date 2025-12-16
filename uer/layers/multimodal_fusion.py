@@ -119,37 +119,38 @@ class BidirectionalFusionLayer(nn.Module):
             raw_out: [batch, seq_len_raw, hidden]
             size_out: [batch, seq_len_size, hidden]
         """
-        # ===== Raw Branch =====
-        # Self-Attention
+        # ===== Step 1: Self-Attention (parallel for both branches) =====
+        # Raw Self-Attention
         raw_self, _ = self.self_attn_raw(raw_feat, raw_feat, raw_feat, raw_mask, None)
         raw_self = self.dropout_raw_1(raw_self)
-        raw_feat = self.layer_norm_raw_1(raw_feat + raw_self)
+        raw_feat_sa = self.layer_norm_raw_1(raw_feat + raw_self)
 
-        # Cross-Attention (Q=raw, KV=size)
-        raw_cross, _ = self.cross_attn_raw(size_feat, size_feat, raw_feat, cross_mask_r2s, None)
-        raw_cross = self.dropout_raw_2(raw_cross)
-        raw_feat = self.layer_norm_raw_2(raw_feat + raw_cross)
-
-        # FFN
-        raw_ffn = self.ffn_raw(raw_feat)
-        raw_ffn = self.dropout_raw_3(raw_ffn)
-        raw_out = self.layer_norm_raw_3(raw_feat + raw_ffn)
-
-        # ===== Size Branch =====
-        # Self-Attention
+        # Size Self-Attention
         size_self, _ = self.self_attn_size(size_feat, size_feat, size_feat, size_mask, None)
         size_self = self.dropout_size_1(size_self)
-        size_feat = self.layer_norm_size_1(size_feat + size_self)
+        size_feat_sa = self.layer_norm_size_1(size_feat + size_self)
 
-        # Cross-Attention (Q=size, KV=raw)
-        size_cross, _ = self.cross_attn_size(raw_feat, raw_feat, size_feat, cross_mask_s2r, None)
+        # ===== Step 2: Cross-Attention (symmetric, use self-attention outputs) =====
+        # Raw Cross-Attention (Q=raw, KV=size) - 用 size 的 self-attention 输出
+        raw_cross, _ = self.cross_attn_raw(size_feat_sa, size_feat_sa, raw_feat_sa, cross_mask_r2s, None)
+        raw_cross = self.dropout_raw_2(raw_cross)
+        raw_feat_ca = self.layer_norm_raw_2(raw_feat_sa + raw_cross)
+
+        # Size Cross-Attention (Q=size, KV=raw) - 用 raw 的 self-attention 输出（对称！）
+        size_cross, _ = self.cross_attn_size(raw_feat_sa, raw_feat_sa, size_feat_sa, cross_mask_s2r, None)
         size_cross = self.dropout_size_2(size_cross)
-        size_feat = self.layer_norm_size_2(size_feat + size_cross)
+        size_feat_ca = self.layer_norm_size_2(size_feat_sa + size_cross)
 
-        # FFN
-        size_ffn = self.ffn_size(size_feat)
+        # ===== Step 3: FFN (parallel for both branches) =====
+        # Raw FFN
+        raw_ffn = self.ffn_raw(raw_feat_ca)
+        raw_ffn = self.dropout_raw_3(raw_ffn)
+        raw_out = self.layer_norm_raw_3(raw_feat_ca + raw_ffn)
+
+        # Size FFN
+        size_ffn = self.ffn_size(size_feat_ca)
         size_ffn = self.dropout_size_3(size_ffn)
-        size_out = self.layer_norm_size_3(size_feat + size_ffn)
+        size_out = self.layer_norm_size_3(size_feat_ca + size_ffn)
 
         return raw_out, size_out
 

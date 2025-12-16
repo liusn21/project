@@ -68,6 +68,17 @@ class MultiModalModel(nn.Module):
         # ===== Target Module =====
         self.target = target
 
+        # ===== Momentum Projection Layers (for ITC) =====
+        # 独立的投影层，通过 EMA 更新，而非共享 Online encoder 的投影层
+        self.itc_proj_raw_m = copy.deepcopy(target.itc_proj_raw)
+        self.itc_proj_size_m = copy.deepcopy(target.itc_proj_size)
+
+        # Disable gradient for momentum projection layers
+        for param in self.itc_proj_raw_m.parameters():
+            param.requires_grad = False
+        for param in self.itc_proj_size_m.parameters():
+            param.requires_grad = False
+
         # ===== Feature Queues =====
         # Register as buffers so they are saved with the model but not trained
         self.register_buffer("raw_queue", torch.randn(queue_size, self.hidden_size))
@@ -81,7 +92,7 @@ class MultiModalModel(nn.Module):
     @torch.no_grad()
     def _momentum_update(self):
         """
-        Update momentum encoders using EMA
+        Update momentum encoders and projection layers using EMA
         """
         # Update Raw encoder
         for param, param_m in zip(self.embedding_raw.parameters(),
@@ -97,6 +108,14 @@ class MultiModalModel(nn.Module):
             param_m.data = param_m.data * self.momentum + param.data * (1.0 - self.momentum)
         for param, param_m in zip(self.encoder_size.parameters(),
                                    self.encoder_size_m.parameters()):
+            param_m.data = param_m.data * self.momentum + param.data * (1.0 - self.momentum)
+
+        # Update ITC projection layers
+        for param, param_m in zip(self.target.itc_proj_raw.parameters(),
+                                   self.itc_proj_raw_m.parameters()):
+            param_m.data = param_m.data * self.momentum + param.data * (1.0 - self.momentum)
+        for param, param_m in zip(self.target.itc_proj_size.parameters(),
+                                   self.itc_proj_size_m.parameters()):
             param_m.data = param_m.data * self.momentum + param.data * (1.0 - self.momentum)
 
     @torch.no_grad()
@@ -173,9 +192,9 @@ class MultiModalModel(nn.Module):
             raw_cls_m = raw_output_m[:, 0, :]  # [batch, hidden]
             size_cls_m = size_output_m[:, 0, :]  # [batch, hidden]
 
-            # Project momentum features (using main model's projection)
-            raw_cls_m_proj = F.normalize(self.target.itc_proj_raw(raw_cls_m), dim=-1)
-            size_cls_m_proj = F.normalize(self.target.itc_proj_size(size_cls_m), dim=-1)
+            # Project momentum features (using momentum projection layers, not online)
+            raw_cls_m_proj = F.normalize(self.itc_proj_raw_m(raw_cls_m), dim=-1)
+            size_cls_m_proj = F.normalize(self.itc_proj_size_m(size_cls_m), dim=-1)
 
         # ===== Step 3: ITC Loss =====
         itc_loss, sim_r2s, sim_s2r = self.target.forward_itc(
