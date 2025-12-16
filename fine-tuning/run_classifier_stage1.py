@@ -50,7 +50,12 @@ class Stage1Classifier(nn.Module):
     Architecture:
         - Raw encoder (pretrained): embedding + transformer
         - Size encoder (pretrained): embedding + transformer
-        - Concat CLS tokens -> Classification head
+        - Modality combination -> Classification head
+
+    Supports three modality modes:
+        - 'raw': Only use Raw modality
+        - 'size': Only use Size modality
+        - 'both': Concatenate Raw and Size (default)
     """
 
     def __init__(self, args, vocab_size_raw, vocab_size_size, labels_num):
@@ -58,19 +63,26 @@ class Stage1Classifier(nn.Module):
 
         self.hidden_size = args.hidden_size
         self.labels_num = labels_num
+        self.modality = getattr(args, 'modality', 'both')  # raw, size, both
 
         # Raw modality encoder
-        self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
-        self.encoder_raw = str2encoder[args.encoder](args)
+        if self.modality in ['raw', 'both']:
+            self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
+            self.encoder_raw = str2encoder[args.encoder](args)
 
         # Size modality encoder
-        self.embedding_size = PacketSizeEmbedding(args, vocab_size_size)
-        self.encoder_size = str2encoder[args.encoder](args)
+        if self.modality in ['size', 'both']:
+            self.embedding_size = PacketSizeEmbedding(args, vocab_size_size)
+            self.encoder_size = str2encoder[args.encoder](args)
 
-        # Classification head (concat CLS tokens)
-        # Input: [batch, 2 * hidden_size]
+        # Classification head
+        if self.modality == 'both':
+            classifier_input_size = 2 * args.hidden_size
+        else:
+            classifier_input_size = args.hidden_size
+
         self.classifier = nn.Sequential(
-            nn.Linear(2 * args.hidden_size, args.hidden_size),
+            nn.Linear(classifier_input_size, args.hidden_size),
             nn.Tanh(),
             nn.Dropout(args.dropout),
             nn.Linear(args.hidden_size, labels_num)
@@ -88,27 +100,36 @@ class Stage1Classifier(nn.Module):
         Returns:
             loss, logits if tgt is provided, else None, logits
         """
+        features = []
+
         # Raw encoder
-        raw_emb = self.embedding_raw(raw_src, packet_ids, directions)
-        raw_seg = (raw_src != PAD_ID).long()
-        raw_output = self.encoder_raw(raw_emb, raw_seg)  # [batch, seq_len, hidden]
-        raw_cls = raw_output[:, 0, :]  # [batch, hidden]
+        if self.modality in ['raw', 'both']:
+            raw_emb = self.embedding_raw(raw_src, packet_ids, directions)
+            raw_seg = (raw_src != PAD_ID).long()
+            raw_output = self.encoder_raw(raw_emb, raw_seg)  # [batch, seq_len, hidden]
+            raw_cls = raw_output[:, 0, :]  # [batch, hidden]
+            features.append(raw_cls)
 
         # Size encoder
-        size_emb = self.embedding_size(size_src)
-        size_seg = (size_src != PAD_ID).long()
-        size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len, hidden]
-        size_cls = size_output[:, 0, :]  # [batch, hidden]
+        if self.modality in ['size', 'both']:
+            size_emb = self.embedding_size(size_src)
+            size_seg = (size_src != PAD_ID).long()
+            size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len, hidden]
+            size_cls = size_output[:, 0, :]  # [batch, hidden]
+            features.append(size_cls)
 
-        # Concat CLS tokens
-        combined_cls = torch.cat([raw_cls, size_cls], dim=-1)  # [batch, 2*hidden]
+        # Combine features
+        if len(features) == 2:
+            combined = torch.cat(features, dim=-1)  # [batch, 2*hidden]
+        else:
+            combined = features[0]  # [batch, hidden]
 
         # Classification
-        logits = self.classifier(combined_cls)  # [batch, labels_num]
+        logits = self.classifier(combined)  # [batch, labels_num]
 
         if tgt is not None:
             loss = nn.NLLLoss()(nn.LogSoftmax(dim=-1)(logits), tgt)
-            return loss, logits
+            return loss.unsqueeze(0), logits  # 保持维度，避免 DataParallel 警告
         else:
             return None, logits
 
@@ -129,19 +150,41 @@ def load_pretrained_encoder(model, pretrained_path, encoder_type='raw'):
     state_dict = torch.load(pretrained_path, map_location='cpu')
 
     # Extract embedding and encoder weights
-    embedding_state = {k.replace('embedding.', ''): v
-                       for k, v in state_dict.items() if k.startswith('embedding.')}
-    encoder_state = {k.replace('encoder.', ''): v
-                     for k, v in state_dict.items() if k.startswith('encoder.')}
+    prefix_emb = 'embedding.'
+    prefix_enc = 'encoder.'
+    embedding_state = {k[len(prefix_emb):]: v
+                       for k, v in state_dict.items() if k.startswith(prefix_emb)}
+    encoder_state = {k[len(prefix_enc):]: v
+                     for k, v in state_dict.items() if k.startswith(prefix_enc)}
 
     if encoder_type == 'raw':
-        model.embedding_raw.load_state_dict(embedding_state, strict=False)
-        model.encoder_raw.load_state_dict(encoder_state, strict=False)
+        emb_result = model.embedding_raw.load_state_dict(embedding_state, strict=False)
+        enc_result = model.encoder_raw.load_state_dict(encoder_state, strict=False)
     else:
-        model.embedding_size.load_state_dict(embedding_state, strict=False)
-        model.encoder_size.load_state_dict(encoder_state, strict=False)
+        emb_result = model.embedding_size.load_state_dict(embedding_state, strict=False)
+        enc_result = model.encoder_size.load_state_dict(encoder_state, strict=False)
 
-    print(f"  Loaded {len(embedding_state)} embedding params, {len(encoder_state)} encoder params")
+    # 打印详细的加载信息
+    print(f"  Checkpoint keys: {len(state_dict)}")
+    print(f"  Embedding params to load: {len(embedding_state)}")
+    print(f"  Encoder params to load: {len(encoder_state)}")
+
+    # 检查是否全部加载成功
+    emb_success = len(emb_result.missing_keys) == 0 and len(emb_result.unexpected_keys) == 0
+    enc_success = len(enc_result.missing_keys) == 0 and len(enc_result.unexpected_keys) == 0
+
+    if emb_success and enc_success:
+        print(f"  ✓ All parameters loaded successfully!")
+    else:
+        print(f"  ✗ Load incomplete:")
+        if emb_result.missing_keys:
+            print(f"    Missing embedding keys ({len(emb_result.missing_keys)}): {emb_result.missing_keys}")
+        if emb_result.unexpected_keys:
+            print(f"    Unexpected embedding keys ({len(emb_result.unexpected_keys)}): {emb_result.unexpected_keys}")
+        if enc_result.missing_keys:
+            print(f"    Missing encoder keys ({len(enc_result.missing_keys)}): {enc_result.missing_keys[:5]}...")
+        if enc_result.unexpected_keys:
+            print(f"    Unexpected encoder keys ({len(enc_result.unexpected_keys)}): {enc_result.unexpected_keys[:5]}...")
 
 
 def load_dataset(path):
@@ -336,6 +379,8 @@ def main():
     parser.add_argument("--encoder", type=str, default="transformer")
     parser.add_argument("--optimizer", type=str, default="adamw")
     parser.add_argument("--scheduler", type=str, default="linear")
+    parser.add_argument("--modality", choices=["raw", "size", "both"], default="both",
+                        help="Modality mode: 'raw' (only Raw), 'size' (only Size), 'both' (concat both)")
 
     # Sequence lengths
     parser.add_argument("--seq_length_raw", type=int, default=512)
@@ -375,11 +420,14 @@ def main():
 
     # Build model
     print("Building model...")
+    print(f"  Modality mode: {args.modality}")
     model = Stage1Classifier(args, len(vocab_raw), len(vocab_size), args.labels_num)
 
-    # Load pretrained encoders
-    load_pretrained_encoder(model, args.pretrained_raw_path, 'raw')
-    load_pretrained_encoder(model, args.pretrained_size_path, 'size')
+    # Load pretrained encoders based on modality
+    if args.modality in ['raw', 'both']:
+        load_pretrained_encoder(model, args.pretrained_raw_path, 'raw')
+    if args.modality in ['size', 'both']:
+        load_pretrained_encoder(model, args.pretrained_size_path, 'size')
 
     # Move to device
     args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")

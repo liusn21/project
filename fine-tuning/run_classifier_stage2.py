@@ -118,7 +118,7 @@ class Stage2Classifier(nn.Module):
 
         if tgt is not None:
             loss = nn.NLLLoss()(nn.LogSoftmax(dim=-1)(logits), tgt)
-            return loss, logits
+            return loss.unsqueeze(0), logits  # 保持维度，避免 DataParallel 警告
         else:
             return None, logits
 
@@ -156,11 +156,20 @@ def load_pretrained_model(model, pretrained_path):
     classifier_missing = [k for k in missing if k.startswith('classifier')]
     other_missing = [k for k in missing if not k.startswith('classifier')]
 
-    if other_missing:
-        print(f"  Warning: Missing non-classifier keys: {other_missing[:5]}...")
+    print(f"  Checkpoint total keys: {len(state_dict)}")
+    print(f"  Filtered keys (exclude momentum/target): {len(filtered_state)}")
+    print(f"  Missing keys: {len(missing)} (classifier: {len(classifier_missing)}, other: {len(other_missing)})")
+    print(f"  Unexpected keys: {len(unexpected)}")
 
-    print(f"  Loaded {len(filtered_state)} params")
-    print(f"  Missing (classifier, expected): {len(classifier_missing)}")
+    if len(other_missing) == 0 and len(unexpected) == 0:
+        print(f"  All encoder/fusion parameters loaded successfully!")
+        print(f"  Classifier randomly initialized ({len(classifier_missing)} params)")
+    else:
+        print(f"  Load incomplete:")
+        if other_missing:
+            print(f"    Missing non-classifier keys ({len(other_missing)}): {other_missing[:10]}...")
+        if unexpected:
+            print(f"    Unexpected keys ({len(unexpected)}): {unexpected[:10]}...")
 
 
 def load_dataset(path):

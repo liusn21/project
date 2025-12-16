@@ -57,47 +57,53 @@ def build_model(args):
         )
 
         # Load pretrained encoders if specified
+        prefix_emb = 'embedding.'
+        prefix_enc = 'encoder.'
+
         if hasattr(args, 'pretrained_raw_path') and args.pretrained_raw_path:
             print(f"Loading pretrained Raw encoder from {args.pretrained_raw_path}")
             raw_state = torch.load(args.pretrained_raw_path, map_location="cpu")
-            model.embedding_raw.load_state_dict(
-                {k.replace('embedding.', ''): v for k, v in raw_state.items() if k.startswith('embedding.')},
-                strict=False
-            )
-            model.encoder_raw.load_state_dict(
-                {k.replace('encoder.', ''): v for k, v in raw_state.items() if k.startswith('encoder.')},
-                strict=False
-            )
+            raw_emb_state = {k[len(prefix_emb):]: v for k, v in raw_state.items() if k.startswith(prefix_emb)}
+            raw_enc_state = {k[len(prefix_enc):]: v for k, v in raw_state.items() if k.startswith(prefix_enc)}
+
+            emb_result = model.embedding_raw.load_state_dict(raw_emb_state, strict=False)
+            enc_result = model.encoder_raw.load_state_dict(raw_enc_state, strict=False)
             # Also load into momentum encoder
-            model.embedding_raw_m.load_state_dict(
-                {k.replace('embedding.', ''): v for k, v in raw_state.items() if k.startswith('embedding.')},
-                strict=False
-            )
-            model.encoder_raw_m.load_state_dict(
-                {k.replace('encoder.', ''): v for k, v in raw_state.items() if k.startswith('encoder.')},
-                strict=False
-            )
+            model.embedding_raw_m.load_state_dict(raw_emb_state, strict=False)
+            model.encoder_raw_m.load_state_dict(raw_enc_state, strict=False)
+
+            print(f"  Checkpoint keys: {len(raw_state)}, Embedding: {len(raw_emb_state)}, Encoder: {len(raw_enc_state)}")
+            if len(emb_result.missing_keys) == 0 and len(enc_result.missing_keys) == 0:
+                print(f"  Raw encoder loaded successfully!")
+            else:
+                print(f"  Raw encoder load incomplete:")
+                if emb_result.missing_keys:
+                    print(f"    Missing embedding: {emb_result.missing_keys}")
+                if enc_result.missing_keys:
+                    print(f"    Missing encoder: {enc_result.missing_keys[:5]}...")
 
         if hasattr(args, 'pretrained_size_path') and args.pretrained_size_path:
             print(f"Loading pretrained Size encoder from {args.pretrained_size_path}")
             size_state = torch.load(args.pretrained_size_path, map_location="cpu")
-            model.embedding_size.load_state_dict(
-                {k.replace('embedding.', ''): v for k, v in size_state.items() if k.startswith('embedding.')},
-                strict=False
-            )
-            model.encoder_size.load_state_dict(
-                {k.replace('encoder.', ''): v for k, v in size_state.items() if k.startswith('encoder.')},
-                strict=False
-            )
+            size_emb_state = {k[len(prefix_emb):]: v for k, v in size_state.items() if k.startswith(prefix_emb)}
+            size_enc_state = {k[len(prefix_enc):]: v for k, v in size_state.items() if k.startswith(prefix_enc)}
+
+            emb_result = model.embedding_size.load_state_dict(size_emb_state, strict=False)
+            enc_result = model.encoder_size.load_state_dict(size_enc_state, strict=False)
             # Also load into momentum encoder
-            model.embedding_size_m.load_state_dict(
-                {k.replace('embedding.', ''): v for k, v in size_state.items() if k.startswith('embedding.')},
-                strict=False
-            )
-            model.encoder_size_m.load_state_dict(
-                {k.replace('encoder.', ''): v for k, v in size_state.items() if k.startswith('encoder.')},
-                strict=False
-            )
+            model.embedding_size_m.load_state_dict(size_emb_state, strict=False)
+            model.encoder_size_m.load_state_dict(size_enc_state, strict=False)
+
+            # 打印加载信息
+            print(f"  Checkpoint keys: {len(size_state)}, Embedding: {len(size_emb_state)}, Encoder: {len(size_enc_state)}")
+            if len(emb_result.missing_keys) == 0 and len(enc_result.missing_keys) == 0:
+                print(f"  Size encoder loaded successfully!")
+            else:
+                print(f"  Size encoder load incomplete:")
+                if emb_result.missing_keys:
+                    print(f"    Missing embedding: {emb_result.missing_keys}")
+                if enc_result.missing_keys:
+                    print(f"    Missing encoder: {enc_result.missing_keys[:5]}...")
 
         print(f"  Fusion layers: {num_fusion_layers}")
         print(f"  Queue size: {queue_size}")
