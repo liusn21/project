@@ -50,15 +50,13 @@ class MultiModalTarget(nn.Module):
         self.itc_proj_size = nn.Linear(hidden_size, hidden_size)
 
         # ===== ITM: Binary Classification Head =====
-        # Input: element-wise product of raw_fused_cls and size_fused_cls [hidden_size]
-        # Multiplication directly captures alignment/similarity between modalities
+        # Input: concatenation of raw_fused_cls and size_fused_cls [2 * hidden_size]
         self.itm_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Linear(2 * hidden_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(args.dropout),
-            nn.Linear(hidden_size // 2, 2)  # Binary classification
+            nn.Linear(hidden_size, 2)  # Binary classification
         )
-        # Class-weighted loss: positive:negative = 1:2, so weight positive class 2x
         self.itm_criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.0]))
 
         # ===== MLM_raw: MLM Head for Raw modality =====
@@ -193,12 +191,10 @@ class MultiModalTarget(nn.Module):
         batch_size = pos_raw_cls.size(0)
         device = pos_raw_cls.device
 
-        # Element-wise multiplication to capture alignment between modalities
-        # Matched pairs: aligned vectors → larger product values
-        # Mismatched pairs: misaligned vectors → smaller/different product values
-        pos_feat = pos_raw_cls * pos_size_cls  # [batch, hidden]
-        neg1_feat = neg1_raw_cls * neg1_size_cls  # [batch, hidden]
-        neg2_feat = neg2_raw_cls * neg2_size_cls  # [batch, hidden]
+        # Concatenation to preserve all information from both modalities
+        pos_feat = torch.cat([pos_raw_cls, pos_size_cls], dim=-1)  # [batch, 2*hidden]
+        neg1_feat = torch.cat([neg1_raw_cls, neg1_size_cls], dim=-1)  # [batch, 2*hidden]
+        neg2_feat = torch.cat([neg2_raw_cls, neg2_size_cls], dim=-1)  # [batch, 2*hidden]
 
         # Positive samples
         pos_logits = self.itm_head(pos_feat)  # [batch, 2]
