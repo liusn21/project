@@ -94,7 +94,6 @@ def build_model(args):
             model.embedding_size_m.load_state_dict(size_emb_state, strict=False)
             model.encoder_size_m.load_state_dict(size_enc_state, strict=False)
 
-            # 打印加载信息
             print(f"  Checkpoint keys: {len(size_state)}, Embedding: {len(size_emb_state)}, Encoder: {len(size_enc_state)}")
             if len(emb_result.missing_keys) == 0 and len(enc_result.missing_keys) == 0:
                 print(f"  Size encoder loaded successfully!")

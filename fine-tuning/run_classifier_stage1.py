@@ -38,9 +38,10 @@ from uer.encoders import str2encoder
 from uer.utils.vocab import Vocab
 from uer.utils.config import load_hyperparam
 from uer.utils.seed import set_seed
-from uer.utils.optimizers import str2optimizer, str2scheduler
 from uer.model_saver import save_model
 from uer.utils.constants import PAD_ID
+from uer.utils import *
+from uer.opts import fine_tuning_opts
 
 
 class Stage1Classifier(nn.Module):
@@ -342,14 +343,10 @@ def build_optimizer(args, model):
 
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    fine_tuning_opts(parser)
+    
 
     # Path options
-    parser.add_argument("--train_path", type=str, required=True,
-                        help="Path to training data (pickle)")
-    parser.add_argument("--dev_path", type=str, required=True,
-                        help="Path to validation data (pickle)")
-    parser.add_argument("--test_path", type=str, default=None,
-                        help="Path to test data (pickle)")
     parser.add_argument("--label2id_path", type=str, required=True,
                         help="Path to label2id mapping (pickle)")
     parser.add_argument("--vocab_path_raw", type=str, required=True,
@@ -360,25 +357,11 @@ def main():
                         help="Path to pretrained raw encoder checkpoint")
     parser.add_argument("--pretrained_size_path", type=str, default=None,
                         help="Path to pretrained size encoder checkpoint")
-    parser.add_argument("--output_model_path", type=str, required=True,
-                        help="Path to save the best model")
-    parser.add_argument("--config_path", type=str, default="models/bert/base_config.json",
-                        help="Path to model config")
 
     # Training options
-    parser.add_argument("--epochs_num", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--warmup", type=float, default=0.1)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--report_steps", type=int, default=100)
     parser.add_argument("--earlystop", type=int, default=5)
 
     # Model options
-    parser.add_argument("--encoder", type=str, default="transformer")
-    parser.add_argument("--optimizer", type=str, default="adamw")
-    parser.add_argument("--scheduler", type=str, default="linear")
     parser.add_argument("--modality", choices=["raw", "size", "both"], default="both",
                         help="Modality mode: 'raw' (only Raw), 'size' (only Size), 'both' (concat both)")
 

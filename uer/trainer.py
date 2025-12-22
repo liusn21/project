@@ -355,6 +355,9 @@ class MultiModalTrainer(Trainer):
         self.lambda_itc = getattr(args, 'lambda_itc', 1.0)
         self.lambda_itm = getattr(args, 'lambda_itm', 1.0)
         self.lambda_mlm = getattr(args, 'lambda_mlm', 1.0)
+        # Separate MLM weights for modality balance (if specified, override lambda_mlm)
+        self.lambda_mlm_raw = getattr(args, 'lambda_mlm_raw', None)
+        self.lambda_mlm_size = getattr(args, 'lambda_mlm_size', None)
 
         # Count batches for averaging
         self.batch_count = 0
@@ -385,10 +388,18 @@ class MultiModalTrainer(Trainer):
         mlm_raw_loss = loss_dict['mlm_raw_loss']
         mlm_size_loss = loss_dict['mlm_size_loss']
 
-        # Combined loss
-        loss = (self.lambda_itc * itc_loss +
-                self.lambda_itm * itm_loss +
-                self.lambda_mlm * (mlm_raw_loss + mlm_size_loss))
+        # Combined loss (support separate MLM weights for modality balance)
+        if self.lambda_mlm_raw is not None and self.lambda_mlm_size is not None:
+            # Use separate weights for raw and size MLM
+            loss = (self.lambda_itc * itc_loss +
+                    self.lambda_itm * itm_loss +
+                    self.lambda_mlm_raw * mlm_raw_loss +
+                    self.lambda_mlm_size * mlm_size_loss)
+        else:
+            # Use combined weight (backward compatible)
+            loss = (self.lambda_itc * itc_loss +
+                    self.lambda_itm * itm_loss +
+                    self.lambda_mlm * (mlm_raw_loss + mlm_size_loss))
 
         # Update statistics
         self.total_loss += loss.item()

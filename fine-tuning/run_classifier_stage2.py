@@ -27,10 +27,60 @@ import random
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pickle
 from tqdm import tqdm
 import numpy as np
+from copy import deepcopy
 from sklearn.metrics import f1_score, precision_score, recall_score
+
+
+# ============ EMA (Exponential Moving Average) ============
+class EMA:
+    """
+    Exponential Moving Average: Smooth model weights for better generalization
+    Initialized after first epoch to avoid being dragged by initial weights
+    """
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        self.initialized = False
+
+    def init_shadow(self):
+        """Initialize shadow weights (call after first epoch)"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+        self.initialized = True
+
+    def update(self):
+        if not self.initialized:
+            return
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                new_avg = (1 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_avg.clone()
+
+    def apply_shadow(self):
+        """Use EMA weights for evaluation"""
+        if not self.initialized:
+            return
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self):
+        """Restore original weights"""
+        if not self.initialized:
+            return
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+        self.backup = {}
+
 
 from uer.layers import RawPacketEmbedding, PacketSizeEmbedding
 from uer.layers.multimodal_fusion import MultiModalFusionEncoder
@@ -38,9 +88,10 @@ from uer.encoders import str2encoder
 from uer.utils.vocab import Vocab
 from uer.utils.config import load_hyperparam
 from uer.utils.seed import set_seed
-from uer.utils.optimizers import str2optimizer, str2scheduler
 from uer.model_saver import save_model
 from uer.utils.constants import PAD_ID
+from uer.utils import *
+from uer.opts import finetune_opts
 
 
 class Stage2Classifier(nn.Module):
@@ -118,7 +169,7 @@ class Stage2Classifier(nn.Module):
 
         if tgt is not None:
             loss = nn.NLLLoss()(nn.LogSoftmax(dim=-1)(logits), tgt)
-            return loss.unsqueeze(0), logits  # 保持维度，避免 DataParallel 警告
+            return loss.unsqueeze(0), logits  # Keep dims to avoid DataParallel warning
         else:
             return None, logits
 
@@ -178,6 +229,68 @@ def load_dataset(path):
         return pickle.load(f)
 
 
+def compute_class_weights(dataset, num_classes, method='sqrt'):
+    """
+    Compute class weights for imbalanced data
+
+    Args:
+        dataset: list of samples with 'label' key
+        num_classes: number of classes
+        method: weighting method
+            - 'inverse': 1/count (original, may over-amplify minority classes)
+            - 'sqrt': 1/sqrt(count) (recommended, balanced effect)
+            - 'log': 1/log(count+1) (more gentle)
+            - 'effective': based on effective number of samples (CVPR 2019)
+
+    Returns:
+        torch.Tensor of shape [num_classes] with class weights
+    """
+    label_counts = torch.zeros(num_classes)
+    for sample in dataset:
+        label_counts[sample['label']] += 1
+
+    print(f"Class distribution: {label_counts.tolist()}")
+
+    if method == 'inverse':
+        # Original method: full inverse frequency
+        total = len(dataset)
+        weights = total / (num_classes * label_counts + 1e-6)
+
+    elif method == 'sqrt':
+        # Square root method: moderate weight differences
+        # 400 vs 40 -> weight ratio changes from 10:1 to ~3.16:1
+        weights = 1.0 / (torch.sqrt(label_counts) + 1e-6)
+
+    elif method == 'log':
+        # Logarithm method: more gentle adjustment
+        weights = 1.0 / (torch.log(label_counts + 1) + 1e-6)
+
+    elif method == 'effective':
+        # Effective Number of Samples (CVPR 2019)
+        # Paper: "Class-Balanced Loss Based on Effective Number of Samples"
+        beta = 0.999  # Tunable param, closer to 1 = closer to inverse frequency
+        effective_num = 1.0 - torch.pow(beta, label_counts)
+        weights = (1.0 - beta) / (effective_num + 1e-6)
+
+    else:
+        raise ValueError(f"Unknown weighting method: {method}")
+
+    # Normalize so mean weight = 1
+    weights = weights / weights.mean()
+
+    # Clip extreme weights (optional: limit max weight ratio)
+    max_weight = weights.max()
+    min_weight = weights.min()
+    if max_weight / min_weight > 10:
+        print(f"  Warning: weight ratio {max_weight/min_weight:.1f}x, clipping to 10x")
+        weights = torch.clamp(weights, min=max_weight / 10)
+        weights = weights / weights.mean()  # Re-normalize
+
+    print(f"Class weights ({method}): {[f'{w:.3f}' for w in weights.tolist()]}")
+
+    return weights
+
+
 def batch_loader(batch_size, dataset, shuffle=False):
     """Generate batches from dataset"""
     if shuffle:
@@ -197,7 +310,7 @@ def batch_loader(batch_size, dataset, shuffle=False):
         yield raw_src, packet_ids, directions, size_src, tgt
 
 
-def train_epoch(args, model, optimizer, scheduler, train_data):
+def train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema):
     """Train for one epoch"""
     model.train()
     total_loss = 0.0
@@ -211,14 +324,31 @@ def train_epoch(args, model, optimizer, scheduler, train_data):
         tgt = tgt.to(args.device)
 
         model.zero_grad()
-        loss, _ = model(raw_src, packet_ids, directions, size_src, tgt)
 
-        if torch.cuda.device_count() > 1:
+        # Get logits from model
+        _, logits = model(raw_src, packet_ids, directions, size_src, None)
+
+        # Compute loss
+        loss = criterion(logits, tgt)
+
+        # Handle DataParallel case
+        if loss.dim() > 0:
             loss = torch.mean(loss)
 
         loss.backward()
+
+        # Gradient clipping
+        if args.max_grad_norm > 0:
+            if hasattr(model, 'module'):
+                torch.nn.utils.clip_grad_norm_(model.module.parameters(), args.max_grad_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
         optimizer.step()
         scheduler.step()
+
+        # EMA update
+        ema.update()
 
         total_loss += loss.item()
         step += 1
@@ -248,7 +378,7 @@ def evaluate(args, model, eval_data, print_confusion=False):
             pred = torch.argmax(logits, dim=-1)
 
             for p, g in zip(pred.cpu().tolist(), tgt.cpu().tolist()):
-                confusion[g, p] += 1  # [ground_truth, predicted] - 标准惯例
+                confusion[g, p] += 1  # [ground_truth, predicted] - standard convention
                 y_pred.append(p)
                 y_true.append(g)
 
@@ -280,11 +410,11 @@ def evaluate(args, model, eval_data, print_confusion=False):
         print("\nPer-class metrics:")
         eps = 1e-9
         for i in range(args.labels_num):
-            # confusion[g, p]: 行=ground_truth, 列=predicted
-            # Precision = TP / (TP + FP) = 预测为i的中有多少是对的
-            # Recall = TP / (TP + FN) = 真实为i的中有多少被预测对了
-            p = confusion[i, i].item() / (confusion[:, i].sum().item() + eps)  # 列和
-            r = confusion[i, i].item() / (confusion[i, :].sum().item() + eps)  # 行和
+            # confusion[g, p]: row=ground_truth, col=predicted
+            # Precision = TP / (TP + FP) = correct among predicted as i
+            # Recall = TP / (TP + FN) = correct among actual i
+            p = confusion[i, i].item() / (confusion[:, i].sum().item() + eps)  # col sum
+            r = confusion[i, i].item() / (confusion[i, :].sum().item() + eps)  # row sum
             f1 = 2 * p * r / (p + r + eps)
             print(f"  Label {i}: P={p:.3f}, R={r:.3f}, F1={f1:.3f}")
 
@@ -292,16 +422,96 @@ def evaluate(args, model, eval_data, print_confusion=False):
 
 
 def build_optimizer(args, model):
-    """Build optimizer and scheduler"""
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'gamma', 'beta']
+    """Build optimizer and scheduler with optional Layer-wise LR Decay"""
+    no_decay = ['bias', 'gamma', 'beta', 'LayerNorm']
 
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-         'weight_decay_rate': 0.01},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
-         'weight_decay_rate': 0.0}
-    ]
+    # Get the actual model (handle DataParallel wrapper)
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    if args.use_llrd:
+        # Layer-wise Learning Rate Decay: encoder < fusion < classifier
+        encoder_lr = args.learning_rate * args.llrd_encoder_ratio
+        fusion_lr = args.learning_rate * args.llrd_fusion_ratio
+        classifier_lr = args.learning_rate
+
+        optimizer_grouped_parameters = []
+
+        # Encoder parameters (lowest LR)
+        encoder_params = []
+        encoder_params_no_decay = []
+        for name, param in actual_model.named_parameters():
+            if 'embedding_raw' in name or 'encoder_raw' in name or \
+               'embedding_size' in name or 'encoder_size' in name:
+                if any(nd in name for nd in no_decay):
+                    encoder_params_no_decay.append(param)
+                else:
+                    encoder_params.append(param)
+
+        optimizer_grouped_parameters.append({
+            'params': encoder_params,
+            'lr': encoder_lr,
+            'weight_decay': 0.01
+        })
+        optimizer_grouped_parameters.append({
+            'params': encoder_params_no_decay,
+            'lr': encoder_lr,
+            'weight_decay': 0.0
+        })
+
+        # Fusion parameters (middle LR)
+        fusion_params = []
+        fusion_params_no_decay = []
+        for name, param in actual_model.named_parameters():
+            if 'fusion' in name:
+                if any(nd in name for nd in no_decay):
+                    fusion_params_no_decay.append(param)
+                else:
+                    fusion_params.append(param)
+
+        optimizer_grouped_parameters.append({
+            'params': fusion_params,
+            'lr': fusion_lr,
+            'weight_decay': 0.01
+        })
+        optimizer_grouped_parameters.append({
+            'params': fusion_params_no_decay,
+            'lr': fusion_lr,
+            'weight_decay': 0.0
+        })
+
+        # Classifier parameters (highest LR)
+        classifier_params = []
+        classifier_params_no_decay = []
+        for name, param in actual_model.named_parameters():
+            if 'classifier' in name:
+                if any(nd in name for nd in no_decay):
+                    classifier_params_no_decay.append(param)
+                else:
+                    classifier_params.append(param)
+
+        optimizer_grouped_parameters.append({
+            'params': classifier_params,
+            'lr': classifier_lr,
+            'weight_decay': 0.01
+        })
+        optimizer_grouped_parameters.append({
+            'params': classifier_params_no_decay,
+            'lr': classifier_lr,
+            'weight_decay': 0.0
+        })
+
+        print(f"  LLRD: encoder_lr={encoder_lr:.2e}, fusion_lr={fusion_lr:.2e}, classifier_lr={classifier_lr:.2e}")
+
+    else:
+        # Standard optimizer: same LR for all parameters
+        param_optimizer = list(model.named_parameters())
+
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+             'weight_decay': 0.01},
+            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+             'weight_decay': 0.0}
+        ]
 
     if args.optimizer in ["adamw"]:
         optimizer = str2optimizer[args.optimizer](
@@ -327,47 +537,51 @@ def build_optimizer(args, model):
 
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    finetune_opts(parser)
 
     # Path options
-    parser.add_argument("--train_path", type=str, required=True,
-                        help="Path to training data (pickle)")
-    parser.add_argument("--dev_path", type=str, required=True,
-                        help="Path to validation data (pickle)")
-    parser.add_argument("--test_path", type=str, default=None,
-                        help="Path to test data (pickle)")
     parser.add_argument("--label2id_path", type=str, required=True,
                         help="Path to label2id mapping (pickle)")
     parser.add_argument("--vocab_path_raw", type=str, required=True,
                         help="Path to raw modality vocabulary")
     parser.add_argument("--vocab_path_size", type=str, required=True,
                         help="Path to size modality vocabulary")
-    parser.add_argument("--pretrained_model_path", type=str, default=None,
-                        help="Path to pretrained Stage 2 multimodal model checkpoint")
-    parser.add_argument("--output_model_path", type=str, required=True,
-                        help="Path to save the best model")
-    parser.add_argument("--config_path", type=str, default="models/bert/base_config.json",
-                        help="Path to model config")
 
     # Training options
-    parser.add_argument("--epochs_num", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--warmup", type=float, default=0.1)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--report_steps", type=int, default=100)
     parser.add_argument("--earlystop", type=int, default=5)
 
     # Model options
-    parser.add_argument("--encoder", type=str, default="transformer")
-    parser.add_argument("--optimizer", type=str, default="adamw")
-    parser.add_argument("--scheduler", type=str, default="linear")
     parser.add_argument("--num_fusion_layers", type=int, default=6,
                         help="Number of fusion layers (should match pretrained model)")
 
     # Sequence lengths
     parser.add_argument("--seq_length_raw", type=int, default=512)
     parser.add_argument("--seq_length_size", type=int, default=256)
+
+    # Fine-tuning options
+    parser.add_argument("--label_smoothing", type=float, default=0.1,
+                        help="Label smoothing factor (0.0 = no smoothing)")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Max gradient norm for clipping (0 = no clipping)")
+    parser.add_argument("--use_class_weight", action="store_true",
+                        help="Use class weights for imbalanced data")
+    parser.add_argument("--class_weight_method", type=str, default="sqrt",
+                        choices=["inverse", "sqrt", "log", "effective"],
+                        help="Class weight method: inverse, sqrt (recommended), log, effective")
+
+    # Layer-wise LR Decay
+    parser.add_argument("--use_llrd", action="store_true",
+                        help="Use Layer-wise Learning Rate Decay (encoder LR < fusion LR < classifier LR)")
+    parser.add_argument("--llrd_encoder_ratio", type=float, default=0.1,
+                        help="Encoder LR = base_LR * this ratio (default 0.1)")
+    parser.add_argument("--llrd_fusion_ratio", type=float, default=0.5,
+                        help="Fusion LR = base_LR * this ratio (default 0.5)")
+
+    # GPU options
+    parser.add_argument("--world_size", type=int, default=1,
+                        help="Total number of processes (GPUs) for training.")
+    parser.add_argument("--gpu_ranks", default=[], nargs='+', type=int,
+                        help="List of GPU ranks to use. E.g., --gpu_ranks 2 3 to use GPU 2 and 3.")
 
     args = parser.parse_args()
 
@@ -408,18 +622,71 @@ def main():
     # Load pretrained model
     load_pretrained_model(model, args.pretrained_model_path)
 
-    # Move to device
-    args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {args.device}")
-    model = model.to(args.device)
+    # Setup GPU device(s)
+    ranks_num = len(args.gpu_ranks)
 
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-        model = torch.nn.DataParallel(model)
+    if args.world_size > 1 and ranks_num > 1:
+        # Multi-GPU mode with DataParallel
+        assert torch.cuda.is_available(), "No available GPUs."
+        assert ranks_num <= torch.cuda.device_count(), "Specified GPUs exceed available GPUs."
+
+        # Set the primary device to the first specified GPU
+        primary_gpu = args.gpu_ranks[0]
+        args.device = torch.device(f"cuda:{primary_gpu}")
+        model = model.to(args.device)
+
+        # Use DataParallel with specified GPUs
+        model = torch.nn.DataParallel(model, device_ids=args.gpu_ranks)
+        print(f"Using DataParallel on GPUs: {args.gpu_ranks}")
+
+    elif ranks_num == 1:
+        # Single GPU mode with specified GPU
+        assert torch.cuda.is_available(), "No available GPUs."
+        gpu_id = args.gpu_ranks[0]
+        assert gpu_id < torch.cuda.device_count(), f"GPU {gpu_id} not available (only {torch.cuda.device_count()} GPUs)."
+
+        args.device = torch.device(f"cuda:{gpu_id}")
+        model = model.to(args.device)
+        print(f"Using single GPU: {gpu_id}")
+
+    elif torch.cuda.is_available():
+        # Default: use cuda:0
+        args.device = torch.device("cuda:0")
+        model = model.to(args.device)
+        print(f"Using default GPU: cuda:0")
+
+    else:
+        # CPU mode
+        args.device = torch.device("cpu")
+        model = model.to(args.device)
+        print("Using CPU mode")
 
     # Build optimizer
     args.train_steps = int(len(train_data) * args.epochs_num / args.batch_size) + 1
     optimizer, scheduler = build_optimizer(args, model)
+
+    # Build loss criterion
+    print("\nSetting up loss function...")
+    class_weights = None
+    if args.use_class_weight:
+        class_weights = compute_class_weights(train_data, args.labels_num, method=args.class_weight_method)
+        class_weights = class_weights.to(args.device)
+
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=args.label_smoothing
+    )
+
+    print(f"  Loss: CrossEntropy")
+    print(f"  Label smoothing: {args.label_smoothing}")
+    print(f"  Class weights: {'Enabled (' + args.class_weight_method + ')' if args.use_class_weight else 'Disabled'}")
+    print(f"  Gradient clipping: {args.max_grad_norm if args.max_grad_norm > 0 else 'Disabled'}")
+    if args.use_llrd:
+        print(f"  LLRD: encoder={args.llrd_encoder_ratio}x, fusion={args.llrd_fusion_ratio}x, classifier=1x")
+
+    # Setup EMA (initialized after first epoch)
+    ema = EMA(model, decay=0.999)
+    print(f"  EMA: Enabled (decay=0.999, init after epoch 1)")
 
     # Training loop
     print("\n" + "=" * 50)
@@ -428,34 +695,62 @@ def main():
 
     best_f1 = 0.0
     best_epoch = 0
-    patience_counter = 0  # 连续没有改进的 epoch 数
+    patience_counter = 0
 
     for epoch in range(1, args.epochs_num + 1):
         print(f"\nEpoch {epoch}/{args.epochs_num}")
         print("-" * 30)
 
         # Train
-        avg_loss = train_epoch(args, model, optimizer, scheduler, train_data)
+        avg_loss = train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema)
         print(f"Training loss: {avg_loss:.4f}")
+
+        # Initialize EMA after first epoch
+        if epoch == 1:
+            ema.init_shadow()
+            print("  EMA initialized with epoch 1 weights")
 
         # Evaluate on dev set
         print("\nValidation:")
-        f1, _ = evaluate(args, model, dev_data)
+        print("  [Original weights]")
+        f1_orig, _ = evaluate(args, model, dev_data)
+
+        # EMA evaluation (only after initialization)
+        use_ema_for_save = False
+        if ema.initialized:
+            ema.apply_shadow()
+            print("  [EMA weights]")
+            f1_ema, _ = evaluate(args, model, dev_data)
+            ema.restore()
+
+            if f1_ema >= f1_orig:
+                f1 = f1_ema
+                use_ema_for_save = True
+                print(f"  -> EMA wins ({f1_ema:.4f} >= {f1_orig:.4f})")
+            else:
+                f1 = f1_orig
+                print(f"  -> Original wins ({f1_orig:.4f} > {f1_ema:.4f})")
+        else:
+            f1 = f1_orig
 
         # Save best model
         if f1 > best_f1:
             best_f1 = f1
             best_epoch = epoch
-            patience_counter = 0  # 重置计数器
-            save_model(model, args.output_model_path)
+            patience_counter = 0
+            if use_ema_for_save:
+                ema.apply_shadow()
+                save_model(model, args.output_model_path)
+                ema.restore()
+            else:
+                save_model(model, args.output_model_path)
             print(f"New best model saved! F1: {best_f1:.4f}")
         else:
             patience_counter += 1
             print(f"No improvement. Patience: {patience_counter}/{args.earlystop}")
 
-        # Early stopping
         if patience_counter >= args.earlystop:
-            print(f"Early stopping at epoch {epoch} (no improvement for {args.earlystop} epochs)")
+            print(f"Early stopping at epoch {epoch}")
             break
 
     # Final evaluation on test set
@@ -464,11 +759,10 @@ def main():
         print("Test Set Evaluation")
         print("=" * 50)
 
-        # Load best model
-        if torch.cuda.device_count() > 1:
-            model.module.load_state_dict(torch.load(args.output_model_path))
+        if hasattr(model, 'module'):
+            model.module.load_state_dict(torch.load(args.output_model_path, map_location=args.device))
         else:
-            model.load_state_dict(torch.load(args.output_model_path))
+            model.load_state_dict(torch.load(args.output_model_path, map_location=args.device))
 
         evaluate(args, model, test_data, print_confusion=True)
 

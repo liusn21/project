@@ -123,6 +123,10 @@ def main():
                         help="Weight for ITM (matching) loss.")
     parser.add_argument("--lambda_mlm", type=float, default=1.0,
                         help="Weight for MLM losses (both raw and size).")
+    parser.add_argument("--lambda_mlm_raw", type=float, default=None,
+                        help="Weight for Raw MLM loss (if set, overrides lambda_mlm for raw).")
+    parser.add_argument("--lambda_mlm_size", type=float, default=None,
+                        help="Weight for Size MLM loss (if set, overrides lambda_mlm for size).")
 
     # Temperature parameters
     parser.add_argument("--itc_temperature", type=float, default=0.07,
