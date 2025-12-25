@@ -1,14 +1,15 @@
 """
-Multi-Modal Traffic Data Extractor V3 (uer框架兼容版)
+Multi-Modal Traffic Data Extractor V3 (uer框架兼容版 + IAT Temporal Information)
 
 输出文本格式，兼容uer的preprocess.py：
 - Raw packet: bigram文本（hex，空格分隔）
 - Packet size: 整数文本（空格分隔）
 - Direction: 编码在size中，或单独输出
+- IAT (Inter-Arrival Time): 时序信息（归一化后离散化到0-999）
 
 输出格式：
 - corpus_raw.txt: raw packet bigrams
-- corpus_size.txt: packet sizes
+- corpus_size.txt: packet sizes + IAT temporal tokens
 """
 
 import os
@@ -19,6 +20,7 @@ from tqdm import tqdm
 import binascii
 from multiprocessing import Pool, cpu_count
 import argparse
+import math
 
 
 class MultiModalExtractorV3:
@@ -49,6 +51,7 @@ class MultiModalExtractorV3:
         raw_directions = []
         packet_sizes = []  # List[int]
         size_directions = []
+        timestamps = []  # List[float] - packet timestamps
 
         for packet in packets:
             payload = self._extract_payload(packet, protocol)
@@ -57,6 +60,7 @@ class MultiModalExtractorV3:
 
             payload_len = min(len(payload),1500)
             direction = self._get_direction(packet, protocol, flow_src)
+            timestamp = float(packet.time)  # Extract timestamp
 
             # Raw modality: bigram hex strings
             if len(raw_bigrams) < self.max_raw_packets:
@@ -67,9 +71,13 @@ class MultiModalExtractorV3:
             # Size modality
             packet_sizes.append(payload_len)
             size_directions.append(direction)
+            timestamps.append(timestamp)
 
         if len(packet_sizes) == 0:
             return None
+
+        # Compute IAT tokens (normalized and discretized)
+        iat_tokens = self._compute_iat_tokens(timestamps)
 
         return {
             'protocol': protocol,
@@ -77,7 +85,8 @@ class MultiModalExtractorV3:
             'raw_bigrams': raw_bigrams,  # List[List[str]]
             'raw_directions': raw_directions, # [1,-1,1,-1...]
             'packet_sizes': packet_sizes,
-            'size_directions': size_directions #[1,-1,1,-1...]
+            'size_directions': size_directions, #[1,-1,1,-1...]
+            'iat_tokens': iat_tokens  # List[int] - IAT temporal tokens (0-999)
         }
 
     def _bytes_to_bigram_hex(self, payload_bytes):
@@ -97,6 +106,48 @@ class MultiModalExtractorV3:
             bigram_hex = f"{byte1:02x}{byte2:02x}"
             bigrams.append(bigram_hex)
         return bigrams
+
+    def _compute_iat_tokens(self, timestamps):
+        """
+        计算IAT（Inter-Arrival Time）tokens
+
+        参考PTU论文的方法：
+        1. 计算相邻包时间差（秒）
+        2. 归一化：sigmoid(log10(IAT + epsilon))
+        3. 离散化到1000个bins（0-999）
+
+        Args:
+            timestamps: List[float] - 数据包时间戳（秒）
+
+        Returns:
+            List[int]: IAT tokens (0-999)
+        """
+        if len(timestamps) == 0:
+            return []
+
+        iat_tokens = []
+        epsilon = 1e-6  
+
+        for i in range(len(timestamps)):
+            if i == 0:
+                iat = epsilon
+            else:
+                # 计算与前一个包的时间差
+                iat = timestamps[i] - timestamps[i-1]
+                iat = max(iat, epsilon)  # 确保非负且非零
+
+            # normalization: sigmoid(log10(IAT))
+            # sigmoid(x) = 1 / (1 + exp(-x))
+            log_iat = math.log10(iat)
+            normalized = 1.0 / (1.0 + math.exp(-log_iat))
+
+            # 离散化到 [0, 999]
+            token = int(normalized * 1000)
+            token = min(max(token, 0), 999)  # Clip to [0, 999]
+
+            iat_tokens.append(token)
+
+        return iat_tokens
 
     def parse_filename_5tuple(self, pcap_path):
         """从文件名解析5元组"""
@@ -180,10 +231,11 @@ def save_to_text_format(flows, output_raw_path, output_size_path):
     ||
     ...
 
-    corpus_size.txt格式：
+    corpus_size.txt格式（新增IAT行）：
     ||
     6
     1672 2185 953 ...
+    567 123 456 ...
     ||...
     """
     with open(output_raw_path, 'w') as f_raw, \
@@ -204,18 +256,22 @@ def save_to_text_format(flows, output_raw_path, output_size_path):
                 f_raw.write(" ".join(flow['raw_bigrams'][i]))  # bigrams for this packet
                 f_raw.write("\n")
 
-            # Size corpus
+            # Size corpus (with IAT temporal information)
             f_size.write("||")
             # Protocol (6=TCP, 17=UDP)
             f_size.write("\n")
             f_size.write(str(protocol))
             f_size.write("\n")
-            # direction：size_token = size * direction + 1500
+            # Line 1: size tokens (direction encoded: size_token = size * direction + 1500)
             size_tokens = []
             for size, direction in zip(flow['packet_sizes'], flow['size_directions']):
                 size_token = size * direction + 1500
                 size_tokens.append(str(size_token))
             f_size.write(" ".join(size_tokens))
+            f_size.write("\n")
+            # Line 2: IAT temporal tokens (0-999)
+            iat_token_strs = [str(token) for token in flow['iat_tokens']]
+            f_size.write(" ".join(iat_token_strs))
             f_size.write("\n")  # Flow结束
 
 

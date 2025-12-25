@@ -22,6 +22,8 @@ def main():
                         help="Path of the target vocabulary file.")
     parser.add_argument("--tgt_spm_model_path", default=None, type=str,
                         help="Path of the target sentence piece model.")
+    parser.add_argument("--vocab_path_temporal", default=None, type=str,
+                        help="Path of the temporal vocabulary file (for IAT tokens in packet_size target).")
     parser.add_argument("--pretrained_model_path", type=str, default=None,
                         help="Path of the pretrained model.")
     parser.add_argument("--output_model_path", type=str, required=True,
@@ -125,8 +127,10 @@ def main():
                         help="Weight for MLM losses (both raw and size).")
     parser.add_argument("--lambda_mlm_raw", type=float, default=None,
                         help="Weight for Raw MLM loss (if set, overrides lambda_mlm for raw).")
-    parser.add_argument("--lambda_mlm_size", type=float, default=None,
-                        help="Weight for Size MLM loss (if set, overrides lambda_mlm for size).")
+    parser.add_argument("--lambda_mlm_size", type=float, default=1.0,
+                        help="Weight for Size MLM loss (for packet_size target with temporal).")
+    parser.add_argument("--lambda_mlm_temporal", type=float, default=1.0,
+                        help="Weight for Temporal MLM loss (for packet_size target with temporal IAT).")
 
     # Temperature parameters
     parser.add_argument("--itc_temperature", type=float, default=0.07,

@@ -5,12 +5,12 @@ from uer.utils.constants import PAD_ID
 
 class PacketSizeModel(nn.Module):
     """
-    Model for Packet Size pretraining
+    Model for Packet Size pretraining with Temporal Information
 
     Architecture:
-        - embedding: PacketSizeEmbeddingV2 (token + position)
+        - embedding: PacketSizeEmbedding (token + temporal + position)
         - encoder: Transformer encoder
-        - target: MlmTarget (Masked Language Modeling)
+        - target: DualMlmTarget (Size MLM + Temporal MLM)
     """
     def __init__(self, args, embedding, encoder, target):
         super(PacketSizeModel, self).__init__()
@@ -18,22 +18,25 @@ class PacketSizeModel(nn.Module):
         self.encoder = encoder
         self.target = target
 
-        # Tie weights between token embedding and output layer if specified
+        # Tie weights between size token embedding and size output layer if specified
         if args.tie_weights:
-            self.target.mlm_linear_2.weight = self.embedding.token_embedding.weight
+            self.target.mlm_size_linear_2.weight = self.embedding.token_embedding.weight
 
 
-    def forward(self, src, tgt):
+    def forward(self, src, iat_tokens, tgt_mlm_size, tgt_mlm_temporal):
         """
         Args:
-            src: [batch, seq_len] - token IDs (direction encoded in size tokens)
-            tgt: [batch, seq_len] - MLM targets
+            src: [batch, seq_len] - size token IDs (direction encoded)
+            iat_tokens: [batch, seq_len] - IAT temporal token IDs (0-999 + special)
+            tgt_mlm_size: [batch, seq_len] - size MLM targets
+            tgt_mlm_temporal: [batch, seq_len] - temporal MLM targets
 
         Returns:
-            loss_info: (loss, correct, denominator)
+            loss_info: Tuple of (loss_size, correct_size, denominator_size,
+                                  loss_temporal, correct_temporal, denominator_temporal)
         """
-        # Generate embeddings
-        emb = self.embedding(src)
+        # Generate embeddings (token + temporal + position)
+        emb = self.embedding(src, iat_tokens)
 
         # Generate segment IDs for attention mask
         # seg = 0 for PAD positions, seg = 1 for valid positions
@@ -41,7 +44,7 @@ class PacketSizeModel(nn.Module):
         seg = (src != PAD_ID).long()  # 0 for PAD, 1 for non-PAD
         output = self.encoder(emb, seg)
 
-        # Compute MLM loss
-        loss_info = self.target(output, tgt)
+        # Compute dual MLM loss (size + temporal)
+        loss_info = self.target(output, tgt_mlm_size, tgt_mlm_temporal)
 
         return loss_info

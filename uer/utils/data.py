@@ -858,40 +858,48 @@ class RawPacketDataLoader(DataLoader):
 
 class PacketSizeDataset(Dataset):
     """
-    Dataset for Packet Size modality (Stage 1)
+    Dataset for Packet Size modality with Temporal Information (Stage 1)
 
     Corpus format (corpus_size.txt):
     ||
     6
     1672 2185 953 ...
+    567 123 456 ...
     ||
     17
     1300 1400 ...
+    234 456 789 ...
 
     Format explanation:
     - || : Flow separator
     - Next line: Protocol (6=TCP, 17=UDP)
-    - Following line: Size tokens (direction already encoded: size * direction + 1500)
+    - Line 1: Size tokens (direction already encoded: size * direction + 1500)
+    - Line 2: IAT temporal tokens (0-999)
     """
 
-    def __init__(self, args, vocab, tokenizer):
+    def __init__(self, args, vocab, tokenizer, vocab_temporal=None, tokenizer_temporal=None):
         super(PacketSizeDataset, self).__init__(args, vocab, tokenizer)
         self.short_seq_prob = args.short_seq_prob
 
+        # Temporal vocabulary and tokenizer
+        self.vocab_temporal = vocab_temporal if vocab_temporal is not None else vocab
+        self.tokenizer_temporal = tokenizer_temporal if tokenizer_temporal is not None else tokenizer
+
     def worker(self, proc_id, start, end):
-        print("Worker %d is building packet size dataset..." % proc_id)
+        print("Worker %d is building packet size dataset with temporal info..." % proc_id)
         set_seed(self.seed)
 
         # Buffer for accumulating flows
-        flow_buffer = []   # List of token lists (one per flow)
+        flow_buffer = []   # List of (size_tokens, iat_tokens) tuples (one per flow)
         flow_proto = []    # Protocol for each flow (0=TCP, 1=UDP)
 
         # Current flow being parsed
-        current_tokens = []
+        current_size_tokens = []
+        current_iat_tokens = []
         current_protocol = 0
 
         pos = 0
-        state = 'init'  # States: 'init', 'protocol', 'tokens'
+        state = 'init'  # States: 'init', 'protocol', 'size_tokens', 'iat_tokens'
 
         dataset_writer = open("/tmp/" + str(proc_id) + ".pt", "wb")
 
@@ -911,9 +919,9 @@ class PacketSizeDataset(Dataset):
 
                 # Check for flow separator
                 if line == "||":
-                    # Save previous flow if exists
-                    if len(current_tokens) > 0:
-                        flow_buffer.append(current_tokens)
+                    # Save previous flow if exists (must have both size and IAT)
+                    if len(current_size_tokens) > 0 and len(current_iat_tokens) > 0:
+                        flow_buffer.append((current_size_tokens, current_iat_tokens))
                         flow_proto.append(current_protocol)
 
                     # Check if buffer is full
@@ -925,7 +933,8 @@ class PacketSizeDataset(Dataset):
                         flow_proto = []
 
                     # Reset for new flow
-                    current_tokens = []
+                    current_size_tokens = []
+                    current_iat_tokens = []
                     state = 'protocol'
                     continue
 
@@ -940,9 +949,9 @@ class PacketSizeDataset(Dataset):
                         current_protocol = 0 if proto_num == 6 else 1  # 0=TCP, 1=UDP
                     except ValueError:
                         current_protocol = 0  # Default TCP
-                    state = 'tokens'
+                    state = 'size_tokens'
 
-                elif state == 'tokens':
+                elif state == 'size_tokens':
                     # This line contains size tokens
                     if not line:
                         continue
@@ -953,11 +962,26 @@ class PacketSizeDataset(Dataset):
                     )
 
                     if len(tokens) > 0:
-                        current_tokens = tokens
+                        current_size_tokens = tokens
+                        state = 'iat_tokens'
+
+                elif state == 'iat_tokens':
+                    # This line contains IAT temporal tokens
+                    if not line:
+                        continue
+
+                    # Tokenize IAT tokens
+                    iat_tokens = self.tokenizer_temporal.convert_tokens_to_ids(
+                        self.tokenizer_temporal.tokenize(line)
+                    )
+
+                    if len(iat_tokens) > 0:
+                        current_iat_tokens = iat_tokens
+                    # After reading IAT, flow is complete, wait for next separator
 
             # Save last flow
-            if len(current_tokens) > 0:
-                flow_buffer.append(current_tokens)
+            if len(current_size_tokens) > 0 and len(current_iat_tokens) > 0:
+                flow_buffer.append((current_size_tokens, current_iat_tokens))
                 flow_proto.append(current_protocol)
 
             # Process remaining buffer
@@ -979,46 +1003,94 @@ class PacketSizeDataset(Dataset):
 
     def create_ins_from_flow(self, all_flows, flow_index, flow_proto):
         """
-        Create training instances from a single flow
+        Create training instances from a single flow with temporal information
 
-        Note: Protocol is ignored. Direction is already encoded in size tokens (size * direction + 1500)
-        Only token embedding + position embedding are used.
+        Each flow contains (size_tokens, iat_tokens)
+        Both modalities are masked independently with the same mask positions
         """
-        tokens = all_flows[flow_index]
+        size_tokens, iat_tokens = all_flows[flow_index]
         # flow_proto is ignored as per requirements
+
+        # Ensure size and IAT have same length
+        min_len = min(len(size_tokens), len(iat_tokens))
+        size_tokens = size_tokens[:min_len]
+        iat_tokens = iat_tokens[:min_len]
 
         max_num_tokens = self.seq_length - 2  # Reserve for [CLS] and [SEP]
 
         # Truncate
-        if len(tokens) > max_num_tokens:
-            tokens = tokens[:max_num_tokens]
+        if len(size_tokens) > max_num_tokens:
+            size_tokens = size_tokens[:max_num_tokens]
+            iat_tokens = iat_tokens[:max_num_tokens]
 
-        # Build instance with special tokens
-        src = [self.vocab.get(CLS_TOKEN)] + tokens + [self.vocab.get(SEP_TOKEN)]
+        # Build instance with special tokens for both modalities
+        src_size = [self.vocab.get(CLS_TOKEN)] + size_tokens + [self.vocab.get(SEP_TOKEN)]
+        src_iat = [self.vocab_temporal.get(CLS_TOKEN)] + iat_tokens + [self.vocab_temporal.get(SEP_TOKEN)]
 
         # Padding
-        while len(src) < self.seq_length:
-            src.append(PAD_ID)
+        while len(src_size) < self.seq_length:
+            src_size.append(PAD_ID)
+            src_iat.append(PAD_ID)
 
-        # Apply masking
+        # Apply masking (use same mask positions for both modalities)
         if not self.dynamic_masking:
-            src, tgt_mlm = mask_seq(src, self.tokenizer, self.whole_word_masking,
-                                   self.span_masking, self.span_geo_prob, self.span_max_length)
-            instance = (src, tgt_mlm)
+            # Mask size tokens
+            src_size_masked, tgt_mlm_size = mask_seq(
+                src_size, self.tokenizer, self.whole_word_masking,
+                self.span_masking, self.span_geo_prob, self.span_max_length
+            )
+
+            # Mask IAT tokens at the same positions with 80/10/10 strategy
+            # Extract mask positions from size masking
+            mask_positions = [pos for pos, _ in tgt_mlm_size]
+
+            # Apply same mask positions to IAT with standard BERT masking strategy
+            src_iat_masked = src_iat.copy()
+            tgt_mlm_iat = []
+            for pos in mask_positions:
+                original_token = src_iat[pos]
+                tgt_mlm_iat.append((pos, original_token))
+
+                # Standard BERT masking: 80% [MASK], 10% random, 10% unchanged
+                prob = random.random()
+                if prob < 0.8:
+                    # 80%: Replace with [MASK]
+                    src_iat_masked[pos] = self.vocab_temporal.get(MASK_TOKEN)
+                elif prob < 0.9:
+                    # 10%: Replace with random token
+                    while True:
+                        rdi = random.randint(1, len(self.vocab_temporal) - 1)
+                        if rdi not in [self.vocab_temporal.get(CLS_TOKEN),
+                                      self.vocab_temporal.get(SEP_TOKEN),
+                                      self.vocab_temporal.get(MASK_TOKEN),
+                                      PAD_ID]:
+                            break
+                    src_iat_masked[pos] = rdi
+                # else: 10%: Keep original token (src_iat_masked already has it)
+
+            instance = (src_size_masked, src_iat_masked, tgt_mlm_size, tgt_mlm_iat)
         else:
-            instance = (src,)
+            instance = (src_size, src_iat)
 
         return [instance]
 
 
 class PacketSizeDataLoader(DataLoader):
     """
-    DataLoader for Packet Size modality
+    DataLoader for Packet Size modality with Temporal Information
 
     Returns:
-        src: [batch, seq_len] - token IDs (direction already encoded in size tokens)
-        tgt_mlm: [batch, seq_len] - MLM targets
+        src_size: [batch, seq_len] - size token IDs (direction encoded)
+        src_iat: [batch, seq_len] - IAT temporal token IDs
+        tgt_mlm_size: [batch, seq_len] - size MLM targets
+        tgt_mlm_temporal: [batch, seq_len] - temporal MLM targets
     """
+
+    def __init__(self, args, dataset_path, batch_size, proc_id, proc_num, shuffle=False):
+        super(PacketSizeDataLoader, self).__init__(args, dataset_path, batch_size, proc_id, proc_num, shuffle)
+        # Get temporal tokenizer from args (if available)
+        self.tokenizer_temporal = getattr(args, 'tokenizer_temporal', self.tokenizer)
+        self.vocab_temporal = getattr(args, 'vocab_temporal', self.vocab)
 
     def __iter__(self):
         while True:
@@ -1032,34 +1104,80 @@ class PacketSizeDataLoader(DataLoader):
 
             self.start += self.batch_size
 
-            src = []
-            tgt_mlm = []
+            src_size = []
+            src_iat = []
+            tgt_mlm_size = []
+            tgt_mlm_temporal = []
 
             masked_words_num = 0
 
             for ins in instances:
-                if len(ins) == 2:  # Static masking: (src, tgt_mlm)
-                    src.append(ins[0])
-                    masked_words_num += len(ins[1])
-                    tgt_mlm.append([0] * len(ins[0]))
-                    for mask in ins[1]:
-                        tgt_mlm[-1][mask[0]] = mask[1]
-                else:  # Dynamic masking: (src,)
-                    src_single, tgt_mlm_single = mask_seq(
+                if len(ins) == 4:  # Static masking: (src_size, src_iat, tgt_mlm_size, tgt_mlm_iat)
+                    src_size.append(ins[0])
+                    src_iat.append(ins[1])
+                    masked_words_num += len(ins[2])  # Count size masks
+
+                    # Convert mask tuples to dense targets
+                    tgt_mlm_size.append([0] * len(ins[0]))
+                    for mask in ins[2]:
+                        tgt_mlm_size[-1][mask[0]] = mask[1]
+
+                    tgt_mlm_temporal.append([0] * len(ins[1]))
+                    for mask in ins[3]:
+                        tgt_mlm_temporal[-1][mask[0]] = mask[1]
+
+                else:  # Dynamic masking: (src_size, src_iat)
+                    # Mask size tokens
+                    src_size_single, tgt_mlm_size_single = mask_seq(
                         ins[0], self.tokenizer, self.whole_word_masking,
                         self.span_masking, self.span_geo_prob, self.span_max_length
                     )
-                    masked_words_num += len(tgt_mlm_single)
-                    src.append(src_single)
-                    tgt_mlm.append([0] * len(ins[0]))
-                    for mask in tgt_mlm_single:
-                        tgt_mlm[-1][mask[0]] = mask[1]
+                    masked_words_num += len(tgt_mlm_size_single)
+
+                    # Mask IAT tokens at the same positions with 80/10/10 strategy
+                    mask_positions = [pos for pos, _ in tgt_mlm_size_single]
+                    src_iat_single = ins[1].copy()
+                    tgt_mlm_iat_single = []
+                    for pos in mask_positions:
+                        original_token = ins[1][pos]
+                        tgt_mlm_iat_single.append((pos, original_token))
+
+                        # Standard BERT masking: 80% [MASK], 10% random, 10% unchanged
+                        prob = random.random()
+                        if prob < 0.8:
+                            # 80%: Replace with [MASK]
+                            src_iat_single[pos] = self.vocab_temporal.get(MASK_TOKEN)
+                        elif prob < 0.9:
+                            # 10%: Replace with random token
+                            while True:
+                                rdi = random.randint(1, len(self.vocab_temporal) - 1)
+                                if rdi not in [self.vocab_temporal.get(CLS_TOKEN),
+                                              self.vocab_temporal.get(SEP_TOKEN),
+                                              self.vocab_temporal.get(MASK_TOKEN),
+                                              PAD_ID]:
+                                    break
+                            src_iat_single[pos] = rdi
+                        # else: 10%: Keep original token
+
+                    src_size.append(src_size_single)
+                    src_iat.append(src_iat_single)
+
+                    # Convert to dense targets
+                    tgt_mlm_size.append([0] * len(ins[0]))
+                    for mask in tgt_mlm_size_single:
+                        tgt_mlm_size[-1][mask[0]] = mask[1]
+
+                    tgt_mlm_temporal.append([0] * len(ins[1]))
+                    for mask in tgt_mlm_iat_single:
+                        tgt_mlm_temporal[-1][mask[0]] = mask[1]
 
             if masked_words_num == 0:
                 continue
 
-            yield (torch.LongTensor(src),
-                   torch.LongTensor(tgt_mlm))
+            yield (torch.LongTensor(src_size),
+                   torch.LongTensor(src_iat),
+                   torch.LongTensor(tgt_mlm_size),
+                   torch.LongTensor(tgt_mlm_temporal))
 
 
 # ============================================================================

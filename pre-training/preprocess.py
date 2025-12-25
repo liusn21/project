@@ -27,6 +27,8 @@ def main():
                         help="Path of the target vocabulary file.")
     parser.add_argument("--tgt_spm_model_path", default=None, type=str,
                         help="Path of the target sentence piece model.")
+    parser.add_argument("--vocab_path_temporal", default=None, type=str,
+                        help="Path of the temporal vocabulary file (for IAT tokens in packet_size target).")
     parser.add_argument("--dataset_path", type=str, default="dataset.pt",
                         help="Path of the preprocessed dataset.")
 
@@ -76,8 +78,21 @@ def main():
     if args.target == "seq2seq":
         args.tgt_tokenizer = str2tokenizer[args.tgt_tokenizer](args, False)
 
+    # Build temporal tokenizer for packet_size target (if vocab_path_temporal is provided)
+    tokenizer_temporal = None
+    if args.target == "packet_size" and hasattr(args, 'vocab_path_temporal') and args.vocab_path_temporal:
+        # Create a temporary args object for temporal tokenizer
+        import copy
+        args_temporal = copy.copy(args)
+        args_temporal.vocab_path = args.vocab_path_temporal
+        tokenizer_temporal = str2tokenizer[args.tokenizer](args_temporal)
+        print(f"Loaded temporal vocab from {args.vocab_path_temporal} (size: {len(tokenizer_temporal.vocab)})")
+
     # Build and save dataset.
-    dataset = str2dataset[args.target](args, tokenizer.vocab, tokenizer)
+    if args.target == "packet_size" and tokenizer_temporal is not None:
+        dataset = str2dataset[args.target](args, tokenizer.vocab, tokenizer, tokenizer_temporal.vocab, tokenizer_temporal)
+    else:
+        dataset = str2dataset[args.target](args, tokenizer.vocab, tokenizer)
     dataset.build_and_save(args.processes_num,split_by_flow=True)
 
 

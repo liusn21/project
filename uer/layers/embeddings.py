@@ -108,19 +108,21 @@ class RawPacketEmbedding(nn.Module):
 
 class PacketSizeEmbedding(nn.Module):
     """
-    NEW Embedding for Packet Size modality
+    NEW Embedding for Packet Size modality with Temporal Information
 
     Components:
     - Token embedding: size tokens (vocab_size from vocab file)
+    - Temporal embedding: IAT tokens (vocab_size_temporal=1005 for 0-999 + special tokens)
     - Position embedding: sequence position
 
-    Formula: emb = token_emb + position_emb
+    Formula: emb = token_emb + temporal_emb + position_emb
 
     Note:
     - Direction is already encoded in size tokens (size * direction + 1500)
+    - IAT provides temporal dynamics information
     - Protocol embedding is removed as per requirements
     """
-    def __init__(self, args, vocab_size):
+    def __init__(self, args, vocab_size, vocab_size_temporal):
         super(PacketSizeEmbedding, self).__init__()
         self.remove_embedding_layernorm = args.remove_embedding_layernorm
         self.dropout = nn.Dropout(args.dropout)
@@ -129,16 +131,20 @@ class PacketSizeEmbedding(nn.Module):
         # Token embedding (size tokens with direction encoded)
         self.token_embedding = nn.Embedding(vocab_size, args.emb_size)
 
+        # Temporal embedding (IAT tokens: 0-999 + special tokens)
+        self.temporal_embedding = nn.Embedding(vocab_size_temporal, args.emb_size)
+
         # Position embedding
         self.position_embedding = nn.Embedding(self.max_seq_length, args.emb_size)
 
         if not self.remove_embedding_layernorm:
             self.layer_norm = LayerNorm(args.emb_size)
 
-    def forward(self, src):
+    def forward(self, src, iat_tokens):
         """
         Args:
             src: [batch, seq_len] - size token IDs (direction encoded)
+            iat_tokens: [batch, seq_len] - IAT temporal token IDs (0-999 + special)
 
         Returns:
             emb: [batch, seq_len, emb_size]
@@ -148,14 +154,17 @@ class PacketSizeEmbedding(nn.Module):
         # Token embedding
         token_emb = self.token_embedding(src)
 
+        # Temporal embedding
+        temporal_emb = self.temporal_embedding(iat_tokens)
+
         # Position embedding
         pos_emb = self.position_embedding(
             torch.arange(0, seq_len, device=src.device, dtype=torch.long)
             .unsqueeze(0).repeat(batch_size, 1)
         )
 
-        # Combine embeddings: token + position
-        emb = token_emb + pos_emb
+        # Combine embeddings: token + temporal + position
+        emb = token_emb + temporal_emb + pos_emb
 
         if not self.remove_embedding_layernorm:
             emb = self.layer_norm(emb)

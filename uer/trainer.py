@@ -64,6 +64,17 @@ def train_and_validate(args):
             tgt_vocab = Vocab()
             tgt_vocab.load(args.tgt_vocab_path)
             args.tgt_vocab = tgt_vocab.w2i
+        # Load temporal vocabulary for packet_size target (if provided)
+        if args.target == "packet_size" and hasattr(args, 'vocab_path_temporal') and args.vocab_path_temporal:
+            import copy
+            args_temporal = copy.copy(args)
+            args_temporal.vocab_path = args.vocab_path_temporal
+            args.tokenizer_temporal = str2tokenizer[args.tokenizer](args_temporal)
+            args.vocab_temporal = args.tokenizer_temporal.vocab
+            print(f"Loaded temporal vocab from {args.vocab_path_temporal} (size: {len(args.vocab_temporal)})")
+        else:
+            args.vocab_temporal = None
+            args.tokenizer_temporal = None
 
     # Build model.
     print("Build model.")
@@ -279,22 +290,52 @@ class RawPacketMlmTrainer(Trainer):
 
 
 class PacketSizeMlmTrainer(Trainer):
-    """Trainer for Packet Size modality - MLM only"""
+    """Trainer for Packet Size modality with Temporal Information - Dual MLM (Size + Temporal)"""
 
     def __init__(self, args):
         super(PacketSizeMlmTrainer, self).__init__(args)
-        self.total_loss_mlm = 0.0
-        self.total_correct_mlm = 0.0
-        self.total_denominator = 0.0
+        # Size MLM stats
+        self.total_loss_mlm_size = 0.0
+        self.total_correct_mlm_size = 0.0
+        self.total_denominator_size = 0.0
+        # Temporal MLM stats
+        self.total_loss_mlm_temporal = 0.0
+        self.total_correct_mlm_temporal = 0.0
+        self.total_denominator_temporal = 0.0
+        # Loss weights
+        self.lambda_mlm_size = getattr(args, 'lambda_mlm_size', 1.0)
+        self.lambda_mlm_temporal = getattr(args, 'lambda_mlm_temporal', 1.0)
 
     def forward_propagation(self, batch, model):
-        src, tgt_mlm = batch
-        loss_mlm, correct_mlm, denominator = model(src, tgt_mlm)
+        # Check if batch has temporal info (4 tensors) or legacy format (2 tensors)
+        if len(batch) == 4:
+            # New format with temporal: (src_size, src_iat, tgt_mlm_size, tgt_mlm_temporal)
+            src_size, src_iat, tgt_mlm_size, tgt_mlm_temporal = batch
+            loss_size, correct_size, denominator_size, loss_temporal, correct_temporal, denominator_temporal = model(
+                src_size, src_iat, tgt_mlm_size, tgt_mlm_temporal
+            )
 
-        self.total_loss += loss_mlm.item()
-        self.total_loss_mlm += loss_mlm.item()
-        self.total_correct_mlm += correct_mlm.item()
-        self.total_denominator += denominator.item()
+            # Weighted combined loss
+            loss_mlm = self.lambda_mlm_size * loss_size + self.lambda_mlm_temporal * loss_temporal
+
+            self.total_loss += loss_mlm.item()
+            self.total_loss_mlm_size += loss_size.item()
+            self.total_loss_mlm_temporal += loss_temporal.item()
+            self.total_correct_mlm_size += correct_size.item()
+            self.total_correct_mlm_temporal += correct_temporal.item()
+            self.total_denominator_size += denominator_size.item()
+            self.total_denominator_temporal += denominator_temporal.item()
+
+        else:
+            # Legacy format (2 tensors): (src, tgt_mlm) - single MLM
+            src, tgt_mlm = batch
+            loss_mlm, correct_mlm, denominator = model(src, tgt_mlm)
+
+            self.total_loss += loss_mlm.item()
+            self.total_loss_mlm_size += loss_mlm.item()
+            self.total_correct_mlm_size += correct_mlm.item()
+            self.total_denominator_size += denominator.item()
+            loss_mlm = loss_mlm  # Keep for compatibility
 
         loss = loss_mlm / self.accumulation_steps
         return loss
@@ -304,22 +345,30 @@ class PacketSizeMlmTrainer(Trainer):
         if self.dist_train:
             done_tokens *= self.world_size
 
+        # Report both Size and Temporal MLM stats
         print("| {:8d}/{:8d} steps"
               "| {:3.3f} s"
               "| {:8.2f} tokens/s"
-              "| loss_mlm: {:7.2f}"
-              "| acc_mlm: {:3.3f}".format(
+              "| loss_size: {:7.2f}"
+              "| acc_size: {:3.3f}"
+              "| loss_temp: {:7.2f}"
+              "| acc_temp: {:3.3f}".format(
             self.current_step,
             self.total_steps,
             (time.time() - self.start_time),
             done_tokens / (time.time() - self.start_time),
-            self.total_loss_mlm / self.report_steps,
-            self.total_correct_mlm / self.total_denominator))
+            self.total_loss_mlm_size / self.report_steps,
+            self.total_correct_mlm_size / (self.total_denominator_size + 1e-6),
+            self.total_loss_mlm_temporal / self.report_steps,
+            self.total_correct_mlm_temporal / (self.total_denominator_temporal + 1e-6)))
 
         self.total_loss = 0.0
-        self.total_loss_mlm = 0.0
-        self.total_correct_mlm = 0.0
-        self.total_denominator = 0.0
+        self.total_loss_mlm_size = 0.0
+        self.total_loss_mlm_temporal = 0.0
+        self.total_correct_mlm_size = 0.0
+        self.total_correct_mlm_temporal = 0.0
+        self.total_denominator_size = 0.0
+        self.total_denominator_temporal = 0.0
 
 
 class MultiModalTrainer(Trainer):

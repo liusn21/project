@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from uer.layers.transformer import TransformerLayer,TransformerMOELayer
+from uer.layers.transformer import TransformerLayer
 from uer.layers.layer_norm import LayerNorm, T5LayerNorm
 from uer.layers.relative_position_embedding import RelativePositionEmbedding
 import pickle

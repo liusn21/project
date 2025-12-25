@@ -2,8 +2,8 @@ CXX = g++
 CXXFLAGS = -std=c++17 -O3 -Wall -Wextra -pthread
 LDFLAGS = -lpcap
 
-TARGET = pcap_flow_filter
-SRC = pcap_flow_filter.cpp
+TARGET = pcap_process
+SRC = pcap_process.cpp
 
 all: $(TARGET)
 

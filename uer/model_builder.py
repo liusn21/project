@@ -116,12 +116,28 @@ def build_model(args):
         encoder = str2encoder[args.encoder](args)
         target = str2target[args.target](args, len(args.vocab))
         model = RawPacketModel(args, embedding, encoder, target)
-    # For packet_size target, use PacketSizeEmbedding and PacketSizeModel
+    # For packet_size target, use PacketSizeEmbedding and PacketSizeModel with temporal info
     elif args.target == "packet_size":
-        embedding = PacketSizeEmbedding(args, len(args.vocab))
-        encoder = str2encoder[args.encoder](args)
-        target = str2target[args.target](args, len(args.vocab))
-        model = PacketSizeModel(args, embedding, encoder, target)
+        # Check if temporal vocab is provided (for Stage 1 with IAT)
+        if hasattr(args, 'vocab_temporal') and args.vocab_temporal is not None:
+            # Packet Size with Temporal IAT (DualMlm)
+            vocab_size_temporal = len(args.vocab_temporal)
+            embedding = PacketSizeEmbedding(args, len(args.vocab), vocab_size_temporal)
+            encoder = str2encoder[args.encoder](args)
+            # Use DualMlmTarget
+            from uer.targets.mlm_target import DualMlmTarget
+            target = DualMlmTarget(args, len(args.vocab), vocab_size_temporal)
+            model = PacketSizeModel(args, embedding, encoder, target)
+            print(f"  Packet Size with Temporal IAT")
+            print(f"  Size vocab: {len(args.vocab)}, Temporal vocab: {vocab_size_temporal}")
+        else:
+            # Legacy: Packet Size without temporal info (Single MLM)
+            embedding = PacketSizeEmbedding(args, len(args.vocab), len(args.vocab))  # Use same vocab for compatibility
+            encoder = str2encoder[args.encoder](args)
+            target = str2target[args.target](args, len(args.vocab))
+            model = PacketSizeModel(args, embedding, encoder, target)
+            print(f"  Packet Size (legacy mode without temporal)")
+
     else:
         embedding = str2embedding[args.embedding](args, len(args.vocab))
         encoder = str2encoder[args.encoder](args)
