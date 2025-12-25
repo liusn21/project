@@ -32,8 +32,14 @@ class PacketSizeModel(nn.Module):
             tgt_mlm_temporal: [batch, seq_len] - temporal MLM targets
 
         Returns:
-            loss_info: Tuple of (loss_size, correct_size, denominator_size,
-                                  loss_temporal, correct_temporal, denominator_temporal)
+            loss_info: Tuple of:
+                - loss_size: Size MLM loss (CrossEntropy)
+                - correct_size: Number of correct size predictions
+                - denominator_size: Number of masked size positions
+                - loss_temporal: Temporal MLM loss (soft-label KL divergence)
+                - correct_temporal_exact: Number of exact temporal matches
+                - correct_temporal_range: Number of predictions within ±sigma range
+                - denominator_temporal: Number of masked temporal positions
         """
         # Generate embeddings (token + temporal + position)
         emb = self.embedding(src, iat_tokens)

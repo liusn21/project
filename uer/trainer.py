@@ -292,7 +292,13 @@ class RawPacketMlmTrainer(Trainer):
 
 
 class PacketSizeMlmTrainer(Trainer):
-    """Trainer for Packet Size modality with Temporal Information - Dual MLM (Size + Temporal)"""
+    """
+    Trainer for Packet Size modality with Temporal Information - Dual MLM (Size + Temporal)
+
+    Size MLM: Uses CrossEntropy loss (hard labels)
+    Temporal MLM: Uses soft-label KL divergence loss (Gaussian soft labels)
+                  Reports both exact and range (±sigma) accuracy
+    """
 
     def __init__(self, args):
         super(PacketSizeMlmTrainer, self).__init__(args)
@@ -300,9 +306,10 @@ class PacketSizeMlmTrainer(Trainer):
         self.total_loss_mlm_size = 0.0
         self.total_correct_mlm_size = 0.0
         self.total_denominator_size = 0.0
-        # Temporal MLM stats
+        # Temporal MLM stats (with both exact and range accuracy)
         self.total_loss_mlm_temporal = 0.0
-        self.total_correct_mlm_temporal = 0.0
+        self.total_correct_mlm_temporal_exact = 0.0
+        self.total_correct_mlm_temporal_range = 0.0
         self.total_denominator_temporal = 0.0
         # Loss weights
         self.lambda_mlm_size = getattr(args, 'lambda_mlm_size', 1.0)
@@ -313,7 +320,10 @@ class PacketSizeMlmTrainer(Trainer):
         if len(batch) == 4:
             # New format with temporal: (src_size, src_iat, tgt_mlm_size, tgt_mlm_temporal)
             src_size, src_iat, tgt_mlm_size, tgt_mlm_temporal = batch
-            loss_size, correct_size, denominator_size, loss_temporal, correct_temporal, denominator_temporal = model(
+
+            # Model returns 7 values now (with correct_temporal_range)
+            (loss_size, correct_size, denominator_size,
+             loss_temporal, correct_temporal_exact, correct_temporal_range, denominator_temporal) = model(
                 src_size, src_iat, tgt_mlm_size, tgt_mlm_temporal
             )
 
@@ -324,7 +334,8 @@ class PacketSizeMlmTrainer(Trainer):
             self.total_loss_mlm_size += loss_size.item()
             self.total_loss_mlm_temporal += loss_temporal.item()
             self.total_correct_mlm_size += correct_size.item()
-            self.total_correct_mlm_temporal += correct_temporal.item()
+            self.total_correct_mlm_temporal_exact += correct_temporal_exact.item()
+            self.total_correct_mlm_temporal_range += correct_temporal_range.item()
             self.total_denominator_size += denominator_size.item()
             self.total_denominator_temporal += denominator_temporal.item()
 
@@ -347,14 +358,16 @@ class PacketSizeMlmTrainer(Trainer):
         if self.dist_train:
             done_tokens *= self.world_size
 
-        # Report both Size and Temporal MLM stats
+        # Report Size and Temporal MLM stats
+        # Temporal reports both exact accuracy (for reference) and range accuracy (primary metric)
         print("| {:8d}/{:8d} steps"
               "| {:3.3f} s"
               "| {:8.2f} tokens/s"
-              "| loss_size: {:7.2f}"
-              "| acc_size: {:3.3f}"
-              "| loss_temp: {:7.2f}"
-              "| acc_temp: {:3.3f}".format(
+              "| loss_sz: {:5.2f}"
+              "| acc_sz: {:5.3f}"
+              "| loss_tp: {:5.2f}"
+              "| acc_tp_ex: {:5.3f}"
+              "| acc_tp_rg: {:5.3f}".format(
             self.current_step,
             self.total_steps,
             (time.time() - self.start_time),
@@ -362,13 +375,15 @@ class PacketSizeMlmTrainer(Trainer):
             self.total_loss_mlm_size / self.report_steps,
             self.total_correct_mlm_size / (self.total_denominator_size + 1e-6),
             self.total_loss_mlm_temporal / self.report_steps,
-            self.total_correct_mlm_temporal / (self.total_denominator_temporal + 1e-6)))
+            self.total_correct_mlm_temporal_exact / (self.total_denominator_temporal + 1e-6),
+            self.total_correct_mlm_temporal_range / (self.total_denominator_temporal + 1e-6)))
 
         self.total_loss = 0.0
         self.total_loss_mlm_size = 0.0
         self.total_loss_mlm_temporal = 0.0
         self.total_correct_mlm_size = 0.0
-        self.total_correct_mlm_temporal = 0.0
+        self.total_correct_mlm_temporal_exact = 0.0
+        self.total_correct_mlm_temporal_range = 0.0
         self.total_denominator_size = 0.0
         self.total_denominator_temporal = 0.0
 
