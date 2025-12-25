@@ -31,11 +31,13 @@ def train_and_validate(args):
         args.vocab_size = vocab_size.w2i
 
         # Create tokenizers for both modalities
+        print("Raw tokenizer")
+        args.vocab_path = args.vocab_path_raw
         args.tokenizer_raw = str2tokenizer[args.tokenizer](args)
-        args.tokenizer_raw.vocab = vocab_raw.w2i
 
+        print("Size tokenizer")
+        args.vocab_path = args.vocab_path_size
         args.tokenizer_size = str2tokenizer[args.tokenizer](args)
-        args.tokenizer_size.vocab = vocab_size.w2i
 
         # Set main vocab/tokenizer for compatibility
         args.vocab = vocab_raw.w2i
