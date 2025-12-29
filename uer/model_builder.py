@@ -20,12 +20,15 @@ def build_model(args):
 
     # For multimodal target, use MultiModalModel (ALBEF-style)
     if args.target == "multimodal":
+        # Get temporal vocab size
+        vocab_size_temporal = len(args.vocab_temporal) if hasattr(args, 'vocab_temporal') else len(args.vocab_size)
+
         # Build Raw Packet encoder
         embedding_raw = RawPacketEmbedding(args, len(args.vocab_raw))
         encoder_raw = str2encoder[args.encoder](args)
 
-        # Build Packet Size encoder
-        embedding_size = PacketSizeEmbedding(args, len(args.vocab_size))
+        # Build Packet Size encoder (with temporal embedding support)
+        embedding_size = PacketSizeEmbedding(args, len(args.vocab_size), vocab_size_temporal)
         encoder_size = str2encoder[args.encoder](args)
 
         # Build fusion module (6-layer bidirectional cross-attention)
@@ -34,12 +37,13 @@ def build_model(args):
         num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
         fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers)
 
-        # Build target module (ITC + ITM + MLM)
+        # Build target module (ITC + ITM + Masked Reconstruction)
         target = str2target[args.target](
             args,
             hidden_size=args.hidden_size,
             vocab_size_raw=len(args.vocab_raw),
-            vocab_size_size=len(args.vocab_size)
+            vocab_size_size=len(args.vocab_size),
+            vocab_size_temporal=vocab_size_temporal
         )
 
         # Get queue and momentum parameters
@@ -104,6 +108,7 @@ def build_model(args):
                 if enc_result.missing_keys:
                     print(f"    Missing encoder: {enc_result.missing_keys[:5]}...")
 
+        print(f"  Vocab sizes: Raw={len(args.vocab_raw)}, Size={len(args.vocab_size)}, Temporal={vocab_size_temporal}")
         print(f"  Fusion layers: {num_fusion_layers}")
         print(f"  Queue size: {queue_size}")
         print(f"  Momentum: {momentum}")

@@ -20,17 +20,32 @@ def train_and_validate(args):
     # Load vocabulary.
     print("Load vocabulary.")
     if args.target == "multimodal":
-        # Multi-modal requires two vocabularies
+        # Multi-modal requires three vocabularies: Raw, Size, Temporal
         print("Loading multi-modal vocabularies...")
+
+        # Raw vocabulary
         vocab_raw = Vocab()
         vocab_raw.load(args.vocab_path_raw)
         args.vocab_raw = vocab_raw.w2i
 
+        # Size vocabulary
         vocab_size = Vocab()
         vocab_size.load(args.vocab_path_size)
         args.vocab_size = vocab_size.w2i
 
-        # Create tokenizers for both modalities
+        # Temporal vocabulary (for IAT tokens)
+        if hasattr(args, 'vocab_path_temporal') and args.vocab_path_temporal:
+            import copy
+            vocab_temporal = Vocab()
+            vocab_temporal.load(args.vocab_path_temporal)
+            args.vocab_temporal = vocab_temporal.w2i
+            print(f"  Temporal vocab loaded from {args.vocab_path_temporal} (size: {len(args.vocab_temporal)})")
+        else:
+            # Fallback: use size vocab for temporal (not recommended)
+            args.vocab_temporal = args.vocab_size
+            print("  WARNING: No temporal vocab specified, using size vocab as fallback")
+
+        # Create tokenizers for all modalities
         print("Raw tokenizer")
         args.vocab_path = args.vocab_path_raw
         args.tokenizer_raw = str2tokenizer[args.tokenizer](args)
@@ -38,6 +53,13 @@ def train_and_validate(args):
         print("Size tokenizer")
         args.vocab_path = args.vocab_path_size
         args.tokenizer_size = str2tokenizer[args.tokenizer](args)
+
+        print("Temporal tokenizer")
+        if hasattr(args, 'vocab_path_temporal') and args.vocab_path_temporal:
+            args.vocab_path = args.vocab_path_temporal
+            args.tokenizer_temporal = str2tokenizer[args.tokenizer](args)
+        else:
+            args.tokenizer_temporal = args.tokenizer_size
 
         # Set main vocab/tokenizer for compatibility
         args.vocab = vocab_raw.w2i
@@ -68,10 +90,11 @@ def train_and_validate(args):
             args.tgt_vocab = tgt_vocab.w2i
         # Load temporal vocabulary for packet_size target (if provided)
         if args.target == "packet_size" and hasattr(args, 'vocab_path_temporal') and args.vocab_path_temporal:
-            import copy
-            args_temporal = copy.copy(args)
-            args_temporal.vocab_path = args.vocab_path_temporal
-            args.tokenizer_temporal = str2tokenizer[args.tokenizer](args_temporal)
+            # import copy
+            # args_temporal = copy.copy(args)
+            # args_temporal.vocab_path = args.vocab_path_temporal
+            args.vocab_path = args.vocab_path_temporal
+            args.tokenizer_temporal = BertTokenizer(args_temporal)
             args.vocab_temporal = args.tokenizer_temporal.vocab
             print(f"Loaded temporal vocab from {args.vocab_path_temporal} (size: {len(args.vocab_temporal)})")
         else:
@@ -390,14 +413,15 @@ class PacketSizeMlmTrainer(Trainer):
 
 class MultiModalTrainer(Trainer):
     """
-    Trainer for Multi-Modal Pretraining (Stage 2) - ALBEF-style
+    Trainer for Multi-Modal Pretraining (Stage 2) - ALBEF-style with Masked Reconstruction
 
-    Tasks: ITC + ITM + MLM_raw + MLM_size
+    Tasks: ITC + ITM + Masked Reconstruction (Size + Temporal)
 
     Features:
     - Momentum distillation with EMA update
     - Feature queues for contrastive learning
     - Hard negative mining for ITM
+    - Masked Reconstruction with soft-label KL for Temporal
     - Full parameter training with differential LR
     """
 
@@ -407,78 +431,74 @@ class MultiModalTrainer(Trainer):
         # Loss tracking
         self.total_loss_itc = 0.0
         self.total_loss_itm = 0.0
-        self.total_loss_mlm_raw = 0.0
-        self.total_loss_mlm_size = 0.0
+        self.total_loss_recon_size = 0.0
+        self.total_loss_recon_temporal = 0.0
 
         # Accuracy tracking
         self.total_acc_itm = 0.0
-        self.total_correct_mlm_raw = 0.0
-        self.total_denominator_mlm_raw = 0.0
-        self.total_correct_mlm_size = 0.0
-        self.total_denominator_mlm_size = 0.0
+        self.total_correct_recon_size = 0.0
+        self.total_denominator_recon_size = 0.0
+        self.total_correct_recon_temporal_exact = 0.0
+        self.total_correct_recon_temporal_range = 0.0
+        self.total_denominator_recon_temporal = 0.0
 
         # Loss weights
         self.lambda_itc = getattr(args, 'lambda_itc', 1.0)
         self.lambda_itm = getattr(args, 'lambda_itm', 1.0)
-        self.lambda_mlm = getattr(args, 'lambda_mlm', 1.0)
-        # Separate MLM weights for modality balance (if specified, override lambda_mlm)
-        self.lambda_mlm_raw = getattr(args, 'lambda_mlm_raw', None)
-        self.lambda_mlm_size = getattr(args, 'lambda_mlm_size', None)
+        self.lambda_recon_size = getattr(args, 'lambda_recon_size', 1.0)
+        self.lambda_recon_temporal = getattr(args, 'lambda_recon_temporal', 1.0)
 
         # Count batches for averaging
         self.batch_count = 0
 
     def forward_propagation(self, batch, model):
         """
-        Forward pass for ALBEF-style multimodal pretraining
+        Forward pass for ALBEF-style multimodal pretraining with Masked Reconstruction
 
-        Batch format: (raw_src, raw_packet_ids, raw_directions, size_src, tgt_mlm_raw, tgt_mlm_size)
+        NEW Batch format (7 tensors):
+            (raw_src, raw_packet_ids, raw_directions, size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal)
+
+        Note: Raw is NOT masked; Size and IAT are synchronously masked
         """
-        raw_src, raw_packet_ids, raw_directions, size_src, tgt_mlm_raw, tgt_mlm_size = batch
+        raw_src, raw_packet_ids, raw_directions, size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal = batch
 
         # Forward through model
         if hasattr(model, 'module'):
             loss_dict = model.module(
-                raw_src, raw_packet_ids, raw_directions, size_src,
-                tgt_mlm_raw, tgt_mlm_size
+                raw_src, raw_packet_ids, raw_directions,
+                size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal
             )
         else:
             loss_dict = model(
-                raw_src, raw_packet_ids, raw_directions, size_src,
-                tgt_mlm_raw, tgt_mlm_size
+                raw_src, raw_packet_ids, raw_directions,
+                size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal
             )
 
         # Extract losses
         itc_loss = loss_dict['itc_loss']
         itm_loss = loss_dict['itm_loss']
-        mlm_raw_loss = loss_dict['mlm_raw_loss']
-        mlm_size_loss = loss_dict['mlm_size_loss']
+        recon_size_loss = loss_dict['recon_size_loss']
+        recon_temporal_loss = loss_dict['recon_temporal_loss']
 
-        # Combined loss (support separate MLM weights for modality balance)
-        if self.lambda_mlm_raw is not None and self.lambda_mlm_size is not None:
-            # Use separate weights for raw and size MLM
-            loss = (self.lambda_itc * itc_loss +
-                    self.lambda_itm * itm_loss +
-                    self.lambda_mlm_raw * mlm_raw_loss +
-                    self.lambda_mlm_size * mlm_size_loss)
-        else:
-            # Use combined weight (backward compatible)
-            loss = (self.lambda_itc * itc_loss +
-                    self.lambda_itm * itm_loss +
-                    self.lambda_mlm * (mlm_raw_loss + mlm_size_loss))
+        # Combined loss
+        loss = (self.lambda_itc * itc_loss +
+                self.lambda_itm * itm_loss +
+                self.lambda_recon_size * recon_size_loss +
+                self.lambda_recon_temporal * recon_temporal_loss)
 
         # Update statistics
         self.total_loss += loss.item()
         self.total_loss_itc += itc_loss.item()
         self.total_loss_itm += itm_loss.item()
-        self.total_loss_mlm_raw += mlm_raw_loss.item()
-        self.total_loss_mlm_size += mlm_size_loss.item()
+        self.total_loss_recon_size += recon_size_loss.item()
+        self.total_loss_recon_temporal += recon_temporal_loss.item()
 
         self.total_acc_itm += loss_dict['itm_acc'].item()
-        self.total_correct_mlm_raw += loss_dict['mlm_raw_correct'].item()
-        self.total_denominator_mlm_raw += loss_dict['mlm_raw_denom'].item()
-        self.total_correct_mlm_size += loss_dict['mlm_size_correct'].item()
-        self.total_denominator_mlm_size += loss_dict['mlm_size_denom'].item()
+        self.total_correct_recon_size += loss_dict['recon_size_correct'].item()
+        self.total_denominator_recon_size += loss_dict['recon_size_denom'].item()
+        self.total_correct_recon_temporal_exact += loss_dict['recon_temporal_correct_exact'].item()
+        self.total_correct_recon_temporal_range += loss_dict['recon_temporal_correct_range'].item()
+        self.total_denominator_recon_temporal += loss_dict['recon_temporal_denom'].item()
 
         self.batch_count += 1
 
@@ -495,40 +515,43 @@ class MultiModalTrainer(Trainer):
         avg_loss = self.total_loss / n
         avg_loss_itc = self.total_loss_itc / n
         avg_loss_itm = self.total_loss_itm / n
-        avg_loss_mlm_raw = self.total_loss_mlm_raw / n
-        avg_loss_mlm_size = self.total_loss_mlm_size / n
+        avg_loss_recon_sz = self.total_loss_recon_size / n
+        avg_loss_recon_tp = self.total_loss_recon_temporal / n
 
         avg_acc_itm = self.total_acc_itm / n
-        acc_mlm_raw = self.total_correct_mlm_raw / self.total_denominator_mlm_raw if self.total_denominator_mlm_raw > 0 else 0.0
-        acc_mlm_size = self.total_correct_mlm_size / self.total_denominator_mlm_size if self.total_denominator_mlm_size > 0 else 0.0
+        acc_recon_sz = self.total_correct_recon_size / self.total_denominator_recon_size if self.total_denominator_recon_size > 0 else 0.0
+        acc_recon_tp_ex = self.total_correct_recon_temporal_exact / self.total_denominator_recon_temporal if self.total_denominator_recon_temporal > 0 else 0.0
+        acc_recon_tp_rg = self.total_correct_recon_temporal_range / self.total_denominator_recon_temporal if self.total_denominator_recon_temporal > 0 else 0.0
 
         print("| {:8d}/{:8d} steps"
-              " | {:3.3f} s"
-              " | loss {:7.3f}"
-              " | itc: {:5.3f}"
-              " | itm: {:5.3f}"
-              " | mlm_r: {:5.3f}"
-              " | mlm_s: {:5.3f}"
-              " | acc_itm: {:5.3f}"
-              " | acc_mlm_r: {:5.3f}"
-              " | acc_mlm_s: {:5.3f}".format(
+              " | {:3.1f}s"
+              " | loss {:5.2f}"
+              " | itc: {:4.2f}"
+              " | itm: {:4.2f}"
+              " | rc_sz: {:4.2f}"
+              " | rc_tp: {:4.2f}"
+              " | itm_acc: {:4.2f}"
+              " | sz_acc: {:4.2f}"
+              " | tp_ex_acc: {:4.2f}"
+              " | tp_rg_acc: {:4.2f}".format(
             self.current_step, self.total_steps,
             (time.time() - self.start_time),
-            avg_loss, avg_loss_itc, avg_loss_itm, avg_loss_mlm_raw, avg_loss_mlm_size,
-            avg_acc_itm, acc_mlm_raw, acc_mlm_size
+            avg_loss, avg_loss_itc, avg_loss_itm, avg_loss_recon_sz, avg_loss_recon_tp,
+            avg_acc_itm, acc_recon_sz, acc_recon_tp_ex, acc_recon_tp_rg
         ))
 
         # Reset statistics
         self.total_loss = 0.0
         self.total_loss_itc = 0.0
         self.total_loss_itm = 0.0
-        self.total_loss_mlm_raw = 0.0
-        self.total_loss_mlm_size = 0.0
+        self.total_loss_recon_size = 0.0
+        self.total_loss_recon_temporal = 0.0
         self.total_acc_itm = 0.0
-        self.total_correct_mlm_raw = 0.0
-        self.total_denominator_mlm_raw = 0.0
-        self.total_correct_mlm_size = 0.0
-        self.total_denominator_mlm_size = 0.0
+        self.total_correct_recon_size = 0.0
+        self.total_denominator_recon_size = 0.0
+        self.total_correct_recon_temporal_exact = 0.0
+        self.total_correct_recon_temporal_range = 0.0
+        self.total_denominator_recon_temporal = 0.0
         self.batch_count = 0
 
 

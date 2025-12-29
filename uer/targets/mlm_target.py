@@ -159,7 +159,8 @@ class DualMlmTarget(nn.Module):
 
         # Temporal soft-label sigma: controls tolerance range (±3σ ≈ 99.7% mass)
         # sigma=10 means predictions within ±30 tokens are considered "close"
-        self.temporal_sigma = 10
+        # Now configurable via args.temporal_sigma (default=10 for backward compatibility)
+        self.temporal_sigma = getattr(args, 'temporal_sigma', 10)
 
         # ===== Size MLM Head =====
         if self.factorized_embedding_parameterization:

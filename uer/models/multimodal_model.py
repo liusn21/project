@@ -18,8 +18,37 @@ Features:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 import copy
 from uer.utils.constants import PAD_ID
+
+
+@torch.no_grad()
+def concat_all_gather(tensor):
+    """
+    Gather tensors from all GPUs and concatenate them.
+    Used for distributed training to synchronize feature queues.
+
+    Args:
+        tensor: [batch, ...] - tensor to gather from all GPUs
+
+    Returns:
+        gathered: [batch * world_size, ...] - concatenated tensor from all GPUs
+    """
+    if not dist.is_initialized():
+        return tensor
+
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return tensor
+
+    # Create placeholder tensors for gathering
+    tensors_gather = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(tensors_gather, tensor)
+
+    # Concatenate along batch dimension
+    output = torch.cat(tensors_gather, dim=0)
+    return output
 
 
 class MultiModalModel(nn.Module):
@@ -121,12 +150,20 @@ class MultiModalModel(nn.Module):
     @torch.no_grad()
     def _dequeue_and_enqueue(self, raw_feat, size_feat):
         """
-        Update feature queues with new features
+        Update feature queues with new features.
+
+        In distributed training, gathers features from all GPUs before enqueuing
+        to ensure all processes have consistent queues (ALBEF-style).
 
         Args:
             raw_feat: [batch, hidden] - Raw CLS features (normalized)
             size_feat: [batch, hidden] - Size CLS features (normalized)
         """
+        # Gather features from all GPUs in distributed training
+        # This ensures all processes have the same queue contents
+        raw_feat = concat_all_gather(raw_feat)
+        size_feat = concat_all_gather(size_feat)
+
         batch_size = raw_feat.size(0)
 
         ptr = int(self.queue_ptr)
@@ -147,30 +184,36 @@ class MultiModalModel(nn.Module):
 
         self.queue_ptr[0] = ptr
 
-    def forward(self, raw_src, raw_packet_ids, raw_directions, size_src,
-                tgt_mlm_raw, tgt_mlm_size):
+    def forward(self, raw_src, raw_packet_ids, raw_directions,
+                size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal):
         """
-        Forward pass for training
+        Forward pass for training with Masked Reconstruction
+
+        NEW Design:
+            - Raw: NOT masked, provides context for reconstruction
+            - Size + IAT: Synchronously masked, reconstructed using fused features
 
         Args:
-            raw_src: [batch, seq_len_raw] - Raw Packet token IDs (masked)
+            raw_src: [batch, seq_len_raw] - Raw Packet token IDs (NOT masked)
             raw_packet_ids: [batch, seq_len_raw] - Packet indices
             raw_directions: [batch, seq_len_raw] - Direction indices
             size_src: [batch, seq_len_size] - Size token IDs (masked)
-            tgt_mlm_raw: [batch, seq_len_raw] - MLM targets for Raw
-            tgt_mlm_size: [batch, seq_len_size] - MLM targets for Size
+            iat_src: [batch, seq_len_size] - IAT token IDs (masked at same positions)
+            tgt_mlm_size: [batch, seq_len_size] - Size reconstruction targets
+            tgt_mlm_temporal: [batch, seq_len_size] - Temporal reconstruction targets
 
         Returns:
             loss_dict: Dictionary containing all losses and metrics
         """
         batch_size = raw_src.size(0)
 
-        # ===== Step 1: Encode with Main Encoders =====
+        # ===== Step 1: Encode Raw with Main Encoder (NOT masked) =====
         raw_emb = self.embedding_raw(raw_src, raw_packet_ids, raw_directions)
         raw_seg = (raw_src != PAD_ID).long()
         raw_output = self.encoder_raw(raw_emb, raw_seg)  # [batch, seq_len_raw, hidden]
 
-        size_emb = self.embedding_size(size_src)
+        # ===== Step 2: Encode Size+IAT with Main Encoder (masked) =====
+        size_emb = self.embedding_size(size_src, iat_src)  # Now takes both size and IAT
         size_seg = (size_src != PAD_ID).long()
         size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len_size, hidden]
 
@@ -178,25 +221,25 @@ class MultiModalModel(nn.Module):
         raw_cls = raw_output[:, 0, :]  # [batch, hidden]
         size_cls = size_output[:, 0, :]  # [batch, hidden]
 
-        # ===== Step 2: Encode with Momentum Encoders (no gradient) =====
+        # ===== Step 3: Encode with Momentum Encoders (no gradient) =====
         with torch.no_grad():
             self._momentum_update()
 
             raw_emb_m = self.embedding_raw_m(raw_src, raw_packet_ids, raw_directions)
             raw_output_m = self.encoder_raw_m(raw_emb_m, raw_seg)
 
-            size_emb_m = self.embedding_size_m(size_src)
+            size_emb_m = self.embedding_size_m(size_src, iat_src)  # Now takes both size and IAT
             size_output_m = self.encoder_size_m(size_emb_m, size_seg)
 
             # Extract CLS tokens and project
             raw_cls_m = raw_output_m[:, 0, :]  # [batch, hidden]
             size_cls_m = size_output_m[:, 0, :]  # [batch, hidden]
 
-            # Project momentum features (using momentum projection layers, not online)
+            # Project momentum features (using momentum projection layers)
             raw_cls_m_proj = F.normalize(self.itc_proj_raw_m(raw_cls_m), dim=-1)
             size_cls_m_proj = F.normalize(self.itc_proj_size_m(size_cls_m), dim=-1)
 
-        # ===== Step 3: ITC Loss =====
+        # ===== Step 4: ITC Loss =====
         itc_loss, sim_r2s, sim_s2r = self.target.forward_itc(
             raw_cls, size_cls,
             raw_cls_m_proj, size_cls_m_proj,
@@ -204,11 +247,11 @@ class MultiModalModel(nn.Module):
             temperature=self.itc_temp
         )
 
-        # ===== Step 4: Update Queues =====
+        # ===== Step 5: Update Queues =====
         with torch.no_grad():
             self._dequeue_and_enqueue(raw_cls_m_proj, size_cls_m_proj)
 
-        # ===== Step 5: Fusion for Positive Samples =====
+        # ===== Step 6: Fusion for Positive Samples =====
         # Positive pairs: (raw_i, size_i)
         raw_fused, size_fused = self.fusion(raw_output, size_output, raw_seg, size_seg)
 
@@ -216,19 +259,17 @@ class MultiModalModel(nn.Module):
         pos_raw_cls = raw_fused[:, 0, :]  # [batch, hidden]
         pos_size_cls = size_fused[:, 0, :]  # [batch, hidden]
 
-        # ===== Step 6: Hard Negative Sampling for ITM =====
+        # ===== Step 7: Hard Negative Sampling for ITM =====
         # Sample hard negative indices based on ITC similarity
         neg_size_idx, neg_raw_idx = self.target.sample_hard_negatives(
             sim_r2s, sim_s2r, batch_size, temperature=self.itm_temp
         )
 
-        # ===== Step 7: Fusion for Negative Samples =====
+        # ===== Step 8: Fusion for Negative Samples =====
         # Negative type 1: (raw_i, size_neg) - each raw_i paired with its hard negative size
-        # Gather negative size encoder outputs and segments
         neg_size_output_1 = size_output[neg_size_idx]  # [batch, seq_len_size, hidden]
         neg_size_seg_1 = size_seg[neg_size_idx]  # [batch, seq_len_size]
 
-        # Run fusion for negative type 1
         neg1_raw_fused, neg1_size_fused = self.fusion(
             raw_output, neg_size_output_1, raw_seg, neg_size_seg_1
         )
@@ -236,31 +277,26 @@ class MultiModalModel(nn.Module):
         neg1_size_cls = neg1_size_fused[:, 0, :]  # [batch, hidden]
 
         # Negative type 2: (raw_neg, size_i) - each size_i paired with its hard negative raw
-        # Gather negative raw encoder outputs and segments
         neg_raw_output_2 = raw_output[neg_raw_idx]  # [batch, seq_len_raw, hidden]
         neg_raw_seg_2 = raw_seg[neg_raw_idx]  # [batch, seq_len_raw]
 
-        # Run fusion for negative type 2
         neg2_raw_fused, neg2_size_fused = self.fusion(
             neg_raw_output_2, size_output, neg_raw_seg_2, size_seg
         )
         neg2_raw_cls = neg2_raw_fused[:, 0, :]  # [batch, hidden]
         neg2_size_cls = neg2_size_fused[:, 0, :]  # [batch, hidden]
 
-        # ===== Step 8: ITM Loss =====
-        # Pass all fused CLS tokens (positive + 2 types of negatives)
+        # ===== Step 9: ITM Loss =====
         itm_loss, itm_acc = self.target.forward_itm(
             pos_raw_cls, pos_size_cls,      # Positive: (raw_i, size_i)
             neg1_raw_cls, neg1_size_cls,    # Negative 1: (raw_i, size_neg)
             neg2_raw_cls, neg2_size_cls     # Negative 2: (raw_neg, size_i)
         )
 
-        # ===== Step 9: MLM Losses =====
-        mlm_raw_loss, mlm_raw_correct, mlm_raw_denom = self.target.forward_mlm_raw(
-            raw_fused, tgt_mlm_raw
-        )
-        mlm_size_loss, mlm_size_correct, mlm_size_denom = self.target.forward_mlm_size(
-            size_fused, tgt_mlm_size
+        # ===== Step 10: Masked Reconstruction Loss (Size + Temporal) =====
+        # Use fused size features to reconstruct masked Size and IAT tokens
+        recon_results = self.target.forward_masked_reconstruction(
+            size_fused, tgt_mlm_size, tgt_mlm_temporal
         )
 
         # ===== Return all losses and metrics =====
@@ -268,26 +304,40 @@ class MultiModalModel(nn.Module):
             'itc_loss': itc_loss,
             'itm_loss': itm_loss,
             'itm_acc': itm_acc,
-            'mlm_raw_loss': mlm_raw_loss,
-            'mlm_raw_correct': mlm_raw_correct,
-            'mlm_raw_denom': mlm_raw_denom,
-            'mlm_size_loss': mlm_size_loss,
-            'mlm_size_correct': mlm_size_correct,
-            'mlm_size_denom': mlm_size_denom,
+            # Masked Reconstruction results
+            'recon_size_loss': recon_results['size_loss'],
+            'recon_size_correct': recon_results['size_correct'],
+            'recon_size_denom': recon_results['size_denom'],
+            'recon_temporal_loss': recon_results['temporal_loss'],
+            'recon_temporal_correct_exact': recon_results['temporal_correct_exact'],
+            'recon_temporal_correct_range': recon_results['temporal_correct_range'],
+            'recon_temporal_denom': recon_results['temporal_denom'],
         }
 
-    def forward_inference(self, raw_src, raw_packet_ids, raw_directions, size_src):
+    def forward_inference(self, raw_src, raw_packet_ids, raw_directions, size_src, iat_src):
         """
         Forward pass for inference (no training objectives)
 
         Returns fused features for downstream tasks.
+
+        Args:
+            raw_src: [batch, seq_len_raw] - Raw Packet token IDs
+            raw_packet_ids: [batch, seq_len_raw] - Packet indices
+            raw_directions: [batch, seq_len_raw] - Direction indices
+            size_src: [batch, seq_len_size] - Size token IDs
+            iat_src: [batch, seq_len_size] - IAT token IDs
+
+        Returns:
+            raw_fused: [batch, seq_len_raw, hidden] - Fused Raw features
+            size_fused: [batch, seq_len_size, hidden] - Fused Size features
         """
-        # Encode
+        # Encode Raw
         raw_emb = self.embedding_raw(raw_src, raw_packet_ids, raw_directions)
         raw_seg = (raw_src != PAD_ID).long()
         raw_output = self.encoder_raw(raw_emb, raw_seg)
 
-        size_emb = self.embedding_size(size_src)
+        # Encode Size + IAT
+        size_emb = self.embedding_size(size_src, iat_src)
         size_seg = (size_src != PAD_ID).long()
         size_output = self.encoder_size(size_emb, size_seg)
 

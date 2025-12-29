@@ -138,6 +138,12 @@ def main():
     parser.add_argument("--itm_temperature", type=float, default=0.07,
                         help="Temperature for ITM hard negative sampling.")
 
+    # Temporal soft-label parameters
+    parser.add_argument("--temporal_sigma", type=float, default=10,
+                        help="Standard deviation for temporal soft-label KL loss. "
+                             "Controls tolerance range: ±3σ covers ~99.7% probability mass. "
+                             "Default=10 means predictions within ±30 tokens are considered 'close'.")
+
     # Learning rate
     parser.add_argument("--encoder_lr_ratio", type=float, default=0.1,
                         help="Learning rate ratio for encoders. "

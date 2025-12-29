@@ -23,7 +23,7 @@ def mask_seq(src, tokenizer, whole_word_masking, span_masking, span_geo_prob, sp
         src = src_no_pad
 
     random.shuffle(tokens_index)
-    num_to_predict = max(1, int(round(len(src_no_pad) * 0.15))) 
+    num_to_predict = max(1, int(round(len(src_no_pad) * 0.3))) 
     tgt_mlm = []
     for index_set in tokens_index:
         if len(tgt_mlm) >= num_to_predict:
@@ -1186,18 +1186,25 @@ class PacketSizeDataLoader(DataLoader):
 
 class MultiModalDataset(Dataset):
     """
-    Dataset for Multi-Modal Pretraining (Stage 2)
+    Dataset for Multi-Modal Pretraining (Stage 2) with Temporal Information
 
-    Loads paired Raw Packet + Packet Size data for CMM and CMMP tasks
+    Loads paired Raw Packet + Packet Size + IAT data for ITC, ITM, and Masked Reconstruction tasks
 
     Requires:
         - corpus_path_raw: Path to raw packet corpus
-        - corpus_path_size: Path to packet size corpus
+        - corpus_path_size: Path to packet size corpus (with IAT tokens)
 
     Both corpora must have the same flows in the same order.
+
+    Size corpus format:
+        ||
+        6 (or 17)
+        1672 2185 953 ...      <- Size tokens
+        567 123 456 ...        <- IAT temporal tokens
     """
 
-    def __init__(self, args, vocab_raw, vocab_size, tokenizer_raw, tokenizer_size):
+    def __init__(self, args, vocab_raw, vocab_size, tokenizer_raw, tokenizer_size,
+                 vocab_temporal=None, tokenizer_temporal=None):
         # Initialize base class with raw vocab/tokenizer (for compatibility)
         super(MultiModalDataset, self).__init__(args, vocab_raw, tokenizer_raw)
 
@@ -1206,6 +1213,10 @@ class MultiModalDataset(Dataset):
         self.vocab_size = vocab_size
         self.tokenizer_raw = tokenizer_raw
         self.tokenizer_size = tokenizer_size
+
+        # Temporal vocabulary and tokenizer (for IAT tokens)
+        self.vocab_temporal = vocab_temporal if vocab_temporal is not None else vocab_size
+        self.tokenizer_temporal = tokenizer_temporal if tokenizer_temporal is not None else tokenizer_size
 
         # Corpus paths
         self.corpus_path_raw = args.corpus_path_raw
@@ -1288,6 +1299,7 @@ class MultiModalDataset(Dataset):
         raw_directions_buffer = []
 
         size_flow_buffer = []
+        iat_flow_buffer = []  # NEW: IAT temporal tokens buffer
         size_proto_buffer = []
 
         dataset_writer = open("/tmp/" + str(proc_id) + ".pt", "wb")
@@ -1299,7 +1311,7 @@ class MultiModalDataset(Dataset):
             # Skip to start_flow in both files
             if start_flow > 0:
                 self._skip_flows(f_raw, start_flow)
-                self._skip_flows(f_size, start_flow)
+                self._skip_flows_size(f_size, start_flow)  # Use new skip function for size corpus
 
             # Process flows from start_flow to end_flow
             flows_processed = 0
@@ -1310,8 +1322,8 @@ class MultiModalDataset(Dataset):
                     print(f"Worker {proc_id}: Reached end of raw corpus at flow {flow_idx}")
                     break
 
-                # Parse one flow from Size corpus
-                size_tokens, size_proto = self._parse_size_flow(f_size)
+                # Parse one flow from Size corpus (now returns size_tokens, iat_tokens, protocol)
+                size_tokens, iat_tokens, size_proto = self._parse_size_flow(f_size)
                 if size_tokens is None:
                     print(f"Worker {proc_id}: Reached end of size corpus at flow {flow_idx}")
                     break
@@ -1320,12 +1332,18 @@ class MultiModalDataset(Dataset):
                 if raw_proto != size_proto:
                     print(f"Worker {proc_id} WARNING: Protocol mismatch at flow {flow_idx}: raw={raw_proto}, size={size_proto}")
 
+                # Skip flows with empty IAT tokens
+                if len(iat_tokens) == 0:
+                    print(f"Worker {proc_id} WARNING: Empty IAT tokens at flow {flow_idx}, skipping")
+                    continue
+
                 # Add to buffers
                 raw_flow_buffer.append(raw_packets)
                 raw_proto_buffer.append(raw_proto)
                 raw_directions_buffer.append(raw_directions)
 
                 size_flow_buffer.append(size_tokens)
+                iat_flow_buffer.append(iat_tokens)  # NEW: Add IAT tokens
                 size_proto_buffer.append(size_proto)
 
                 flows_processed += 1
@@ -1334,7 +1352,7 @@ class MultiModalDataset(Dataset):
                 if len(raw_flow_buffer) >= self.docs_buffer_size:
                     instances = self.build_instances(
                         raw_flow_buffer, raw_proto_buffer, raw_directions_buffer,
-                        size_flow_buffer, size_proto_buffer
+                        size_flow_buffer, iat_flow_buffer, size_proto_buffer
                     )
                     for instance in instances:
                         pickle.dump(instance, dataset_writer)
@@ -1344,13 +1362,14 @@ class MultiModalDataset(Dataset):
                     raw_proto_buffer = []
                     raw_directions_buffer = []
                     size_flow_buffer = []
+                    iat_flow_buffer = []
                     size_proto_buffer = []
 
             # Process remaining buffer
             if len(raw_flow_buffer) > 0:
                 instances = self.build_instances(
                     raw_flow_buffer, raw_proto_buffer, raw_directions_buffer,
-                    size_flow_buffer, size_proto_buffer
+                    size_flow_buffer, iat_flow_buffer, size_proto_buffer
                 )
                 for instance in instances:
                     pickle.dump(instance, dataset_writer)
@@ -1359,7 +1378,27 @@ class MultiModalDataset(Dataset):
         print(f"Worker {proc_id} finished processing {flows_processed} flows.")
 
     def _skip_flows(self, file_handle, num_flows):
-        """Skip num_flows in the corpus file"""
+        """Skip num_flows in the Raw corpus file"""
+        flows_skipped = 0
+        while flows_skipped < num_flows:
+            line = file_handle.readline()
+            if not line:  # EOF
+                break
+            if line.strip() == '||':
+                flows_skipped += 1
+
+    def _skip_flows_size(self, file_handle, num_flows):
+        """
+        Skip num_flows in the Size corpus file
+
+        Size corpus format per flow:
+            ||
+            protocol
+            size_tokens
+            iat_tokens
+
+        So we need to count '||' separators.
+        """
         flows_skipped = 0
         while flows_skipped < num_flows:
             line = file_handle.readline()
@@ -1456,15 +1495,16 @@ class MultiModalDataset(Dataset):
         Format:
             ||
             6 (or 17)
-            1672 2185 953 ...
+            1672 2185 953 ...      <- Size tokens
+            567 123 456 ...        <- IAT temporal tokens
 
         Returns:
-            (tokens, protocol) or (None, None) if EOF
+            (size_tokens, iat_tokens, protocol) or (None, None, None) if EOF
         """
         # Read flow separator
         line = f.readline()
         if not line:  # EOF
-            return None, None
+            return None, None, None
 
         line = line.strip()
         if line != "||":
@@ -1472,13 +1512,13 @@ class MultiModalDataset(Dataset):
             while line and line != "||":
                 line = f.readline().strip()
             if not line:
-                return None, None
+                return None, None, None
 
         # Read protocol
         proto_line = f.readline()
         if not proto_line:
             print("Warning: Unexpected EOF when reading protocol")
-            return None, None
+            return None, None, None
 
         try:
             proto_num = int(proto_line.strip())
@@ -1486,34 +1526,50 @@ class MultiModalDataset(Dataset):
         except:
             protocol = 0  # Default TCP
 
-        # Read size tokens (single line)
-        tokens_line = f.readline()
-        if not tokens_line:
+        # Read size tokens (first line after protocol)
+        size_line = f.readline()
+        if not size_line:
             print("Warning: Unexpected EOF when reading size tokens")
-            return [], protocol
+            return [], [], protocol
 
-        tokens_line = tokens_line.strip()
-        if not tokens_line:
+        size_line = size_line.strip()
+        if not size_line:
             print("Warning: Empty size tokens line")
-            return [], protocol
+            return [], [], protocol
 
         # Tokenize size tokens
-        tokens = self.tokenizer_size.convert_tokens_to_ids(
-            self.tokenizer_size.tokenize(tokens_line)
+        size_tokens = self.tokenizer_size.convert_tokens_to_ids(
+            self.tokenizer_size.tokenize(size_line)
         )
 
-        return tokens, protocol
+        # Read IAT temporal tokens (second line after protocol)
+        iat_line = f.readline()
+        if not iat_line:
+            print("Warning: Unexpected EOF when reading IAT tokens")
+            return size_tokens, [], protocol
+
+        iat_line = iat_line.strip()
+        if not iat_line:
+            print("Warning: Empty IAT tokens line")
+            return size_tokens, [], protocol
+
+        # Tokenize IAT tokens
+        iat_tokens = self.tokenizer_temporal.convert_tokens_to_ids(
+            self.tokenizer_temporal.tokenize(iat_line)
+        )
+
+        return size_tokens, iat_tokens, protocol
 
     def build_instances(self, raw_flows, raw_protos, raw_directions_list,
-                       size_flows, size_protos):
-        """Build paired instances from both modalities"""
+                       size_flows, iat_flows, size_protos):
+        """Build paired instances from both modalities with IAT temporal tokens"""
         instances = []
 
         for _ in range(self.dup_factor):
             for flow_idx in range(len(raw_flows)):
                 instance = self.create_ins_from_paired_flow(
                     raw_flows[flow_idx], raw_protos[flow_idx], raw_directions_list[flow_idx],
-                    size_flows[flow_idx], size_protos[flow_idx]
+                    size_flows[flow_idx], iat_flows[flow_idx], size_protos[flow_idx]
                 )
                 if instance is not None:
                     instances.append(instance)
@@ -1521,20 +1577,26 @@ class MultiModalDataset(Dataset):
         return instances
 
     def create_ins_from_paired_flow(self, raw_packets, raw_proto, raw_directions,
-                                     size_tokens, size_proto):
+                                     size_tokens, iat_tokens, size_proto):
         """
-        Create one instance from paired Raw + Size flow
+        Create one instance from paired Raw + Size + IAT flow
+
+        NEW Design for Masked Reconstruction:
+            - Raw: NOT masked (provides context for reconstruction)
+            - Size + IAT: Synchronously masked at same positions
 
         Returns:
-            Static masking: (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_cmmp_raw, tgt_cmmp_size)
-            Dynamic masking: (raw_src, raw_packet_ids, raw_directions_seq, size_src)
+            Static masking: (raw_src, raw_packet_ids, raw_directions_seq,
+                            size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal)
+            Dynamic masking: (raw_src, raw_packet_ids, raw_directions_seq,
+                            size_src, iat_src)
 
-        Note: Both Raw and Size modalities are masked for CMMP tasks
+        Note: Only Size and IAT are masked for Masked Reconstruction task
         """
         max_raw_tokens = self.seq_length_raw - 2  # Reserve for [CLS] and [SEP]
         max_size_tokens = self.seq_length_size - 2  # Reserve for [CLS] and [SEP]
 
-        # ===== Process Raw Packet =====
+        # ===== Process Raw Packet (NOT masked) =====
         raw_tokens = []
         raw_pkt_indices = []
         raw_dir_values = []
@@ -1555,7 +1617,7 @@ class MultiModalDataset(Dataset):
             raw_pkt_indices = raw_pkt_indices[:max_raw_tokens]
             raw_dir_values = raw_dir_values[:max_raw_tokens]
 
-        # Build Raw sequence
+        # Build Raw sequence (NO masking applied)
         raw_src = [self.vocab_raw.get(CLS_TOKEN)] + raw_tokens + [self.vocab_raw.get(SEP_TOKEN)]
 
         raw_packet_ids = [8] + raw_pkt_indices + [8]
@@ -1571,69 +1633,110 @@ class MultiModalDataset(Dataset):
             raw_packet_ids.append(8)
             raw_directions_seq.append(1)
 
-        # ===== Process Packet Size =====
+        # ===== Process Packet Size + IAT (Synchronized Masking) =====
+        # Ensure Size and IAT have same length
+        min_len = min(len(size_tokens), len(iat_tokens))
+        size_tokens = size_tokens[:min_len]
+        iat_tokens = iat_tokens[:min_len]
+
         # Truncate
         if len(size_tokens) > max_size_tokens:
             size_tokens = size_tokens[:max_size_tokens]
+            iat_tokens = iat_tokens[:max_size_tokens]
 
         # Build Size sequence
-        size_src = [self.vocab_size.get(CLS_TOKEN)] + size_tokens + [self.vocab_size.get(SEP_TOKEN)]
+        size_src = [self.vocab_size.get(CLS_TOKEN)] + list(size_tokens) + [self.vocab_size.get(SEP_TOKEN)]
+
+        # Build IAT sequence (using temporal vocab)
+        iat_src = [self.vocab_temporal.get(CLS_TOKEN)] + list(iat_tokens) + [self.vocab_temporal.get(SEP_TOKEN)]
 
         # Padding to seq_length_size
         while len(size_src) < self.seq_length_size:
             size_src.append(PAD_ID)
+            iat_src.append(PAD_ID)
 
-        # ===== Apply Masking to Both Modalities =====
+        # ===== Apply Synchronized Masking to Size and IAT =====
         if not self.dynamic_masking:
-            # Static masking: apply mask_seq() here in Dataset
-            
-            # Mask Raw (for CMMP_raw task)
-            raw_src, tgt_mlm_raw = mask_seq(
-                raw_src, self.tokenizer_raw, self.whole_word_masking,
+            # Static masking: apply synchronized mask here in Dataset
+
+            # First, mask Size tokens
+            size_src_masked, tgt_mlm_size = mask_seq(
+                list(size_src), self.tokenizer_size, self.whole_word_masking,
                 self.span_masking, self.span_geo_prob, self.span_max_length
             )
 
-            # Mask Size (for CMMP_size task)
-            size_src, tgt_mlm_size = mask_seq(
-                size_src, self.tokenizer_size, self.whole_word_masking,
-                self.span_masking, self.span_geo_prob, self.span_max_length
-            )
+            # Extract mask positions from Size masking
+            mask_positions = [pos for pos, _ in tgt_mlm_size]
 
-            # Return 6 elements (with both tgt_mlm_raw and tgt_mlm_size)
-            return (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_raw, tgt_mlm_size)
+            # Apply same mask positions to IAT with standard BERT masking strategy
+            iat_src_masked = list(iat_src)
+            tgt_mlm_temporal = []
+            for pos in mask_positions:
+                original_token = iat_src[pos]
+                tgt_mlm_temporal.append((pos, original_token))
+
+                # Standard BERT masking: 80% [MASK], 10% random, 10% unchanged
+                prob = random.random()
+                if prob < 0.8:
+                    # 80%: Replace with [MASK]
+                    iat_src_masked[pos] = self.vocab_temporal.get(MASK_TOKEN)
+                elif prob < 0.9:
+                    # 10%: Replace with random token
+                    while True:
+                        rdi = random.randint(1, len(self.vocab_temporal) - 1)
+                        if rdi not in [self.vocab_temporal.get(CLS_TOKEN),
+                                      self.vocab_temporal.get(SEP_TOKEN),
+                                      self.vocab_temporal.get(MASK_TOKEN),
+                                      PAD_ID]:
+                            break
+                    iat_src_masked[pos] = rdi
+                # else: 10%: Keep original token (iat_src_masked already has it)
+
+            # Return 7 elements (Raw unmasked, Size+IAT masked)
+            return (raw_src, raw_packet_ids, raw_directions_seq,
+                    size_src_masked, iat_src_masked, tgt_mlm_size, tgt_mlm_temporal)
         else:
             # Dynamic masking: defer masking to DataLoader
-            # Return 4 elements (without tgt_mlm)
-            return (raw_src, raw_packet_ids, raw_directions_seq, size_src)
+            # Return 5 elements (without tgt_mlm)
+            return (raw_src, raw_packet_ids, raw_directions_seq, size_src, iat_src)
 
 
 class MultiModalDataLoader(DataLoader):
     """
-    DataLoader for Multi-Modal Pretraining (Stage 2)
+    DataLoader for Multi-Modal Pretraining (Stage 2) with Temporal Information
+
+    NEW Design for Masked Reconstruction:
+        - Raw: NOT masked (provides context for reconstruction via fusion)
+        - Size + IAT: Synchronously masked at same positions
 
     Returns positive (matching) samples only.
-    CMM negative sampling and hard negative mining are done in Trainer.
+    ITC/ITM negative sampling and hard negative mining are done in Model/Trainer.
 
     Supports both static and dynamic masking (controlled by args.dynamic_masking).
 
     Returns:
-        raw_src: [batch, 512] - Raw Packet tokens (masked for CMMP_raw)
-        raw_packet_ids: [batch, 512] - Packet indices
-        raw_directions: [batch, 512] - Direction indices
-        size_src: [batch, 256] - Size tokens (masked for CMMP_size)
-        tgt_cmmp_raw: [batch, 512] - CMMP_raw targets (0 for unmasked, token_id for masked)
-        tgt_cmmp_size: [batch, 256] - CMMP_size targets (0 for unmasked, token_id for masked)
+        raw_src: [batch, seq_len_raw] - Raw Packet tokens (NOT masked)
+        raw_packet_ids: [batch, seq_len_raw] - Packet indices
+        raw_directions: [batch, seq_len_raw] - Direction indices
+        size_src: [batch, seq_len_size] - Size tokens (masked for reconstruction)
+        iat_src: [batch, seq_len_size] - IAT tokens (masked at same positions as Size)
+        tgt_mlm_size: [batch, seq_len_size] - Size MLM targets (0=unmasked, token_id=masked)
+        tgt_mlm_temporal: [batch, seq_len_size] - Temporal MLM targets (0=unmasked, token_id=masked)
     """
 
     def __init__(self, args, dataset_path, batch_size, proc_id, proc_num, shuffle=False):
         super(MultiModalDataLoader, self).__init__(
             args, dataset_path, batch_size, proc_id, proc_num, shuffle
         )
-        # Store both vocabs and tokenizers for masking
+        # Store vocabs and tokenizers for masking
         self.vocab_raw = args.vocab_raw
         self.vocab_size = args.vocab_size
         self.tokenizer_raw = args.tokenizer_raw
         self.tokenizer_size = args.tokenizer_size
+
+        # Temporal vocab and tokenizer
+        self.vocab_temporal = getattr(args, 'vocab_temporal', args.vocab_size)
+        self.tokenizer_temporal = getattr(args, 'tokenizer_temporal', args.tokenizer_size)
 
     def __iter__(self):
         while True:
@@ -1652,58 +1755,58 @@ class MultiModalDataLoader(DataLoader):
             raw_packet_ids_batch = []
             raw_directions_batch = []
             size_src_batch = []
-            tgt_cmmp_raw_batch = []
-            tgt_cmmp_size_batch = []
+            iat_src_batch = []
+            tgt_mlm_size_batch = []
+            tgt_mlm_temporal_batch = []
 
             masked_words_num = 0
 
             for ins in instances:
                 # Instance format depends on masking mode:
-                # Static masking (len=6): (raw_src, raw_packet_ids, raw_directions_seq, size_src, tgt_mlm_raw, tgt_mlm_size)
-                # Dynamic masking (len=4): (raw_src, raw_packet_ids, raw_directions_seq, size_src)
+                # Static masking (len=7): (raw_src, raw_packet_ids, raw_directions_seq,
+                #                          size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal)
+                # Dynamic masking (len=5): (raw_src, raw_packet_ids, raw_directions_seq,
+                #                          size_src, iat_src)
 
-                if len(ins) == 6:
-                    # Static masking: Dataset already applied masking
+                if len(ins) == 7:
+                    # Static masking: Dataset already applied synchronized masking
                     raw_src = ins[0]
-                    tgt_mlm_raw = ins[4]  # List of (position, token) tuples
+                    raw_packet_ids = ins[1]
+                    raw_directions = ins[2]
                     size_src = ins[3]
+                    iat_src = ins[4]
                     tgt_mlm_size = ins[5]  # List of (position, token) tuples
+                    tgt_mlm_temporal = ins[6]  # List of (position, token) tuples
 
-                    masked_words_num += len(tgt_mlm_raw) + len(tgt_mlm_size)
-
-                    # Convert tgt_mlm format for raw: [(pos, token), ...] -> [0, 0, token, 0, ...]
-                    tgt_cmmp_raw = [0] * len(raw_src)
-                    for pos, token in tgt_mlm_raw:
-                        tgt_cmmp_raw[pos] = token
+                    masked_words_num += len(tgt_mlm_size)
 
                     # Convert tgt_mlm format for size: [(pos, token), ...] -> [0, 0, token, 0, ...]
-                    tgt_cmmp_size = [0] * len(size_src)
+                    tgt_size_dense = [0] * len(size_src)
                     for pos, token in tgt_mlm_size:
-                        tgt_cmmp_size[pos] = token
+                        tgt_size_dense[pos] = token
+
+                    # Convert tgt_mlm format for temporal
+                    tgt_temporal_dense = [0] * len(iat_src)
+                    for pos, token in tgt_mlm_temporal:
+                        tgt_temporal_dense[pos] = token
 
                     raw_src_batch.append(raw_src)
-                    raw_packet_ids_batch.append(ins[1])
-                    raw_directions_batch.append(ins[2])
+                    raw_packet_ids_batch.append(raw_packet_ids)
+                    raw_directions_batch.append(raw_directions)
                     size_src_batch.append(size_src)
-                    tgt_cmmp_raw_batch.append(tgt_cmmp_raw)
-                    tgt_cmmp_size_batch.append(tgt_cmmp_size)
+                    iat_src_batch.append(iat_src)
+                    tgt_mlm_size_batch.append(tgt_size_dense)
+                    tgt_mlm_temporal_batch.append(tgt_temporal_dense)
 
-                else:  # len(ins) == 4
-                    # Dynamic masking: Apply mask_seq() here in DataLoader
-                    raw_src = list(ins[0])  # Copy to avoid modifying original
-                    size_src = list(ins[3])
+                elif len(ins) == 5:
+                    # Dynamic masking: Apply synchronized mask here in DataLoader
+                    raw_src = ins[0]  # Raw is NOT masked
+                    raw_packet_ids = ins[1]
+                    raw_directions = ins[2]
+                    size_src = list(ins[3])  # Copy to avoid modifying original
+                    iat_src = list(ins[4])
 
-                    # Mask raw
-                    raw_src_masked, tgt_mlm_raw = mask_seq(
-                        raw_src,
-                        self.tokenizer_raw,
-                        self.whole_word_masking,
-                        self.span_masking,
-                        self.span_geo_prob,
-                        self.span_max_length
-                    )
-
-                    # Mask size
+                    # Mask Size tokens
                     size_src_masked, tgt_mlm_size = mask_seq(
                         size_src,
                         self.tokenizer_size,
@@ -1713,24 +1816,54 @@ class MultiModalDataLoader(DataLoader):
                         self.span_max_length
                     )
 
-                    masked_words_num += len(tgt_mlm_raw) + len(tgt_mlm_size)
+                    # Apply same mask positions to IAT (synchronized masking)
+                    mask_positions = [pos for pos, _ in tgt_mlm_size]
+                    iat_src_masked = list(iat_src)
+                    tgt_mlm_temporal = []
 
-                    # Convert tgt_mlm format for raw
-                    tgt_cmmp_raw = [0] * len(raw_src)
-                    for pos, token in tgt_mlm_raw:
-                        tgt_cmmp_raw[pos] = token
+                    for pos in mask_positions:
+                        original_token = iat_src[pos]
+                        tgt_mlm_temporal.append((pos, original_token))
+
+                        # Standard BERT masking: 80% [MASK], 10% random, 10% unchanged
+                        prob = random.random()
+                        if prob < 0.8:
+                            iat_src_masked[pos] = self.vocab_temporal.get(MASK_TOKEN)
+                        elif prob < 0.9:
+                            while True:
+                                rdi = random.randint(1, len(self.vocab_temporal) - 1)
+                                if rdi not in [self.vocab_temporal.get(CLS_TOKEN),
+                                              self.vocab_temporal.get(SEP_TOKEN),
+                                              self.vocab_temporal.get(MASK_TOKEN),
+                                              PAD_ID]:
+                                    break
+                            iat_src_masked[pos] = rdi
+                        # else: 10%: Keep original token
+
+                    masked_words_num += len(tgt_mlm_size)
 
                     # Convert tgt_mlm format for size
-                    tgt_cmmp_size = [0] * len(size_src)
+                    tgt_size_dense = [0] * len(size_src)
                     for pos, token in tgt_mlm_size:
-                        tgt_cmmp_size[pos] = token
+                        tgt_size_dense[pos] = token
 
-                    raw_src_batch.append(raw_src_masked)
-                    raw_packet_ids_batch.append(ins[1])
-                    raw_directions_batch.append(ins[2])
+                    # Convert tgt_mlm format for temporal
+                    tgt_temporal_dense = [0] * len(iat_src)
+                    for pos, token in tgt_mlm_temporal:
+                        tgt_temporal_dense[pos] = token
+
+                    raw_src_batch.append(raw_src)
+                    raw_packet_ids_batch.append(raw_packet_ids)
+                    raw_directions_batch.append(raw_directions)
                     size_src_batch.append(size_src_masked)
-                    tgt_cmmp_raw_batch.append(tgt_cmmp_raw)
-                    tgt_cmmp_size_batch.append(tgt_cmmp_size)
+                    iat_src_batch.append(iat_src_masked)
+                    tgt_mlm_size_batch.append(tgt_size_dense)
+                    tgt_mlm_temporal_batch.append(tgt_temporal_dense)
+
+                else:
+                    # Unknown format, skip
+                    print(f"Warning: Unknown instance format with length {len(ins)}, skipping")
+                    continue
 
             # Skip batch if no masked words (should rarely happen)
             if masked_words_num == 0:
@@ -1740,5 +1873,6 @@ class MultiModalDataLoader(DataLoader):
                    torch.LongTensor(raw_packet_ids_batch),
                    torch.LongTensor(raw_directions_batch),
                    torch.LongTensor(size_src_batch),
-                   torch.LongTensor(tgt_cmmp_raw_batch),
-                   torch.LongTensor(tgt_cmmp_size_batch))
+                   torch.LongTensor(iat_src_batch),
+                   torch.LongTensor(tgt_mlm_size_batch),
+                   torch.LongTensor(tgt_mlm_temporal_batch))
