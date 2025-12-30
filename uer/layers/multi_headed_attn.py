@@ -24,48 +24,56 @@ class MultiHeadedAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.final_linear = nn.Linear(self.inner_hidden_size, hidden_size, bias=has_bias)
 
-    def forward(self, key, value, query, mask, position_bias=None):
+    def forward(self, key, value, query, mask, position_bias=None, logits_gate=None):
         """
         Args:
-            key: [batch_size x seq_length x hidden_size]
-            value: [batch_size x seq_length x hidden_size]
-            query: [batch_size x seq_length x hidden_size]
-            mask: [batch_size x 1 x seq_length x seq_length]
+            key: [batch_size x seq_length_k x hidden_size]
+            value: [batch_size x seq_length_k x hidden_size]
+            query: [batch_size x seq_length_q x hidden_size]
+            mask: [batch_size x 1 x seq_length_q x seq_length_k]
             position_bias: [1 x heads_num x seq_length x seq_length]
+            logits_gate: Optional gate for cross-attention control.
+                         Shape: [batch_size x heads_num x seq_length_q x 1] or broadcastable.
+                         Values in [0, 1]. When gate=0, attention to keys is suppressed.
+                         Applied as: scores = scores - (1 - gate) * 10000.0
         Returns:
-            output: [batch_size x seq_length x hidden_size]
+            output: [batch_size x seq_length_q x hidden_size]
+            probs: [batch_size x heads_num x seq_length_q x seq_length_k]
         """
-        batch_size, seq_length, _ = query.size()
+        batch_size, seq_length_q, _ = query.size()
+        seq_length_k = key.size(1)
         heads_num = self.heads_num
         per_head_size = self.per_head_size
-
-        def shape(x):
-            return x. \
-                   contiguous(). \
-                   view(batch_size, seq_length, heads_num, per_head_size). \
-                   transpose(1, 2)
 
         def unshape(x):
             return x. \
                    transpose(1, 2). \
                    contiguous(). \
-                   view(batch_size, seq_length, self.inner_hidden_size)
+                   view(batch_size, seq_length_q, self.inner_hidden_size)
 
+        # Linear projections: [B, L, H*d] -> [B, H, L, d]
+        query = self.linear_layers[0](query).view(batch_size, seq_length_q, heads_num, per_head_size).transpose(1, 2)
+        key = self.linear_layers[1](key).view(batch_size, seq_length_k, heads_num, per_head_size).transpose(1, 2)
+        value = self.linear_layers[2](value).view(batch_size, seq_length_k, heads_num, per_head_size).transpose(1, 2)
 
-        query, key, value = [l(x). \
-                             view(batch_size, -1, heads_num, per_head_size). \
-                             transpose(1, 2) \
-                             for l, x in zip(self.linear_layers, (query, key, value))
-                            ]
-
+        # Attention scores: [B, H, L_q, L_k]
         scores = torch.matmul(query, key.transpose(-2, -1))
         if position_bias is not None:
             scores = scores + position_bias
         if self.with_scale:
             scores = scores / math.sqrt(float(per_head_size))
+
+        # Apply padding mask
         scores = scores + mask
+
+        # Apply logits gate (for cross-attention modality control)
+        # gate=1: no change; gate=0: scores -> -10000 (attention suppressed)
+        if logits_gate is not None:
+            gate_mask = (1.0 - logits_gate) * -10000.0
+            scores = scores + gate_mask
+
         probs = nn.Softmax(dim=-1)(scores)
         probs = self.dropout(probs)
         output = unshape(torch.matmul(probs, value))
         output = self.final_linear(output)
-        return output,probs
+        return output, probs

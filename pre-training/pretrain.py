@@ -113,6 +113,12 @@ def main():
     # ALBEF-style architecture parameters
     parser.add_argument("--num_fusion_layers", type=int, default=6,
                         help="Number of bidirectional cross-attention fusion layers.")
+    parser.add_argument("--use_fusion_gate", action="store_true",
+                        help="Enable learnable gate mechanism in fusion layers. "
+                             "Gate controls cross-attention at logits level (before softmax) "
+                             "to suppress noisy modality information. "
+                             "Useful for scenarios where one modality may be unreliable "
+                             "(e.g., encrypted traffic, Tor with uniform packet sizes).")
     parser.add_argument("--queue_size", type=int, default=4096,
                         help="Size of the feature queue for ITC contrastive learning.")
     parser.add_argument("--momentum", type=float, default=0.995,

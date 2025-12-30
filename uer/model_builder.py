@@ -35,7 +35,8 @@ def build_model(args):
         from uer.layers.multimodal_fusion import MultiModalFusionEncoder
 
         num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
-        fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers)
+        use_fusion_gate = getattr(args, 'use_fusion_gate', False)
+        fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_gate=use_fusion_gate)
 
         # Build target module (ITC + ITM + Masked Reconstruction)
         target = str2target[args.target](
@@ -110,6 +111,7 @@ def build_model(args):
 
         print(f"  Vocab sizes: Raw={len(args.vocab_raw)}, Size={len(args.vocab_size)}, Temporal={vocab_size_temporal}")
         print(f"  Fusion layers: {num_fusion_layers}")
+        print(f"  Fusion gate: {use_fusion_gate}")
         print(f"  Queue size: {queue_size}")
         print(f"  Momentum: {momentum}")
         print(f"  ITC temperature: {getattr(args, 'itc_temperature', 0.07)}")
