@@ -90,12 +90,13 @@ def train_and_validate(args):
             args.tgt_vocab = tgt_vocab.w2i
         # Load temporal vocabulary for packet_size target (if provided)
         if args.target == "packet_size" and hasattr(args, 'vocab_path_temporal') and args.vocab_path_temporal:
-            # import copy
-            # args_temporal = copy.copy(args)
-            # args_temporal.vocab_path = args.vocab_path_temporal
+            # Temporarily change vocab_path to load temporal vocab
+            original_vocab_path = args.vocab_path
             args.vocab_path = args.vocab_path_temporal
-            args.tokenizer_temporal = BertTokenizer(args_temporal)
+            args.tokenizer_temporal = BertTokenizer(args)
             args.vocab_temporal = args.tokenizer_temporal.vocab
+            # Restore original vocab_path
+            args.vocab_path = original_vocab_path
             print(f"Loaded temporal vocab from {args.vocab_path_temporal} (size: {len(args.vocab_temporal)})")
         else:
             args.vocab_temporal = None
