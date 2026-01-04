@@ -17,7 +17,7 @@ sys.path.append(os.getcwd())
 
 import random
 import numpy as np
-from scapy.all import rdpcap
+from scapy.all import rdpcap, PcapReader
 from scapy.layers.inet import IP, TCP, UDP
 from tqdm import tqdm
 from collections import defaultdict
@@ -36,10 +36,14 @@ class MultiModalFlowExtractor:
         self.bytes_per_packet = bytes_per_packet
         self.max_raw_packets = max_raw_packets
         self.max_size_packets = max_size_packets
+        self.epsilon = 1e-6  # For IAT computation
 
     def extract_pcap(self, pcap_path):
         """
-        Extract features from a PCAP file
+        Extract features from a PCAP file (streaming mode for efficiency)
+
+        Uses streaming PcapReader to avoid loading entire PCAP into memory.
+        Stops reading once we have enough packets (max_size_packets).
 
         Returns:
             dict with keys:
@@ -48,16 +52,9 @@ class MultiModalFlowExtractor:
                 - raw_packet_ids: List[int] - packet index per packet
                 - packet_sizes: List[int] - payload sizes
                 - size_directions: List[int] - direction per size packet
+                - iat_tokens: List[int] - IAT temporal tokens (0-999)
             or None if extraction fails
         """
-        try:
-            packets = rdpcap(pcap_path)
-        except Exception as e:
-            return None
-
-        if len(packets) == 0:
-            return None
-
         # Parse 5-tuple from filename
         tuple_info = self._parse_filename_5tuple(pcap_path)
         if tuple_info is None:
@@ -71,32 +68,47 @@ class MultiModalFlowExtractor:
         raw_packet_ids = []
         packet_sizes = []
         size_directions = []
+        timestamps = []  # Collect timestamps for IAT computation
 
         raw_packet_count = 0
 
-        for packet in packets:
-            payload = self._extract_payload(packet, protocol)
-            if payload is None or len(payload) == 0:
-                continue
+        # Streaming PCAP reading for efficiency
+        try:
+            with PcapReader(pcap_path) as pcap_reader:
+                for packet in pcap_reader:
+                    # Early exit: we have enough packets
+                    if len(packet_sizes) >= self.max_size_packets:
+                        break
 
-            payload_len = min(len(payload), 1500)
-            direction = self._get_direction(packet, protocol, flow_src)
+                    payload = self._extract_payload(packet, protocol)
+                    if payload is None or len(payload) == 0:
+                        continue
 
-            # Raw modality
-            if raw_packet_count < self.max_raw_packets:
-                bigram_hex_list = self._bytes_to_bigram_hex(payload[:self.bytes_per_packet])
-                raw_bigrams.append(bigram_hex_list)
-                raw_directions.append(direction)
-                raw_packet_ids.append(raw_packet_count)
-                raw_packet_count += 1
+                    payload_len = min(len(payload), 1500)
+                    direction = self._get_direction(packet, protocol, flow_src)
+                    timestamp = float(packet.time)
 
-            # Size modality
-            if len(packet_sizes) < self.max_size_packets:
-                packet_sizes.append(payload_len)
-                size_directions.append(direction)
+                    # Raw modality (first 8 packets)
+                    if raw_packet_count < self.max_raw_packets:
+                        bigram_hex_list = self._bytes_to_bigram_hex(payload[:self.bytes_per_packet])
+                        raw_bigrams.append(bigram_hex_list)
+                        raw_directions.append(direction)
+                        raw_packet_ids.append(raw_packet_count)
+                        raw_packet_count += 1
+
+                    # Size modality (up to max_size_packets)
+                    packet_sizes.append(payload_len)
+                    size_directions.append(direction)
+                    timestamps.append(timestamp)
+
+        except Exception as e:
+            return None
 
         if len(packet_sizes) == 0:
             return None
+
+        # Compute IAT tokens (normalized and discretized to 0-999)
+        iat_tokens = self._compute_iat_tokens(timestamps)
 
         return {
             'protocol': protocol,
@@ -104,7 +116,8 @@ class MultiModalFlowExtractor:
             'raw_directions': raw_directions,
             'raw_packet_ids': raw_packet_ids,
             'packet_sizes': packet_sizes,
-            'size_directions': size_directions
+            'size_directions': size_directions,
+            'iat_tokens': iat_tokens
         }
 
     def _parse_filename_5tuple(self, pcap_path):
@@ -185,6 +198,50 @@ class MultiModalFlowExtractor:
             bigram_hex = f"{byte1:02x}{byte2:02x}"
             bigrams.append(bigram_hex)
         return bigrams
+
+    def _compute_iat_tokens(self, timestamps):
+        """
+        Compute IAT (Inter-Arrival Time) tokens
+
+        Method from PTU paper (same as pretraining):
+        1. Calculate time difference between consecutive packets (seconds)
+        2. Normalize: sigmoid(log10(IAT + epsilon))
+        3. Discretize to 1000 bins (0-999)
+
+        Args:
+            timestamps: List[float] - packet timestamps (seconds)
+
+        Returns:
+            List[int]: IAT tokens (0-999)
+        """
+        import math
+
+        if len(timestamps) == 0:
+            return []
+
+        iat_tokens = []
+
+        for i in range(len(timestamps)):
+            if i == 0:
+                # First packet uses epsilon
+                iat = self.epsilon
+            else:
+                # Calculate time difference from previous packet
+                iat = timestamps[i] - timestamps[i-1]
+                iat = max(iat, self.epsilon)  # Ensure non-negative and non-zero
+
+            # Normalization: sigmoid(log10(IAT))
+            # sigmoid(x) = 1 / (1 + exp(-x))
+            log_iat = math.log10(iat)
+            normalized = 1.0 / (1.0 + math.exp(-log_iat))
+
+            # Discretize to [0, 999]
+            token = int(normalized * 1000)
+            token = min(max(token, 0), 999)  # Clip to [0, 999]
+
+            iat_tokens.append(token)
+
+        return iat_tokens
 
 
 def create_tokenizer(vocab_path):
@@ -276,24 +333,36 @@ def tokenize_raw_flow(flow_data, tokenizer_raw, seq_length_raw):
     return src, packet_ids, directions
 
 
-def tokenize_size_flow(flow_data, tokenizer_size, seq_length_size):
+def tokenize_size_iat_flow(flow_data, tokenizer_size, tokenizer_temporal, seq_length_size):
     """
-    Tokenize packet size data for a single flow
+    Tokenize Packet Size modality (Size + IAT) for a single flow
+
+    Size and IAT belong to the same modality and are processed together.
+    Both sequences have the same length and structure.
 
     Format matches pretraining (data.py PacketSizeDataset):
-        - [CLS] + size_tokens + [SEP] + [PAD]...
+        - Size: [CLS] + size_tokens + [SEP] + [PAD]...
+        - IAT:  [CLS] + iat_tokens + [SEP] + [PAD]...
         - Size token = size * direction + 1500 (direction already encoded)
+        - IAT tokens are already discretized to 0-999
 
     Args:
-        flow_data: dict with 'packet_sizes' (List[int]) and 'size_directions' (List[int])
-        tokenizer_size: BertTokenizer for size modality
-        seq_length_size: target sequence length
+        flow_data: dict with:
+            - 'packet_sizes' (List[int]): payload sizes
+            - 'size_directions' (List[int]): directions per packet
+            - 'iat_tokens' (List[int]): IAT bins 0-999
+        tokenizer_size: BertTokenizer for size tokens
+        tokenizer_temporal: BertTokenizer for temporal (IAT) tokens
+        seq_length_size: target sequence length for both modalities
 
     Returns:
-        src: List[int] - token IDs
+        size_src: List[int] - size token IDs
+        iat_src: List[int] - IAT token IDs
     """
-    vocab = tokenizer_size.vocab
+    vocab_size = tokenizer_size.vocab
+    vocab_temporal = tokenizer_temporal.vocab
 
+    # ===== Process Size tokens =====
     # Build size token string: "1672 2185 953 ..."
     size_tokens_str = []
     for size, direction in zip(flow_data['packet_sizes'], flow_data['size_directions']):
@@ -301,33 +370,53 @@ def tokenize_size_flow(flow_data, tokenizer_size, seq_length_size):
         size_token = size * direction + 1500
         size_tokens_str.append(str(size_token))
 
-    # Tokenize the size string
-    # This matches pretraining: tokenizer.tokenize(tokens_line)
+    # Tokenize size
     size_str = ' '.join(size_tokens_str)
-    tokens = tokenizer_size.tokenize(size_str)
-    token_ids = tokenizer_size.convert_tokens_to_ids(tokens)
+    size_tokens = tokenizer_size.tokenize(size_str)
+    size_token_ids = tokenizer_size.convert_tokens_to_ids(size_tokens)
 
-    # Reserve space for [CLS] and [SEP]
-    max_tokens = seq_length_size - 2
+    # ===== Process IAT tokens =====
+    # Convert IAT bins to string: "567 123 456 ..."
+    iat_str = ' '.join([str(token) for token in flow_data['iat_tokens']])
 
-    # Truncate if needed
-    if len(token_ids) > max_tokens:
-        token_ids = token_ids[:max_tokens]
+    # Tokenize IAT
+    iat_tokens = tokenizer_temporal.tokenize(iat_str)
+    iat_token_ids = tokenizer_temporal.convert_tokens_to_ids(iat_tokens)
 
-    # Build sequence: [CLS] + tokens + [SEP]
-    cls_id = vocab.get(CLS_TOKEN, 0)
-    sep_id = vocab.get(SEP_TOKEN, 0)
+    # ===== Ensure Size and IAT have same length (CRITICAL for alignment) =====
+    # This matches pretraining behavior (uer/utils/data.py:1638-1640)
+    # Size and IAT must be synchronized because they represent the same packets
+    min_len = min(len(size_token_ids), len(iat_token_ids))
+    size_token_ids = size_token_ids[:min_len]
+    iat_token_ids = iat_token_ids[:min_len]
 
-    src = [cls_id] + token_ids + [sep_id]
+    # Truncate to max_tokens
+    max_tokens = seq_length_size - 2  # Reserve for [CLS] and [SEP]
+    if len(size_token_ids) > max_tokens:
+        size_token_ids = size_token_ids[:max_tokens]
+        iat_token_ids = iat_token_ids[:max_tokens]  # Keep synchronized
 
-    # Pad to seq_length_size
-    while len(src) < seq_length_size:
-        src.append(PAD_ID)
+    # ===== Build sequences with special tokens =====
+    # Size sequence
+    cls_id_size = vocab_size.get(CLS_TOKEN, 0)
+    sep_id_size = vocab_size.get(SEP_TOKEN, 0)
+    size_src = [cls_id_size] + size_token_ids + [sep_id_size]
 
-    return src
+    # IAT sequence
+    cls_id_iat = vocab_temporal.get(CLS_TOKEN, 0)
+    sep_id_iat = vocab_temporal.get(SEP_TOKEN, 0)
+    iat_src = [cls_id_iat] + iat_token_ids + [sep_id_iat]
+
+    # ===== Padding to seq_length_size =====
+    while len(size_src) < seq_length_size:
+        size_src.append(PAD_ID)
+    while len(iat_src) < seq_length_size:
+        iat_src.append(PAD_ID)
+
+    return size_src, iat_src
 
 
-def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size,
+def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
                     seq_length_raw=512, seq_length_size=256,
                     bytes_per_packet=64, max_raw_packets=8, max_size_packets=256,
                     min_samples_per_class=10, max_samples_per_class=500,
@@ -340,6 +429,7 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size,
         pcap_dir: Root directory with structure: pcap_dir/label_name/*.pcap
         tokenizer_raw: BertTokenizer for raw modality
         tokenizer_size: BertTokenizer for size modality
+        tokenizer_temporal: BertTokenizer for temporal (IAT) modality
         ...
 
     Returns:
@@ -382,9 +472,9 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size,
                 flow_data, tokenizer_raw, seq_length_raw
             )
 
-            # Tokenize size modality (using tokenizer, same as pretraining)
-            size_src = tokenize_size_flow(
-                flow_data, tokenizer_size, seq_length_size
+            # Tokenize size modality (Size + IAT together, same modality)
+            size_src, iat_src = tokenize_size_iat_flow(
+                flow_data, tokenizer_size, tokenizer_temporal, seq_length_size
             )
 
             sample = {
@@ -392,6 +482,7 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size,
                 'packet_ids': packet_ids,
                 'directions': directions,
                 'size_src': size_src,
+                'iat_src': iat_src,  # NEW: IAT temporal tokens
                 'label_name': label_name
             }
             label_samples[label_name].append(sample)
@@ -474,6 +565,8 @@ def main():
                         help='Path to raw modality vocabulary file')
     parser.add_argument('--vocab_path_size', type=str, required=True,
                         help='Path to size modality vocabulary file')
+    parser.add_argument('--vocab_path_temporal', type=str, required=True,
+                        help='Path to temporal (IAT) modality vocabulary file')
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Output directory for processed datasets')
 
@@ -506,14 +599,17 @@ def main():
     print("Creating tokenizers...")
     tokenizer_raw = create_tokenizer(args.vocab_path_raw)
     tokenizer_size = create_tokenizer(args.vocab_path_size)
+    tokenizer_temporal = create_tokenizer(args.vocab_path_temporal)
     print(f"  Raw vocab size: {len(tokenizer_raw.vocab)}")
     print(f"  Size vocab size: {len(tokenizer_size.vocab)}")
+    print(f"  Temporal vocab size: {len(tokenizer_temporal.vocab)}")
 
     # Process dataset
     train_data, val_data, test_data, label2id = process_dataset(
         pcap_dir=args.pcap_dir,
         tokenizer_raw=tokenizer_raw,
         tokenizer_size=tokenizer_size,
+        tokenizer_temporal=tokenizer_temporal,
         seq_length_raw=args.seq_length_raw,
         seq_length_size=args.seq_length_size,
         bytes_per_packet=args.bytes_per_packet,

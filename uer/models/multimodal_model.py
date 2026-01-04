@@ -161,8 +161,8 @@ class MultiModalModel(nn.Module):
         """
         # Gather features from all GPUs in distributed training
         # This ensures all processes have the same queue contents
-        raw_feat = concat_all_gather(raw_feat)
-        size_feat = concat_all_gather(size_feat)
+        # raw_feat = concat_all_gather(raw_feat)
+        # size_feat = concat_all_gather(size_feat)
 
         batch_size = raw_feat.size(0)
 

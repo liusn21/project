@@ -137,6 +137,10 @@ def main():
                         help="Weight for Size MLM loss (for packet_size target with temporal).")
     parser.add_argument("--lambda_mlm_temporal", type=float, default=1.0,
                         help="Weight for Temporal MLM loss (for packet_size target with temporal IAT).")
+    parser.add_argument("--lambda_recon_size", type=float, default=1.0,
+                        help="Weight for Size reconstruction loss (for multimodal target).")
+    parser.add_argument("--lambda_recon_temporal", type=float, default=1.0,
+                        help="Weight for Temporal reconstruction loss (for multimodal target).")
 
     # Temperature parameters
     parser.add_argument("--itc_temperature", type=float, default=0.07,

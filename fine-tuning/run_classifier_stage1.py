@@ -59,7 +59,7 @@ class Stage1Classifier(nn.Module):
         - 'both': Concatenate Raw and Size (default)
     """
 
-    def __init__(self, args, vocab_size_raw, vocab_size_size, labels_num):
+    def __init__(self, args, vocab_size_raw, vocab_size_size, vocab_size_temporal, labels_num):
         super(Stage1Classifier, self).__init__()
 
         self.hidden_size = args.hidden_size
@@ -71,9 +71,9 @@ class Stage1Classifier(nn.Module):
             self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
             self.encoder_raw = str2encoder[args.encoder](args)
 
-        # Size modality encoder
+        # Size modality encoder (with temporal/IAT support)
         if self.modality in ['size', 'both']:
-            self.embedding_size = PacketSizeEmbedding(args, vocab_size_size)
+            self.embedding_size = PacketSizeEmbedding(args, vocab_size_size, vocab_size_temporal)
             self.encoder_size = str2encoder[args.encoder](args)
 
         # Classification head
@@ -89,13 +89,14 @@ class Stage1Classifier(nn.Module):
             nn.Linear(args.hidden_size, labels_num)
         )
 
-    def forward(self, raw_src, packet_ids, directions, size_src, tgt=None):
+    def forward(self, raw_src, packet_ids, directions, size_src, iat_src, tgt=None):
         """
         Args:
             raw_src: [batch, seq_len_raw] - Raw token IDs
             packet_ids: [batch, seq_len_raw] - Packet indices
             directions: [batch, seq_len_raw] - Direction indices
             size_src: [batch, seq_len_size] - Size token IDs
+            iat_src: [batch, seq_len_size] - IAT temporal token IDs
             tgt: [batch] - Labels (optional)
 
         Returns:
@@ -111,9 +112,9 @@ class Stage1Classifier(nn.Module):
             raw_cls = raw_output[:, 0, :]  # [batch, hidden]
             features.append(raw_cls)
 
-        # Size encoder
+        # Size encoder (with IAT temporal information)
         if self.modality in ['size', 'both']:
-            size_emb = self.embedding_size(size_src)
+            size_emb = self.embedding_size(size_src, iat_src)
             size_seg = (size_src != PAD_ID).long()
             size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len, hidden]
             size_cls = size_output[:, 0, :]  # [batch, hidden]
@@ -208,9 +209,10 @@ def batch_loader(batch_size, dataset, shuffle=False):
         packet_ids = torch.LongTensor([s['packet_ids'] for s in batch])
         directions = torch.LongTensor([s['directions'] for s in batch])
         size_src = torch.LongTensor([s['size_src'] for s in batch])
+        iat_src = torch.LongTensor([s['iat_src'] for s in batch])
         tgt = torch.LongTensor([s['label'] for s in batch])
 
-        yield raw_src, packet_ids, directions, size_src, tgt
+        yield raw_src, packet_ids, directions, size_src, iat_src, tgt
 
 
 def train_epoch(args, model, optimizer, scheduler, train_data):
@@ -219,15 +221,16 @@ def train_epoch(args, model, optimizer, scheduler, train_data):
     total_loss = 0.0
     step = 0
 
-    for raw_src, packet_ids, directions, size_src, tgt in batch_loader(args.batch_size, train_data, shuffle=True):
+    for raw_src, packet_ids, directions, size_src, iat_src, tgt in batch_loader(args.batch_size, train_data, shuffle=True):
         raw_src = raw_src.to(args.device)
         packet_ids = packet_ids.to(args.device)
         directions = directions.to(args.device)
         size_src = size_src.to(args.device)
+        iat_src = iat_src.to(args.device)
         tgt = tgt.to(args.device)
 
         model.zero_grad()
-        loss, _ = model(raw_src, packet_ids, directions, size_src, tgt)
+        loss, _ = model(raw_src, packet_ids, directions, size_src, iat_src, tgt)
 
         if torch.cuda.device_count() > 1:
             loss = torch.mean(loss)
@@ -253,14 +256,15 @@ def evaluate(args, model, eval_data, print_confusion=False):
     confusion = torch.zeros(args.labels_num, args.labels_num, dtype=torch.long)
 
     with torch.no_grad():
-        for raw_src, packet_ids, directions, size_src, tgt in batch_loader(args.batch_size, eval_data):
+        for raw_src, packet_ids, directions, size_src, iat_src, tgt in batch_loader(args.batch_size, eval_data):
             raw_src = raw_src.to(args.device)
             packet_ids = packet_ids.to(args.device)
             directions = directions.to(args.device)
             size_src = size_src.to(args.device)
+            iat_src = iat_src.to(args.device)
             tgt = tgt.to(args.device)
 
-            _, logits = model(raw_src, packet_ids, directions, size_src, None)
+            _, logits = model(raw_src, packet_ids, directions, size_src, iat_src, None)
             pred = torch.argmax(logits, dim=-1)
 
             for p, g in zip(pred.cpu().tolist(), tgt.cpu().tolist()):
@@ -353,6 +357,8 @@ def main():
                         help="Path to raw modality vocabulary")
     parser.add_argument("--vocab_path_size", type=str, required=True,
                         help="Path to size modality vocabulary")
+    parser.add_argument("--vocab_path_temporal", type=str, required=True,
+                        help="Path to temporal (IAT) modality vocabulary")
     parser.add_argument("--pretrained_raw_path", type=str, default=None,
                         help="Path to pretrained raw encoder checkpoint")
     parser.add_argument("--pretrained_size_path", type=str, default=None,
@@ -386,6 +392,11 @@ def main():
     vocab_raw.load(args.vocab_path_raw)
     vocab_size = Vocab()
     vocab_size.load(args.vocab_path_size)
+    vocab_temporal = Vocab()
+    vocab_temporal.load(args.vocab_path_temporal)
+    print(f"  Raw vocab size: {len(vocab_raw)}")
+    print(f"  Size vocab size: {len(vocab_size)}")
+    print(f"  Temporal vocab size: {len(vocab_temporal)}")
 
     # Load label mapping
     print("Loading label mapping...")
@@ -404,7 +415,7 @@ def main():
     # Build model
     print("Building model...")
     print(f"  Modality mode: {args.modality}")
-    model = Stage1Classifier(args, len(vocab_raw), len(vocab_size), args.labels_num)
+    model = Stage1Classifier(args, len(vocab_raw), len(vocab_size), len(vocab_temporal), args.labels_num)
 
     # Load pretrained encoders based on modality
     if args.modality in ['raw', 'both']:
