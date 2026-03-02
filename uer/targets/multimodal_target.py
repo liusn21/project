@@ -164,15 +164,14 @@ class MultiModalTarget(nn.Module):
 
         return itc_loss, sim_r2s, sim_s2r
 
-    def sample_hard_negatives(self, sim_r2s, sim_s2r, batch_size, temperature=0.07):
+    def sample_hard_negatives(self, sim_r2s, sim_s2r, batch_size):
         """
         Sample hard negative indices based on ITC similarity
 
         Args:
-            sim_r2s: [batch, batch+queue] - Raw到Size的相似度矩阵
-            sim_s2r: [batch, batch+queue] - Size到Raw的相似度矩阵
+            sim_r2s: [batch, batch+queue] - Raw到Size的相似度矩阵 (already scaled by temperature)
+            sim_s2r: [batch, batch+queue] - Size到Raw的相似度矩阵 (already scaled by temperature)
             batch_size: batch size
-            temperature: sampling temperature
 
         Returns:
             neg_size_idx: [batch] - hard negative size indices for each raw
@@ -188,8 +187,9 @@ class MultiModalTarget(nn.Module):
             sim_s2r_batch.fill_diagonal_(-float('inf'))
 
             # Sample hard negatives based on similarity
-            weights_r2s = F.softmax(sim_r2s_batch / temperature, dim=1)
-            weights_s2r = F.softmax(sim_s2r_batch / temperature, dim=1)
+            # sim_r2s and sim_s2r are already divided by temperature in forward_itc
+            weights_r2s = F.softmax(sim_r2s_batch, dim=1)
+            weights_s2r = F.softmax(sim_s2r_batch, dim=1)
 
             # For each raw, sample a hard negative size
             neg_size_idx = torch.multinomial(weights_r2s, 1).squeeze(1)  # [batch]

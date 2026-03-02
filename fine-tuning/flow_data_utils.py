@@ -1,14 +1,15 @@
 """
-Multi-Modal Fine-tuning Data Utilities
+Flow Prediction Data Utilities
 
-PCAP processing and dataset creation for multi-modal traffic classification.
-Extracts both Raw Packet (bigram) and Packet Size features from pcap files.
+PCAP processing and dataset creation for flow prediction task.
+Predicts flow_bytes (total bytes) and flow_duration from first 8 packets.
 
 Input format: datasets/label_name/flow_file.pcap
   - Each pcap file represents one bidirectional flow
   - Filename format: {protocol}_{src_ip}_{src_port}_{dst_ip}_{dst_port}.pcap
 
-Output: train/val/test datasets with both modalities
+Output: train/val/test datasets with features from first 8 packets and
+        labels computed from entire flow (flow_bytes, flow_duration)
 """
 
 import os
@@ -16,8 +17,9 @@ import sys
 sys.path.append(os.getcwd())
 
 import random
+import math
 import numpy as np
-from scapy.all import rdpcap, PcapReader
+from scapy.all import PcapReader
 from scapy.layers.inet import IP, TCP, UDP
 from tqdm import tqdm
 from collections import defaultdict
@@ -29,30 +31,38 @@ from uer.utils.tokenizers import BertTokenizer
 from uer.utils.constants import CLS_TOKEN, SEP_TOKEN, PAD_ID
 
 
-class MultiModalFlowExtractor:
-    """Extract multi-modal features from a single PCAP file"""
+class FlowFeatureExtractor:
+    """
+    Extract features for flow prediction from a single PCAP file.
 
-    def __init__(self, bytes_per_packet=64, max_raw_packets=8, max_size_packets=256):
+    Features: First 8 packets (Raw + Size + IAT modalities)
+    Labels: Entire flow statistics (flow_bytes, flow_duration)
+    """
+
+    def __init__(self, bytes_per_packet=64, max_packets=8):
         self.bytes_per_packet = bytes_per_packet
-        self.max_raw_packets = max_raw_packets
-        self.max_size_packets = max_size_packets
+        self.max_packets = max_packets
         self.epsilon = 1e-6  # For IAT computation
 
     def extract_pcap(self, pcap_path):
         """
-        Extract features from a PCAP file (streaming mode for efficiency)
+        Extract features from first 8 packets and labels from entire flow.
 
-        Uses streaming PcapReader to avoid loading entire PCAP into memory.
-        Stops reading once we have enough packets (max_size_packets).
+        Uses streaming PcapReader to read entire PCAP for label computation
+        but only uses first 8 packets for features.
 
         Returns:
             dict with keys:
                 - raw_bigrams: List[List[str]] - bigram hex strings per packet
                 - raw_directions: List[int] - direction per packet (1=up, -1=down)
                 - raw_packet_ids: List[int] - packet index per packet
-                - packet_sizes: List[int] - payload sizes
+                - packet_sizes: List[int] - payload sizes (first 8 packets)
                 - size_directions: List[int] - direction per size packet
                 - iat_tokens: List[int] - IAT temporal tokens (0-999)
+                - flow_bytes: int - total bytes in entire flow
+                - flow_bytes_log: float - log10(flow_bytes + 1)
+                - flow_duration: float - total duration in seconds
+                - flow_duration_log: float - log10(flow_duration + epsilon)
             or None if extraction fails
         """
         # Parse 5-tuple from filename
@@ -63,23 +73,25 @@ class MultiModalFlowExtractor:
         protocol, src_ip, src_port, dst_ip, dst_port = tuple_info
         flow_src = (src_ip, src_port)
 
+        # Feature arrays (first 8 packets)
         raw_bigrams = []
         raw_directions = []
         raw_packet_ids = []
         packet_sizes = []
         size_directions = []
-        timestamps = []  # Collect timestamps for IAT computation
+        timestamps = []
+
+        # Label computation (entire flow)
+        total_bytes = 0
+        first_timestamp = None
+        last_timestamp = None
 
         raw_packet_count = 0
 
-        # Streaming PCAP reading for efficiency
+        # Streaming PCAP reading
         try:
             with PcapReader(pcap_path) as pcap_reader:
                 for packet in pcap_reader:
-                    # Early exit: we have enough packets
-                    if len(packet_sizes) >= self.max_size_packets:
-                        break
-
                     payload = self._extract_payload(packet, protocol)
                     if payload is None or len(payload) == 0:
                         continue
@@ -88,18 +100,26 @@ class MultiModalFlowExtractor:
                     direction = self._get_direction(packet, protocol, flow_src)
                     timestamp = float(packet.time)
 
-                    # Raw modality (first 8 packets)
-                    if raw_packet_count < self.max_raw_packets:
+                    # Update label statistics (entire flow)
+                    total_bytes += payload_len
+                    if first_timestamp is None:
+                        first_timestamp = timestamp
+                    last_timestamp = timestamp
+
+                    # Feature extraction (first 8 packets only)
+                    if raw_packet_count < self.max_packets:
+                        # Raw modality
                         bigram_hex_list = self._bytes_to_bigram_hex(payload[:self.bytes_per_packet])
                         raw_bigrams.append(bigram_hex_list)
                         raw_directions.append(direction)
                         raw_packet_ids.append(raw_packet_count)
-                        raw_packet_count += 1
 
-                    # Size modality (up to max_size_packets)
-                    packet_sizes.append(payload_len)
-                    size_directions.append(direction)
-                    timestamps.append(timestamp)
+                        # Size modality
+                        packet_sizes.append(payload_len)
+                        size_directions.append(direction)
+                        timestamps.append(timestamp)
+
+                        raw_packet_count += 1
 
         except Exception as e:
             return None
@@ -107,17 +127,31 @@ class MultiModalFlowExtractor:
         if len(packet_sizes) == 0:
             return None
 
-        # Compute IAT tokens (normalized and discretized to 0-999)
+        # Compute IAT tokens for feature packets
         iat_tokens = self._compute_iat_tokens(timestamps)
+
+        # Compute flow labels
+        flow_bytes = total_bytes
+        flow_bytes_log = math.log10(flow_bytes + 1)
+
+        flow_duration = (last_timestamp - first_timestamp) if first_timestamp is not None else 0.0
+        flow_duration = max(flow_duration, 0.0)
+        flow_duration_log = math.log10(flow_duration + self.epsilon)
 
         return {
             'protocol': protocol,
+            # Features (first 8 packets)
             'raw_bigrams': raw_bigrams,
             'raw_directions': raw_directions,
             'raw_packet_ids': raw_packet_ids,
             'packet_sizes': packet_sizes,
             'size_directions': size_directions,
-            'iat_tokens': iat_tokens
+            'iat_tokens': iat_tokens,
+            # Labels (entire flow)
+            'flow_bytes': flow_bytes,
+            'flow_bytes_log': flow_bytes_log,
+            'flow_duration': flow_duration,
+            'flow_duration_log': flow_duration_log
         }
 
     def _parse_filename_5tuple(self, pcap_path):
@@ -201,7 +235,7 @@ class MultiModalFlowExtractor:
 
     def _compute_iat_tokens(self, timestamps):
         """
-        Compute IAT (Inter-Arrival Time) tokens
+        Compute IAT (Inter-Arrival Time) tokens.
 
         Method from PTU paper (same as pretraining):
         1. Calculate time difference between consecutive packets (seconds)
@@ -214,8 +248,6 @@ class MultiModalFlowExtractor:
         Returns:
             List[int]: IAT tokens (0-999)
         """
-        import math
-
         if len(timestamps) == 0:
             return []
 
@@ -223,21 +255,16 @@ class MultiModalFlowExtractor:
 
         for i in range(len(timestamps)):
             if i == 0:
-                # First packet uses epsilon
                 iat = self.epsilon
             else:
-                # Calculate time difference from previous packet
                 iat = timestamps[i] - timestamps[i-1]
-                iat = max(iat, self.epsilon)  # Ensure non-negative and non-zero
+                iat = max(iat, self.epsilon)
 
-            # Normalization: sigmoid(log10(IAT))
-            # sigmoid(x) = 1 / (1 + exp(-x))
             log_iat = math.log10(iat)
             normalized = 1.0 / (1.0 + math.exp(-log_iat))
 
-            # Discretize to [0, 999]
             token = int(normalized * 1000)
-            token = min(max(token, 0), 999)  # Clip to [0, 999]
+            token = min(max(token, 0), 999)
 
             iat_tokens.append(token)
 
@@ -246,11 +273,8 @@ class MultiModalFlowExtractor:
 
 def create_tokenizer(vocab_path):
     """
-    Create a BertTokenizer compatible with pretraining
-
-    Uses the same tokenizer as pretraining (data.py)
+    Create a BertTokenizer compatible with pretraining.
     """
-    # Create a minimal args object for BertTokenizer
     class Args:
         def __init__(self, vocab_path):
             self.vocab_path = vocab_path
@@ -263,16 +287,16 @@ def create_tokenizer(vocab_path):
 
 def tokenize_raw_flow(flow_data, tokenizer_raw, seq_length_raw):
     """
-    Tokenize raw packet data for a single flow
+    Tokenize raw packet data for a single flow.
 
-    Format matches pretraining (data.py RawPacketDataset):
+    Format matches pretraining:
         - [CLS] + all_packet_tokens + [SEP] + [PAD]...
-        - NO SEP tokens between packets (different from BERT sentence-pair!)
+        - NO SEP tokens between packets
         - packet_ids: 0-7 for packets, 8 for special tokens/padding
         - directions: 0=downlink, 1=neutral(special/pad), 2=uplink
 
     Args:
-        flow_data: dict with 'raw_bigrams' (List[List[str]]) and 'raw_directions' (List[int])
+        flow_data: dict with 'raw_bigrams' and 'raw_directions'
         tokenizer_raw: BertTokenizer for raw modality
         seq_length_raw: target sequence length
 
@@ -283,48 +307,38 @@ def tokenize_raw_flow(flow_data, tokenizer_raw, seq_length_raw):
     """
     vocab = tokenizer_raw.vocab
 
-    # Collect all tokens from all packets (no SEP between packets!)
     tokens = []
     token_packet_ids = []
     token_directions = []
 
     for pkt_idx, (bigrams, direction) in enumerate(zip(flow_data['raw_bigrams'], flow_data['raw_directions'])):
-        # Limit to 8 packets (indices 0-7)
         if pkt_idx >= 8:
             break
 
-        # Convert bigram list to space-separated string, then tokenize
-        # This matches pretraining: tokenizer.tokenize(bigram_str)
         bigram_str = ' '.join(bigrams)
         pkt_tokens = tokenizer_raw.tokenize(bigram_str)
         pkt_token_ids = tokenizer_raw.convert_tokens_to_ids(pkt_tokens)
 
-        # Add tokens for this packet
         for token_id in pkt_token_ids:
             tokens.append(token_id)
             token_packet_ids.append(pkt_idx)
-            # Convert direction: -1 -> 0 (downlink), 1 -> 2 (uplink)
             dir_idx = 0 if direction == -1 else 2
             token_directions.append(dir_idx)
 
-    # Reserve space for [CLS] and [SEP]
     max_tokens = seq_length_raw - 2
 
-    # Truncate if needed
     if len(tokens) > max_tokens:
         tokens = tokens[:max_tokens]
         token_packet_ids = token_packet_ids[:max_tokens]
         token_directions = token_directions[:max_tokens]
 
-    # Build sequence: [CLS] + tokens + [SEP]
     cls_id = vocab.get(CLS_TOKEN, 0)
     sep_id = vocab.get(SEP_TOKEN, 0)
 
     src = [cls_id] + tokens + [sep_id]
-    packet_ids = [8] + token_packet_ids + [8]  # 8 for special tokens
-    directions = [1] + token_directions + [1]  # 1 for neutral
+    packet_ids = [8] + token_packet_ids + [8]
+    directions = [1] + token_directions + [1]
 
-    # Pad to seq_length_raw
     while len(src) < seq_length_raw:
         src.append(PAD_ID)
         packet_ids.append(8)
@@ -335,25 +349,21 @@ def tokenize_raw_flow(flow_data, tokenizer_raw, seq_length_raw):
 
 def tokenize_size_iat_flow(flow_data, tokenizer_size, tokenizer_temporal, seq_length_size):
     """
-    Tokenize Packet Size modality (Size + IAT) for a single flow
+    Tokenize Packet Size modality (Size + IAT) for a single flow.
 
-    Size and IAT belong to the same modality and are processed together.
-    Both sequences have the same length and structure.
+    For flow prediction, we only use first 8 packets, so seq_length_size
+    should be small (e.g., 10 = 8 packets + CLS + SEP).
 
-    Format matches pretraining (data.py PacketSizeDataset):
+    Format matches pretraining:
         - Size: [CLS] + size_tokens + [SEP] + [PAD]...
         - IAT:  [CLS] + iat_tokens + [SEP] + [PAD]...
-        - Size token = size * direction + 1500 (direction already encoded)
-        - IAT tokens are already discretized to 0-999
+        - Size token = size * direction + 1500
 
     Args:
-        flow_data: dict with:
-            - 'packet_sizes' (List[int]): payload sizes
-            - 'size_directions' (List[int]): directions per packet
-            - 'iat_tokens' (List[int]): IAT bins 0-999
+        flow_data: dict with 'packet_sizes', 'size_directions', 'iat_tokens'
         tokenizer_size: BertTokenizer for size tokens
         tokenizer_temporal: BertTokenizer for temporal (IAT) tokens
-        seq_length_size: target sequence length for both modalities
+        seq_length_size: target sequence length
 
     Returns:
         size_src: List[int] - size token IDs
@@ -362,52 +372,42 @@ def tokenize_size_iat_flow(flow_data, tokenizer_size, tokenizer_temporal, seq_le
     vocab_size = tokenizer_size.vocab
     vocab_temporal = tokenizer_temporal.vocab
 
-    # ===== Process Size tokens =====
-    # Build size token string: "1672 2185 953 ..."
+    # Process Size tokens
     size_tokens_str = []
     for size, direction in zip(flow_data['packet_sizes'], flow_data['size_directions']):
-        # Size token = size * direction + 1500
         size_token = size * direction + 1500
         size_tokens_str.append(str(size_token))
 
-    # Tokenize size
     size_str = ' '.join(size_tokens_str)
     size_tokens = tokenizer_size.tokenize(size_str)
     size_token_ids = tokenizer_size.convert_tokens_to_ids(size_tokens)
 
-    # ===== Process IAT tokens =====
-    # Convert IAT bins to string: "567 123 456 ..."
+    # Process IAT tokens
     iat_str = ' '.join([str(token) for token in flow_data['iat_tokens']])
-
-    # Tokenize IAT
     iat_tokens = tokenizer_temporal.tokenize(iat_str)
     iat_token_ids = tokenizer_temporal.convert_tokens_to_ids(iat_tokens)
 
-    # ===== Ensure Size and IAT have same length (CRITICAL for alignment) =====
-    # This matches pretraining behavior (uer/utils/data.py:1638-1640)
-    # Size and IAT must be synchronized because they represent the same packets
+    # Ensure Size and IAT have same length
     min_len = min(len(size_token_ids), len(iat_token_ids))
     size_token_ids = size_token_ids[:min_len]
     iat_token_ids = iat_token_ids[:min_len]
 
     # Truncate to max_tokens
-    max_tokens = seq_length_size - 2  # Reserve for [CLS] and [SEP]
+    max_tokens = seq_length_size - 2
     if len(size_token_ids) > max_tokens:
         size_token_ids = size_token_ids[:max_tokens]
-        iat_token_ids = iat_token_ids[:max_tokens]  # Keep synchronized
+        iat_token_ids = iat_token_ids[:max_tokens]
 
-    # ===== Build sequences with special tokens =====
-    # Size sequence
+    # Build sequences with special tokens
     cls_id_size = vocab_size.get(CLS_TOKEN, 0)
     sep_id_size = vocab_size.get(SEP_TOKEN, 0)
     size_src = [cls_id_size] + size_token_ids + [sep_id_size]
 
-    # IAT sequence
     cls_id_iat = vocab_temporal.get(CLS_TOKEN, 0)
     sep_id_iat = vocab_temporal.get(SEP_TOKEN, 0)
     iat_src = [cls_id_iat] + iat_token_ids + [sep_id_iat]
 
-    # ===== Padding to seq_length_size =====
+    # Padding
     while len(size_src) < seq_length_size:
         size_src.append(PAD_ID)
     while len(iat_src) < seq_length_size:
@@ -416,52 +416,44 @@ def tokenize_size_iat_flow(flow_data, tokenizer_size, tokenizer_temporal, seq_le
     return size_src, iat_src
 
 
-def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
-                    seq_length_raw=512, seq_length_size=256,
-                    bytes_per_packet=64, max_raw_packets=8, max_size_packets=256,
-                    min_samples_per_class=10, max_samples_per_class=500,
-                    train_ratio=0.8, val_ratio=0.1, test_ratio=0.1,
-                    seed=42, test_dir=None):
+def process_pcap_dir(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
+                     seq_length_raw=512, seq_length_size=10,
+                     bytes_per_packet=64, max_packets=8,
+                     train_ratio=0.8, val_ratio=0.1, test_ratio=0.1,
+                     seed=42, min_flow_bytes=100, max_samples=None):
     """
-    Process all PCAP files in dataset directory
+    Process all PCAP files in directory for flow prediction.
 
     Args:
         pcap_dir: Root directory with structure: pcap_dir/label_name/*.pcap
+                  (label_name is ignored for regression task, but used for organization)
         tokenizer_raw: BertTokenizer for raw modality
         tokenizer_size: BertTokenizer for size modality
         tokenizer_temporal: BertTokenizer for temporal (IAT) modality
-        seq_length_raw: Sequence length for raw modality
-        seq_length_size: Sequence length for size/IAT modality
+        seq_length_raw: Sequence length for raw modality (default 512)
+        seq_length_size: Sequence length for size/IAT modality (default 10 for 8 packets)
         bytes_per_packet: Bytes to extract per packet for raw modality
-        max_raw_packets: Max packets for raw modality
-        max_size_packets: Max packets for size modality
-        min_samples_per_class: Minimum samples required per class
-        max_samples_per_class: Maximum samples per class (for balancing)
+        max_packets: Max packets for feature extraction (default 8)
         train_ratio: Ratio of training data
         val_ratio: Ratio of validation data
-        test_ratio: Ratio of test data (ignored when test_dir is specified)
+        test_ratio: Ratio of test data
         seed: Random seed
-        test_dir: Separate test directory. When specified:
-            - pcap_dir is used for train/val only (split by train_ratio:val_ratio)
-            - test_dir provides all test samples
-            - label2id is determined by pcap_dir (train directory)
-            - Samples in test_dir with unknown labels are skipped
+        min_flow_bytes: Minimum flow bytes to include (filter tiny flows)
+        max_samples: Maximum total samples to collect (None for unlimited)
 
     Returns:
         train_data, val_data, test_data: Lists of samples
-        label2id: Label name to ID mapping
+        stats: dict with dataset statistics
     """
     random.seed(seed)
     np.random.seed(seed)
 
-    extractor = MultiModalFlowExtractor(
+    extractor = FlowFeatureExtractor(
         bytes_per_packet=bytes_per_packet,
-        max_raw_packets=max_raw_packets,
-        max_size_packets=max_size_packets
+        max_packets=max_packets
     )
 
-    # Collect all samples per label
-    label_samples = defaultdict(list)
+    all_samples = []
 
     # Walk through directory structure
     print(f"Scanning {pcap_dir}...")
@@ -473,21 +465,28 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
         pcap_files = [f for f in os.listdir(label_path)
                       if f.endswith('.pcap') or f.endswith('.pcapng')]
 
-        print(f"Processing label '{label_name}': {len(pcap_files)} files")
+        print(f"Processing '{label_name}': {len(pcap_files)} files")
 
         for pcap_file in tqdm(pcap_files, desc=label_name):
+            if max_samples is not None and len(all_samples) >= max_samples:
+                break
+
             pcap_path = os.path.join(label_path, pcap_file)
             flow_data = extractor.extract_pcap(pcap_path)
 
             if flow_data is None:
                 continue
 
-            # Tokenize raw modality (using tokenizer, same as pretraining)
+            # Filter tiny flows
+            if flow_data['flow_bytes'] < min_flow_bytes:
+                continue
+
+            # Tokenize raw modality
             raw_src, packet_ids, directions = tokenize_raw_flow(
                 flow_data, tokenizer_raw, seq_length_raw
             )
 
-            # Tokenize size modality (Size + IAT together, same modality)
+            # Tokenize size modality
             size_src, iat_src = tokenize_size_iat_flow(
                 flow_data, tokenizer_size, tokenizer_temporal, seq_length_size
             )
@@ -497,151 +496,86 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
                 'packet_ids': packet_ids,
                 'directions': directions,
                 'size_src': size_src,
-                'iat_src': iat_src,  # NEW: IAT temporal tokens
-                'label_name': label_name
+                'iat_src': iat_src,
+                'flow_bytes': flow_data['flow_bytes'],
+                'flow_bytes_log': flow_data['flow_bytes_log'],
+                'flow_duration': flow_data['flow_duration'],
+                'flow_duration_log': flow_data['flow_duration_log'],
+                'label_name': label_name  # Keep for reference
             }
-            label_samples[label_name].append(sample)
+            all_samples.append(sample)
 
-    # Filter labels with too few samples
-    valid_labels = []
-    for label_name, samples in label_samples.items():
-        if len(samples) >= min_samples_per_class:
-            valid_labels.append(label_name)
-        else:
-            print(f"Skipping label '{label_name}': only {len(samples)} samples (< {min_samples_per_class})")
+        if max_samples is not None and len(all_samples) >= max_samples:
+            print(f"Reached max_samples limit ({max_samples})")
+            break
 
-    valid_labels = sorted(valid_labels)
-    label2id = {name: idx for idx, name in enumerate(valid_labels)}
+    print(f"\nTotal samples collected: {len(all_samples)}")
 
-    print(f"\nValid labels: {len(valid_labels)}")
-    for name in valid_labels:
-        print(f"  {name}: {len(label_samples[name])} samples")
+    # Compute statistics
+    flow_bytes_values = [s['flow_bytes'] for s in all_samples]
+    flow_bytes_log_values = [s['flow_bytes_log'] for s in all_samples]
+    flow_duration_values = [s['flow_duration'] for s in all_samples]
+    flow_duration_log_values = [s['flow_duration_log'] for s in all_samples]
 
-    # Sample and split data
-    train_data, val_data, test_data = [], [], []
+    stats = {
+        'flow_bytes': {
+            'mean': np.mean(flow_bytes_values),
+            'std': np.std(flow_bytes_values),
+            'min': np.min(flow_bytes_values),
+            'max': np.max(flow_bytes_values),
+            'median': np.median(flow_bytes_values)
+        },
+        'flow_bytes_log': {
+            'mean': np.mean(flow_bytes_log_values),
+            'std': np.std(flow_bytes_log_values),
+            'min': np.min(flow_bytes_log_values),
+            'max': np.max(flow_bytes_log_values),
+            'median': np.median(flow_bytes_log_values)
+        },
+        'flow_duration': {
+            'mean': np.mean(flow_duration_values),
+            'std': np.std(flow_duration_values),
+            'min': np.min(flow_duration_values),
+            'max': np.max(flow_duration_values),
+            'median': np.median(flow_duration_values)
+        },
+        'flow_duration_log': {
+            'mean': np.mean(flow_duration_log_values),
+            'std': np.std(flow_duration_log_values),
+            'min': np.min(flow_duration_log_values),
+            'max': np.max(flow_duration_log_values),
+            'median': np.median(flow_duration_log_values)
+        }
+    }
 
-    if test_dir is None:
-        # Original mode: split from single directory
-        for label_name in valid_labels:
-            samples = label_samples[label_name]
+    print("\nFlow Statistics:")
+    print(f"  flow_bytes: mean={stats['flow_bytes']['mean']:.2f}, "
+          f"std={stats['flow_bytes']['std']:.2f}, "
+          f"min={stats['flow_bytes']['min']:.2f}, max={stats['flow_bytes']['max']:.2f}")
+    print(f"  flow_bytes_log: mean={stats['flow_bytes_log']['mean']:.4f}, "
+          f"std={stats['flow_bytes_log']['std']:.4f}")
+    print(f"  flow_duration: mean={stats['flow_duration']['mean']:.4f}s, "
+          f"std={stats['flow_duration']['std']:.4f}s")
+    print(f"  flow_duration_log: mean={stats['flow_duration_log']['mean']:.4f}, "
+          f"std={stats['flow_duration_log']['std']:.4f}")
 
-            # Limit max samples
-            if len(samples) > max_samples_per_class:
-                samples = random.sample(samples, max_samples_per_class)
+    # Shuffle and split
+    random.shuffle(all_samples)
 
-            # Shuffle
-            random.shuffle(samples)
+    n = len(all_samples)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
 
-            # Add label ID
-            label_id = label2id[label_name]
-            for s in samples:
-                s['label'] = label_id
-
-            # Split
-            n = len(samples)
-            n_train = int(n * train_ratio)
-            n_val = int(n * val_ratio)
-
-            train_data.extend(samples[:n_train])
-            val_data.extend(samples[n_train:n_train + n_val])
-            test_data.extend(samples[n_train + n_val:])
-    else:
-        # Separate test directory mode
-        # Step 1: Split train directory into train/val only
-        # Normalize train_ratio and val_ratio
-        total_ratio = train_ratio + val_ratio
-        norm_train_ratio = train_ratio / total_ratio
-
-        print(f"\nSeparate test mode: train/val split ratio = {norm_train_ratio:.2f}/{1-norm_train_ratio:.2f}")
-
-        for label_name in valid_labels:
-            samples = label_samples[label_name]
-
-            # Limit max samples
-            if len(samples) > max_samples_per_class:
-                samples = random.sample(samples, max_samples_per_class)
-
-            # Shuffle
-            random.shuffle(samples)
-
-            # Add label ID
-            label_id = label2id[label_name]
-            for s in samples:
-                s['label'] = label_id
-
-            # Split into train/val only (no test from this directory)
-            n = len(samples)
-            n_train = int(n * norm_train_ratio)
-
-            train_data.extend(samples[:n_train])
-            val_data.extend(samples[n_train:])
-
-        # Step 2: Process test directory separately
-        print(f"\nProcessing test directory: {test_dir}")
-        test_label_counts = defaultdict(int)
-        skipped_labels = set()
-
-        for label_name in os.listdir(test_dir):
-            label_path = os.path.join(test_dir, label_name)
-            if not os.path.isdir(label_path):
-                continue
-
-            # Check if label exists in train's label2id
-            if label_name not in label2id:
-                skipped_labels.add(label_name)
-                continue
-
-            label_id = label2id[label_name]
-            pcap_files = [f for f in os.listdir(label_path)
-                          if f.endswith('.pcap') or f.endswith('.pcapng')]
-
-            for pcap_file in tqdm(pcap_files, desc=f"Test:{label_name}"):
-                pcap_path = os.path.join(label_path, pcap_file)
-                flow_data = extractor.extract_pcap(pcap_path)
-
-                if flow_data is None:
-                    continue
-
-                # Tokenize raw modality
-                raw_src, packet_ids, directions = tokenize_raw_flow(
-                    flow_data, tokenizer_raw, seq_length_raw
-                )
-
-                # Tokenize size modality
-                size_src, iat_src = tokenize_size_iat_flow(
-                    flow_data, tokenizer_size, tokenizer_temporal, seq_length_size
-                )
-
-                sample = {
-                    'raw_src': raw_src,
-                    'packet_ids': packet_ids,
-                    'directions': directions,
-                    'size_src': size_src,
-                    'iat_src': iat_src,
-                    'label_name': label_name,
-                    'label': label_id
-                }
-                test_data.append(sample)
-                test_label_counts[label_name] += 1
-
-        if skipped_labels:
-            print(f"\nSkipped labels in test_dir (not in train): {sorted(skipped_labels)}")
-
-        print(f"\nTest set label distribution:")
-        for name in sorted(test_label_counts.keys()):
-            print(f"  {name}: {test_label_counts[name]} samples")
-
-    # Shuffle splits
-    random.shuffle(train_data)
-    random.shuffle(val_data)
-    random.shuffle(test_data)
+    train_data = all_samples[:n_train]
+    val_data = all_samples[n_train:n_train + n_val]
+    test_data = all_samples[n_train + n_val:]
 
     print(f"\nDataset split:")
     print(f"  Train: {len(train_data)}")
     print(f"  Val: {len(val_data)}")
     print(f"  Test: {len(test_data)}")
 
-    return train_data, val_data, test_data, label2id
+    return train_data, val_data, test_data, stats
 
 
 def save_dataset(data, output_path):
@@ -659,13 +593,10 @@ def load_dataset(input_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Process PCAP files for multi-modal fine-tuning')
+    parser = argparse.ArgumentParser(description='Process PCAP files for flow prediction')
 
     parser.add_argument('--pcap_dir', type=str, required=True,
-                        help='Root directory with structure: pcap_dir/label_name/*.pcap (used as train dir when --test_dir is specified)')
-    parser.add_argument('--test_dir', type=str, default=None,
-                        help='Separate test directory. When specified, pcap_dir is used for train/val only, '
-                             'and all samples in test_dir are used for testing. Labels are determined by pcap_dir.')
+                        help='Root directory with structure: pcap_dir/label_name/*.pcap')
     parser.add_argument('--vocab_path_raw', type=str, required=True,
                         help='Path to raw modality vocabulary file')
     parser.add_argument('--vocab_path_size', type=str, required=True,
@@ -677,16 +608,18 @@ def main():
 
     # Sequence lengths
     parser.add_argument('--seq_length_raw', type=int, default=512)
-    parser.add_argument('--seq_length_size', type=int, default=256)
+    parser.add_argument('--seq_length_size', type=int, default=10,
+                        help='Sequence length for size modality (8 packets + CLS + SEP)')
 
     # Feature extraction params
     parser.add_argument('--bytes_per_packet', type=int, default=64)
-    parser.add_argument('--max_raw_packets', type=int, default=8)
-    parser.add_argument('--max_size_packets', type=int, default=256)
+    parser.add_argument('--max_packets', type=int, default=8)
 
     # Dataset filtering
-    parser.add_argument('--min_samples_per_class', type=int, default=10)
-    parser.add_argument('--max_samples_per_class', type=int, default=500)
+    parser.add_argument('--min_flow_bytes', type=int, default=100,
+                        help='Minimum flow bytes to include')
+    parser.add_argument('--max_samples', type=int, default=None,
+                        help='Maximum total samples to collect')
 
     # Split ratios
     parser.add_argument('--train_ratio', type=float, default=0.8)
@@ -700,7 +633,7 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Create tokenizers (same as pretraining)
+    # Create tokenizers
     print("Creating tokenizers...")
     tokenizer_raw = create_tokenizer(args.vocab_path_raw)
     tokenizer_size = create_tokenizer(args.vocab_path_size)
@@ -710,7 +643,7 @@ def main():
     print(f"  Temporal vocab size: {len(tokenizer_temporal.vocab)}")
 
     # Process dataset
-    train_data, val_data, test_data, label2id = process_dataset(
+    train_data, val_data, test_data, stats = process_pcap_dir(
         pcap_dir=args.pcap_dir,
         tokenizer_raw=tokenizer_raw,
         tokenizer_size=tokenizer_size,
@@ -718,22 +651,20 @@ def main():
         seq_length_raw=args.seq_length_raw,
         seq_length_size=args.seq_length_size,
         bytes_per_packet=args.bytes_per_packet,
-        max_raw_packets=args.max_raw_packets,
-        max_size_packets=args.max_size_packets,
-        min_samples_per_class=args.min_samples_per_class,
-        max_samples_per_class=args.max_samples_per_class,
+        max_packets=args.max_packets,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
         seed=args.seed,
-        test_dir=args.test_dir
+        min_flow_bytes=args.min_flow_bytes,
+        max_samples=args.max_samples
     )
 
     # Save datasets
     save_dataset(train_data, os.path.join(args.output_dir, 'train.pkl'))
     save_dataset(val_data, os.path.join(args.output_dir, 'val.pkl'))
     save_dataset(test_data, os.path.join(args.output_dir, 'test.pkl'))
-    save_dataset(label2id, os.path.join(args.output_dir, 'label2id.pkl'))
+    save_dataset(stats, os.path.join(args.output_dir, 'stats.pkl'))
 
     print("\nDone!")
 

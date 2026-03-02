@@ -41,7 +41,7 @@ from uer.utils.seed import set_seed
 from uer.model_saver import save_model
 from uer.utils.constants import PAD_ID
 from uer.utils import *
-from uer.opts import fine_tuning_opts
+from uer.opts import finetune_opts
 
 
 class Stage1Classifier(nn.Module):
@@ -181,6 +181,15 @@ def load_pretrained_encoder(model, pretrained_path, encoder_type='raw'):
         print(f"  ✗ Load incomplete:")
         if emb_result.missing_keys:
             print(f"    Missing embedding keys ({len(emb_result.missing_keys)}): {emb_result.missing_keys}")
+
+            # CRITICAL: Check for temporal_embedding in Size encoder
+            if encoder_type == 'size' and 'temporal_embedding.weight' in emb_result.missing_keys:
+                print(f"    ⚠️  CRITICAL: temporal_embedding.weight is missing!")
+                print(f"    This indicates the pretrained model was trained WITHOUT IAT temporal information.")
+                print(f"    The temporal_embedding layer will use random initialization,")
+                print(f"    which will hurt performance. Please use a pretrained model that includes IAT.")
+                raise ValueError("Pretrained model missing temporal_embedding! Use a model trained with IAT.")
+
         if emb_result.unexpected_keys:
             print(f"    Unexpected embedding keys ({len(emb_result.unexpected_keys)}): {emb_result.unexpected_keys}")
         if enc_result.missing_keys:
@@ -318,9 +327,9 @@ def build_optimizer(args, model):
 
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-         'weight_decay_rate': 0.01},
+         'weight_decay': 0.01},
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
-         'weight_decay_rate': 0.0}
+         'weight_decay': 0.0}
     ]
 
     if args.optimizer in ["adamw"]:
@@ -347,7 +356,7 @@ def build_optimizer(args, model):
 
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    fine_tuning_opts(parser)
+    finetune_opts(parser)
     
 
     # Path options
@@ -374,6 +383,12 @@ def main():
     # Sequence lengths
     parser.add_argument("--seq_length_raw", type=int, default=512)
     parser.add_argument("--seq_length_size", type=int, default=256)
+
+    # GPU options
+    parser.add_argument("--world_size", type=int, default=1,
+                        help="Total number of processes (GPUs) for training.")
+    parser.add_argument("--gpu_ranks", default=[], nargs='+', type=int,
+                        help="List of GPU ranks to use. E.g., --gpu_ranks 2 3 to use GPU 2 and 3.")
 
     args = parser.parse_args()
 
@@ -423,14 +438,44 @@ def main():
     if args.modality in ['size', 'both']:
         load_pretrained_encoder(model, args.pretrained_size_path, 'size')
 
-    # Move to device
-    args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {args.device}")
-    model = model.to(args.device)
+    # Setup GPU device(s)
+    ranks_num = len(args.gpu_ranks)
 
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-        model = torch.nn.DataParallel(model)
+    if args.world_size > 1 and ranks_num > 1:
+        # Multi-GPU mode with DataParallel
+        assert torch.cuda.is_available(), "No available GPUs."
+        assert ranks_num <= torch.cuda.device_count(), "Specified GPUs exceed available GPUs."
+
+        # Set the primary device to the first specified GPU
+        primary_gpu = args.gpu_ranks[0]
+        args.device = torch.device(f"cuda:{primary_gpu}")
+        model = model.to(args.device)
+
+        # Use DataParallel with specified GPUs
+        model = torch.nn.DataParallel(model, device_ids=args.gpu_ranks)
+        print(f"Using DataParallel on GPUs: {args.gpu_ranks}")
+
+    elif ranks_num == 1:
+        # Single GPU mode with specified GPU
+        assert torch.cuda.is_available(), "No available GPUs."
+        gpu_id = args.gpu_ranks[0]
+        assert gpu_id < torch.cuda.device_count(), f"GPU {gpu_id} not available (only {torch.cuda.device_count()} GPUs)."
+
+        args.device = torch.device(f"cuda:{gpu_id}")
+        model = model.to(args.device)
+        print(f"Using single GPU: {gpu_id}")
+
+    elif torch.cuda.is_available():
+        # Default: use cuda:0
+        args.device = torch.device("cuda:0")
+        model = model.to(args.device)
+        print(f"Using default GPU: cuda:0")
+
+    else:
+        # CPU mode
+        args.device = torch.device("cpu")
+        model = model.to(args.device)
+        print("Using CPU mode")
 
     # Build optimizer
     args.train_steps = int(len(train_data) * args.epochs_num / args.batch_size) + 1

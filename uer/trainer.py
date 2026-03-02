@@ -109,7 +109,17 @@ def train_and_validate(args):
     # Load or initialize parameters.
     if args.pretrained_model_path is not None:
         # Initialize with pretrained model.
-        model = load_model(model, args.pretrained_model_path) 
+        model = load_model(model, args.pretrained_model_path)
+    elif args.target == "multimodal":
+        # Multimodal model loads Stage 1 weights inside build_model(),
+        # only randomly initialize non-pretrained components (fusion, target, projections).
+        pretrained_prefixes = ('embedding_raw.', 'encoder_raw.', 'embedding_size.', 'encoder_size.',
+                               'embedding_raw_m.', 'encoder_raw_m.', 'embedding_size_m.', 'encoder_size_m.',
+                               'itc_proj_raw_m.', 'itc_proj_size_m.')
+        for n, p in list(model.named_parameters()):
+            if "gamma" not in n and "beta" not in n:
+                if not n.startswith(pretrained_prefixes):
+                    p.data.normal_(0, 0.02)
     else:
         # Initialize with normal distribution.
         for n, p in list(model.named_parameters()):
@@ -463,17 +473,11 @@ class MultiModalTrainer(Trainer):
         """
         raw_src, raw_packet_ids, raw_directions, size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal = batch
 
-        # Forward through model
-        if hasattr(model, 'module'):
-            loss_dict = model.module(
-                raw_src, raw_packet_ids, raw_directions,
-                size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal
-            )
-        else:
-            loss_dict = model(
-                raw_src, raw_packet_ids, raw_directions,
-                size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal
-            )
+        # Forward through model (must call through DDP wrapper for gradient synchronization)
+        loss_dict = model(
+            raw_src, raw_packet_ids, raw_directions,
+            size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal
+        )
 
         # Extract losses
         itc_loss = loss_dict['itc_loss']
@@ -640,10 +644,10 @@ def worker(proc_id, gpu_ranks, args, model):
                     other_params_decay.append(p)
 
         optimizer_grouped_parameters = [
-            {"params": encoder_params_decay, "lr": encoder_lr, "weight_decay_rate": 0.01},
-            {"params": encoder_params_no_decay, "lr": encoder_lr, "weight_decay_rate": 0.0},
-            {"params": other_params_decay, "lr": args.learning_rate, "weight_decay_rate": 0.01},
-            {"params": other_params_no_decay, "lr": args.learning_rate, "weight_decay_rate": 0.0},
+            {"params": encoder_params_decay, "lr": encoder_lr, "weight_decay": 0.01},
+            {"params": encoder_params_no_decay, "lr": encoder_lr, "weight_decay": 0.0},
+            {"params": other_params_decay, "lr": args.learning_rate, "weight_decay": 0.01},
+            {"params": other_params_no_decay, "lr": args.learning_rate, "weight_decay": 0.0},
         ]
 
         print(f"  Encoder params (lr={encoder_lr:.2e}): "
@@ -653,8 +657,8 @@ def worker(proc_id, gpu_ranks, args, model):
     else:
         # Non-multimodal: all parameters use same learning rate
         optimizer_grouped_parameters = [
-            {"params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], "weight_decay_rate": 0.01},
-            {"params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], "weight_decay_rate": 0.0}
+            {"params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], "weight_decay": 0.01},
+            {"params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], "weight_decay": 0.0}
         ]
 
     if args.optimizer in ["adamw"]:
@@ -679,12 +683,20 @@ def worker(proc_id, gpu_ranks, args, model):
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
         args.amp = amp
 
+    debug = True
     if args.dist_train:
         print("Initialize multiprocessing distributed training environment...")
         dist.init_process_group(backend=args.backend,
                                 init_method=args.master_ip,
                                 world_size=args.world_size,
                                 rank=rank)
+        if debug:
+            print("Debug: dist init finished")
+            torch.cuda.synchronize()
+            print(f"Rank{rank}: CUDA synchronized")
+            dist.barrier()
+            print(f"Rank{rank}: Barrier passed")
+            
         model = DistributedDataParallel(model, device_ids=[gpu_id], find_unused_parameters=True)
         print("Worker %d is training ... " % rank)
     else:

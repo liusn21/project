@@ -67,7 +67,6 @@ class MultiModalModel(nn.Module):
         self.queue_size = queue_size
         self.momentum = momentum
         self.itc_temp = getattr(args, 'itc_temperature', 0.07)
-        self.itm_temp = getattr(args, 'itm_temperature', 0.07)
 
         # ===== Main Encoders =====
         self.embedding_raw = embedding_raw
@@ -222,22 +221,25 @@ class MultiModalModel(nn.Module):
         size_cls = size_output[:, 0, :]  # [batch, hidden]
 
         # ===== Step 3: Encode with Momentum Encoders (no gradient) =====
+        # Note: momentum update AFTER forward pass, so momentum encoder uses
+        # the previous iteration's EMA state (standard ALBEF/MoCo practice)
         with torch.no_grad():
-            self._momentum_update()
-
             raw_emb_m = self.embedding_raw_m(raw_src, raw_packet_ids, raw_directions)
             raw_output_m = self.encoder_raw_m(raw_emb_m, raw_seg)
 
             size_emb_m = self.embedding_size_m(size_src, iat_src)  # Now takes both size and IAT
             size_output_m = self.encoder_size_m(size_emb_m, size_seg)
 
-            # Extract CLS tokens and project
+            # Extract CLS tokens and project (using previous momentum state)
             raw_cls_m = raw_output_m[:, 0, :]  # [batch, hidden]
             size_cls_m = size_output_m[:, 0, :]  # [batch, hidden]
 
             # Project momentum features (using momentum projection layers)
             raw_cls_m_proj = F.normalize(self.itc_proj_raw_m(raw_cls_m), dim=-1)
             size_cls_m_proj = F.normalize(self.itc_proj_size_m(size_cls_m), dim=-1)
+
+            # Update momentum encoders and projections AFTER using them
+            self._momentum_update()
 
         # ===== Step 4: ITC Loss =====
         itc_loss, sim_r2s, sim_s2r = self.target.forward_itc(
@@ -262,7 +264,7 @@ class MultiModalModel(nn.Module):
         # ===== Step 7: Hard Negative Sampling for ITM =====
         # Sample hard negative indices based on ITC similarity
         neg_size_idx, neg_raw_idx = self.target.sample_hard_negatives(
-            sim_r2s, sim_s2r, batch_size, temperature=self.itm_temp
+            sim_r2s, sim_s2r, batch_size
         )
 
         # ===== Step 8: Fusion for Negative Samples =====

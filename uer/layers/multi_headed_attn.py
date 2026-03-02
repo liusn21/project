@@ -34,8 +34,8 @@ class MultiHeadedAttention(nn.Module):
             position_bias: [1 x heads_num x seq_length x seq_length]
             logits_gate: Optional gate for cross-attention control.
                          Shape: [batch_size x heads_num x seq_length_q x 1] or broadcastable.
-                         Values in [0, 1]. When gate=0, attention to keys is suppressed.
-                         Applied as: scores = scores - (1 - gate) * 10000.0
+                         Values in [0, 1]. When gate=0, cross-attention output is suppressed.
+                         Applied as: attn_output = attn_output * gate (per-head, per-position)
         Returns:
             output: [batch_size x seq_length_q x hidden_size]
             probs: [batch_size x heads_num x seq_length_q x seq_length_k]
@@ -66,14 +66,21 @@ class MultiHeadedAttention(nn.Module):
         # Apply padding mask
         scores = scores + mask
 
-        # Apply logits gate (for cross-attention modality control)
-        # gate=1: no change; gate=0: scores -> -10000 (attention suppressed)
-        if logits_gate is not None:
-            gate_mask = (1.0 - logits_gate) * -10000.0
-            scores = scores + gate_mask
+        # === OLD: Additive gate on logits ===
+        # if logits_gate is not None:
+        #     gate_mask = (1.0 - logits_gate) * -10000.0
+        #     scores = scores + gate_mask
 
         probs = nn.Softmax(dim=-1)(scores)
         probs = self.dropout(probs)
-        output = unshape(torch.matmul(probs, value))
+
+        # === NEW: Output-level gate (per-head, per-position) ===
+        # gate: [B, H, L_q, 1] × attn_output: [B, H, L_q, d] → [B, H, L_q, d]
+        # gate=1: full cross-attention; gate=0: output zeroed, residual preserves self-attention
+        attn_output = torch.matmul(probs, value)  # [B, H, L_q, d]
+        if logits_gate is not None:
+            attn_output = attn_output * logits_gate
+        output = unshape(attn_output)
+
         output = self.final_linear(output)
         return output, probs

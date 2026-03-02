@@ -12,11 +12,13 @@ Usage:
         --label2id_path datasets/processed/label2id.pkl \
         --vocab_path_raw models/vocab_raw.txt \
         --vocab_path_size models/vocab_size.txt \
+        --vocab_path_temporal models/vocab_temporal.txt \
         --pretrained_model_path models/multimodal_stage2.bin \
         --output_model_path models/classifier_stage2.bin \
         --config_path models/bert/base_config.json \
         --epochs_num 10 \
-        --batch_size 32
+        --batch_size 32 \
+        --use_fusion_gate  # Add this if pretrained model was trained with gate
 """
 
 import os
@@ -121,7 +123,8 @@ class Stage2Classifier(nn.Module):
 
         # Fusion module
         num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
-        self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers)
+        use_fusion_gate = getattr(args, 'use_fusion_gate', False)
+        self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_gate=use_fusion_gate)
 
         # Classification head (concat fused CLS tokens)
         # Input: [batch, 2 * hidden_size]
@@ -180,10 +183,14 @@ def load_pretrained_model(model, pretrained_path):
     Load pretrained Stage 2 multimodal model weights
 
     The pretrained model contains:
-        - embedding_raw, encoder_raw
-        - embedding_size, encoder_size
-        - fusion
-        - (momentum encoders and target are not needed for classification)
+        - embedding_raw, encoder_raw (main encoders)
+        - embedding_size, encoder_size (main encoders with temporal_embedding)
+        - fusion (fusion layers)
+        - momentum encoders (*_m), ITC projections, target layers, queues (excluded)
+
+    Total params in multimodal.bin: 1226
+        - Loaded: 803 (embedding_raw, encoder_raw, embedding_size, encoder_size, fusion)
+        - Excluded: 423 (momentum, ITC, target, queues)
     """
     if pretrained_path is None:
         return
@@ -191,9 +198,11 @@ def load_pretrained_model(model, pretrained_path):
     print(f"Loading pretrained multimodal model from {pretrained_path}")
     state_dict = torch.load(pretrained_path, map_location='cpu')
 
-    # Filter out momentum encoders and target (not needed for classification)
+    # Filter out momentum encoders, ITC projections, target layers, and queues
+    # These are only used during pretraining and not needed for classification
     exclude_prefixes = ['embedding_raw_m', 'encoder_raw_m',
                         'embedding_size_m', 'encoder_size_m',
+                        'itc_proj_raw_m', 'itc_proj_size_m',
                         'target', 'raw_queue', 'size_queue', 'queue_ptr']
 
     filtered_state = {}
@@ -208,18 +217,47 @@ def load_pretrained_model(model, pretrained_path):
     classifier_missing = [k for k in missing if k.startswith('classifier')]
     other_missing = [k for k in missing if not k.startswith('classifier')]
 
+    # Count excluded parameters by category
+    excluded_count = len(state_dict) - len(filtered_state)
+
     print(f"  Checkpoint total keys: {len(state_dict)}")
-    print(f"  Filtered keys (exclude momentum/target): {len(filtered_state)}")
+    print(f"  Excluded keys (momentum/ITC/target/queues): {excluded_count}")
+    print(f"  Filtered keys (should be loaded): {len(filtered_state)}")
     print(f"  Missing keys: {len(missing)} (classifier: {len(classifier_missing)}, other: {len(other_missing)})")
     print(f"  Unexpected keys: {len(unexpected)}")
 
     if len(other_missing) == 0 and len(unexpected) == 0:
-        print(f"  All encoder/fusion parameters loaded successfully!")
+        # Count loaded parameters by module
+        from collections import defaultdict
+        loaded_by_module = defaultdict(int)
+        for k in filtered_state.keys():
+            module = k.split('.')[0]
+            loaded_by_module[module] += 1
+
+        print(f"  ✓ All encoder/fusion parameters loaded successfully!")
+        print(f"    Loaded modules:")
+        for module in ['embedding_raw', 'encoder_raw', 'embedding_size', 'encoder_size', 'fusion']:
+            if module in loaded_by_module:
+                print(f"      - {module}: {loaded_by_module[module]} params")
+
+        # Verify temporal_embedding was loaded
+        if 'embedding_size.temporal_embedding.weight' in filtered_state:
+            print(f"    ✓ temporal_embedding loaded (IAT support enabled)")
+
         print(f"  Classifier randomly initialized ({len(classifier_missing)} params)")
     else:
-        print(f"  Load incomplete:")
+        print(f"  ✗ Load incomplete:")
         if other_missing:
             print(f"    Missing non-classifier keys ({len(other_missing)}): {other_missing[:10]}...")
+
+            # CRITICAL: Check for temporal_embedding in Size encoder
+            if 'embedding_size.temporal_embedding.weight' in other_missing:
+                print(f"    ⚠️  CRITICAL: embedding_size.temporal_embedding.weight is missing!")
+                print(f"    This indicates the pretrained model was trained WITHOUT IAT temporal information.")
+                print(f"    The temporal_embedding layer will use random initialization,")
+                print(f"    which will significantly hurt performance. Please use a pretrained model that includes IAT.")
+                raise ValueError("Pretrained model missing temporal_embedding! Use a Stage 2 model trained with IAT.")
+
         if unexpected:
             print(f"    Unexpected keys ({len(unexpected)}): {unexpected[:10]}...")
 
@@ -559,6 +597,11 @@ def main():
     # Model options
     parser.add_argument("--num_fusion_layers", type=int, default=6,
                         help="Number of fusion layers (should match pretrained model)")
+    parser.add_argument("--use_fusion_gate", action="store_true",
+                        help="Enable learnable gate mechanism in fusion layers. "
+                             "MUST match the pretrained model's configuration! "
+                             "If pretrained model was trained with --use_fusion_gate, "
+                             "this flag MUST be set during fine-tuning to load gate weights.")
 
     # Sequence lengths
     parser.add_argument("--seq_length_raw", type=int, default=512)
