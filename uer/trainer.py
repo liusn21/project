@@ -611,7 +611,6 @@ def worker(proc_id, gpu_ranks, args, model):
         encoder_lr_ratio = getattr(args, 'encoder_lr_ratio', 0.1)
         encoder_lr = args.learning_rate * encoder_lr_ratio
 
-        print(f"=== ALBEF-style Multi-Modal Training ===")
         print(f"  Encoder lr: {encoder_lr:.2e} (ratio={encoder_lr_ratio})")
         print(f"  Fusion/Target lr: {args.learning_rate:.2e}")
 

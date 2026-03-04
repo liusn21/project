@@ -5,7 +5,7 @@ from uer.layers.layer_norm import LayerNorm
 from uer.utils import *
 
 
-def soft_label_kl_loss(logits, target_idx, num_classes, sigma=10):
+def soft_label_kl_loss(logits, target_idx, num_classes, sigma=10, num_special_tokens=5):
     """
     Compute KL divergence loss with soft Gaussian labels.
 
@@ -19,6 +19,8 @@ def soft_label_kl_loss(logits, target_idx, num_classes, sigma=10):
         num_classes: int - vocabulary size
         sigma: float - standard deviation of Gaussian, controls tolerance range
                       (±3σ covers ~99.7% probability mass)
+        num_special_tokens: int - number of special tokens at the beginning of vocab
+                            (PAD, UNK, CLS, SEP, MASK) to exclude from soft labels
 
     Returns:
         loss: scalar - KL divergence loss (equivalent to cross-entropy with soft labels)
@@ -34,6 +36,10 @@ def soft_label_kl_loss(logits, target_idx, num_classes, sigma=10):
     target_soft = torch.exp(
         -(x.unsqueeze(0) - target_idx.unsqueeze(1).float()) ** 2 / (2 * sigma ** 2)
     )
+    # Zero out special token positions (PAD, UNK, CLS, SEP, MASK) before normalization
+    # to prevent the model from being trained to predict special tokens
+    if num_special_tokens > 0:
+        target_soft[:, :num_special_tokens] = 0.0
     # Normalize to probability distribution
     target_soft = target_soft / target_soft.sum(dim=1, keepdim=True)
 

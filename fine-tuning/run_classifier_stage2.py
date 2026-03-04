@@ -104,7 +104,7 @@ class Stage2Classifier(nn.Module):
         - Raw encoder (pretrained): embedding + transformer
         - Size encoder (pretrained): embedding + transformer
         - Fusion module (pretrained): 6-layer bidirectional cross-attention
-        - Concat fused CLS tokens -> Classification head
+        - Concat fused CLS + mean pooling -> Classification head
     """
 
     def __init__(self, args, vocab_size_raw, vocab_size_size, vocab_size_temporal, labels_num):
@@ -126,16 +126,16 @@ class Stage2Classifier(nn.Module):
         use_fusion_gate = getattr(args, 'use_fusion_gate', False)
         self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_gate=use_fusion_gate)
 
-        # Classification head (concat fused CLS tokens)
-        # Input: [batch, 2 * hidden_size]
+        # Classification head (CLS tokens + mean pooling)
+        # Input: [batch, 4 * hidden_size] = [raw_cls, size_cls, raw_mean, size_mean]
         self.classifier = nn.Sequential(
-            nn.Linear(2 * args.hidden_size, args.hidden_size),
+            nn.Linear(4 * args.hidden_size, args.hidden_size),
             nn.Tanh(),
             nn.Dropout(args.dropout),
             nn.Linear(args.hidden_size, labels_num)
         )
 
-    def forward(self, raw_src, packet_ids, directions, size_src, iat_src, tgt=None):
+    def forward(self, raw_src, packet_ids, directions, size_src, iat_src):
         """
         Args:
             raw_src: [batch, seq_len_raw] - Raw token IDs
@@ -143,10 +143,9 @@ class Stage2Classifier(nn.Module):
             directions: [batch, seq_len_raw] - Direction indices
             size_src: [batch, seq_len_size] - Size token IDs
             iat_src: [batch, seq_len_size] - IAT temporal token IDs
-            tgt: [batch] - Labels (optional)
 
         Returns:
-            loss, logits if tgt is provided, else None, logits
+            logits: [batch, labels_num]
         """
         # Raw encoder
         raw_emb = self.embedding_raw(raw_src, packet_ids, directions)
@@ -165,17 +164,20 @@ class Stage2Classifier(nn.Module):
         raw_cls = raw_fused[:, 0, :]  # [batch, hidden]
         size_cls = size_fused[:, 0, :]  # [batch, hidden]
 
-        # Concat CLS tokens
-        combined_cls = torch.cat([raw_cls, size_cls], dim=-1)  # [batch, 2*hidden]
+        # Mean pooling over non-CLS, non-PAD positions
+        raw_mask = raw_seg[:, 1:].unsqueeze(-1).float()  # [batch, seq_len-1, 1]
+        raw_mean = (raw_fused[:, 1:, :] * raw_mask).sum(1) / (raw_mask.sum(1) + 1e-9)  # [batch, hidden]
+
+        size_mask = size_seg[:, 1:].unsqueeze(-1).float()
+        size_mean = (size_fused[:, 1:, :] * size_mask).sum(1) / (size_mask.sum(1) + 1e-9)  # [batch, hidden]
+
+        # Concat CLS + mean pooling: [batch, 4*hidden]
+        combined = torch.cat([raw_cls, size_cls, raw_mean, size_mean], dim=-1)
 
         # Classification
-        logits = self.classifier(combined_cls)  # [batch, labels_num]
+        logits = self.classifier(combined)  # [batch, labels_num]
 
-        if tgt is not None:
-            loss = nn.NLLLoss()(nn.LogSoftmax(dim=-1)(logits), tgt)
-            return loss.unsqueeze(0), logits  # Keep dims to avoid DataParallel warning
-        else:
-            return None, logits
+        return logits
 
 
 def load_pretrained_model(model, pretrained_path):
@@ -367,7 +369,7 @@ def train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema):
         model.zero_grad()
 
         # Get logits from model
-        _, logits = model(raw_src, packet_ids, directions, size_src, iat_src, None)
+        logits = model(raw_src, packet_ids, directions, size_src, iat_src)
 
         # Compute loss
         loss = criterion(logits, tgt)
@@ -416,7 +418,7 @@ def evaluate(args, model, eval_data, print_confusion=False):
             iat_src = iat_src.to(args.device)
             tgt = tgt.to(args.device)
 
-            _, logits = model(raw_src, packet_ids, directions, size_src, iat_src, None)
+            logits = model(raw_src, packet_ids, directions, size_src, iat_src)
             pred = torch.argmax(logits, dim=-1)
 
             for p, g in zip(pred.cpu().tolist(), tgt.cpu().tolist()):
@@ -577,6 +579,58 @@ def build_optimizer(args, model):
     return optimizer, scheduler
 
 
+def freeze_backbone(model):
+    """Freeze all parameters except classifier head"""
+    actual_model = model.module if hasattr(model, 'module') else model
+    for name, param in actual_model.named_parameters():
+        if not name.startswith('classifier'):
+            param.requires_grad = False
+    trainable = sum(p.numel() for p in actual_model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in actual_model.parameters())
+    print(f"  Backbone frozen: {trainable}/{total} params trainable")
+
+
+def unfreeze_backbone(model):
+    """Unfreeze all parameters"""
+    actual_model = model.module if hasattr(model, 'module') else model
+    for param in actual_model.parameters():
+        param.requires_grad = True
+    trainable = sum(p.numel() for p in actual_model.parameters() if p.requires_grad)
+    print(f"  All params unfrozen: {trainable} params trainable")
+
+
+def build_phase1_optimizer(args, model):
+    """Build optimizer for Phase 1: only classifier parameters"""
+    actual_model = model.module if hasattr(model, 'module') else model
+    no_decay = ['bias', 'gamma', 'beta', 'LayerNorm']
+
+    classifier_params = []
+    classifier_params_no_decay = []
+    for name, param in actual_model.named_parameters():
+        if param.requires_grad:
+            if any(nd in name for nd in no_decay):
+                classifier_params_no_decay.append(param)
+            else:
+                classifier_params.append(param)
+
+    optimizer_grouped_parameters = [
+        {'params': classifier_params, 'weight_decay': 0.01},
+        {'params': classifier_params_no_decay, 'weight_decay': 0.0}
+    ]
+
+    optimizer = str2optimizer["adamw"](
+        optimizer_grouped_parameters, lr=args.phase1_lr, correct_bias=False
+    )
+
+    train_steps = int(len(args._phase1_train_data) * args.phase1_epochs / args.batch_size) + 1
+    scheduler = str2scheduler["cosine"](
+        optimizer, int(train_steps * args.warmup), train_steps
+    )
+
+    print(f"  Phase 1 optimizer: AdamW, lr={args.phase1_lr:.1e}, steps={train_steps}")
+    return optimizer, scheduler
+
+
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     finetune_opts(parser)
@@ -625,6 +679,17 @@ def main():
                         help="Encoder LR = base_LR * this ratio (default 0.1)")
     parser.add_argument("--llrd_fusion_ratio", type=float, default=0.5,
                         help="Fusion LR = base_LR * this ratio (default 0.5)")
+
+    # Two-Phase Training
+    parser.add_argument("--two_phase", action="store_true",
+                        help="Enable two-phase training: Phase 1 freezes backbone, Phase 2 unfreezes all")
+    parser.add_argument("--phase1_epochs", type=int, default=3,
+                        help="Number of epochs for Phase 1 (classifier warmup)")
+    parser.add_argument("--phase1_lr", type=float, default=1e-3,
+                        help="Learning rate for Phase 1 (only classifier)")
+    parser.add_argument("--phase2_scheduler", type=str, default="cosine",
+                        choices=["linear", "cosine", "cosine_with_restarts", "constant_with_warmup"],
+                        help="Scheduler for Phase 2 (default: cosine)")
 
     # GPU options
     parser.add_argument("--world_size", type=int, default=1,
@@ -715,10 +780,6 @@ def main():
         model = model.to(args.device)
         print("Using CPU mode")
 
-    # Build optimizer
-    args.train_steps = int(len(train_data) * args.epochs_num / args.batch_size) + 1
-    optimizer, scheduler = build_optimizer(args, model)
-
     # Build loss criterion
     print("\nSetting up loss function...")
     class_weights = None
@@ -735,43 +796,81 @@ def main():
     print(f"  Label smoothing: {args.label_smoothing}")
     print(f"  Class weights: {'Enabled (' + args.class_weight_method + ')' if args.use_class_weight else 'Disabled'}")
     print(f"  Gradient clipping: {args.max_grad_norm if args.max_grad_norm > 0 else 'Disabled'}")
-    if args.use_llrd:
-        print(f"  LLRD: encoder={args.llrd_encoder_ratio}x, fusion={args.llrd_fusion_ratio}x, classifier=1x")
-
-    # Setup EMA (initialized after first epoch)
-    ema = EMA(model, decay=0.999)
-    print(f"  EMA: Enabled (decay=0.999, init after epoch 1)")
-
-    # Training loop
-    print("\n" + "=" * 50)
-    print("Starting training...")
-    print("=" * 50)
 
     best_f1 = 0.0
     best_epoch = 0
     patience_counter = 0
 
-    for epoch in range(1, args.epochs_num + 1):
-        print(f"\nEpoch {epoch}/{args.epochs_num}")
-        print("-" * 30)
+    if args.two_phase:
+        # ========== TWO-PHASE TRAINING ==========
+        print("\n" + "=" * 50)
+        print("Two-Phase Training Mode")
+        print("=" * 50)
 
-        # Train
-        avg_loss = train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema)
-        print(f"Training loss: {avg_loss:.4f}")
+        # ===== Phase 1: Classifier Warmup (backbone frozen) =====
+        print(f"\n--- Phase 1: Classifier Warmup ({args.phase1_epochs} epochs) ---")
+        freeze_backbone(model)
 
-        # Initialize EMA after first epoch
-        if epoch == 1:
-            ema.init_shadow()
-            print("  EMA initialized with epoch 1 weights")
+        # Store train_data reference for build_phase1_optimizer
+        args._phase1_train_data = train_data
+        p1_optimizer, p1_scheduler = build_phase1_optimizer(args, model)
+        del args._phase1_train_data
 
-        # Evaluate on dev set
-        print("\nValidation:")
-        print("  [Original weights]")
-        f1_orig, _ = evaluate(args, model, dev_data)
+        # No EMA in Phase 1 (weights changing too fast)
+        ema_dummy = EMA(model, decay=0.999)  # placeholder, never initialized
 
-        # EMA evaluation (only after initialization)
-        use_ema_for_save = False
-        if ema.initialized:
+        for epoch in range(1, args.phase1_epochs + 1):
+            print(f"\n[Phase 1] Epoch {epoch}/{args.phase1_epochs}")
+            print("-" * 30)
+
+            avg_loss = train_epoch(args, model, p1_optimizer, p1_scheduler, train_data, criterion, ema_dummy)
+            print(f"Training loss: {avg_loss:.4f}")
+
+            print("Validation:")
+            f1, _ = evaluate(args, model, dev_data)
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_epoch = epoch
+                save_model(model, args.output_model_path)
+                print(f"New best model saved! F1: {best_f1:.4f}")
+
+        print(f"\nPhase 1 complete. Best F1: {best_f1:.4f}")
+
+        # ===== Phase 2: Full Fine-Tuning (all params unfrozen) =====
+        print(f"\n--- Phase 2: Full Fine-Tuning ({args.epochs_num} epochs) ---")
+        unfreeze_backbone(model)
+
+        # Build Phase 2 optimizer with LLRD
+        args.train_steps = int(len(train_data) * args.epochs_num / args.batch_size) + 1
+        # Override scheduler for Phase 2
+        original_scheduler = args.scheduler
+        args.scheduler = args.phase2_scheduler
+        optimizer, scheduler = build_optimizer(args, model)
+        args.scheduler = original_scheduler
+
+        if args.use_llrd:
+            print(f"  LLRD: encoder={args.llrd_encoder_ratio}x, fusion={args.llrd_fusion_ratio}x, classifier=1x")
+
+        # Setup EMA for Phase 2 (initialized from Phase 1 trained weights)
+        ema = EMA(model, decay=0.999)
+        ema.init_shadow()
+        print(f"  EMA: Initialized from Phase 1 weights")
+
+        patience_counter = 0
+
+        for epoch in range(1, args.epochs_num + 1):
+            print(f"\n[Phase 2] Epoch {epoch}/{args.epochs_num}")
+            print("-" * 30)
+
+            avg_loss = train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema)
+            print(f"Training loss: {avg_loss:.4f}")
+
+            # Evaluate with both original and EMA weights
+            print("Validation:")
+            print("  [Original weights]")
+            f1_orig, _ = evaluate(args, model, dev_data)
+
             ema.apply_shadow()
             print("  [EMA weights]")
             f1_ema, _ = evaluate(args, model, dev_data)
@@ -779,33 +878,104 @@ def main():
 
             if f1_ema >= f1_orig:
                 f1 = f1_ema
-                use_ema_for_save = True
+                use_ema = True
                 print(f"  -> EMA wins ({f1_ema:.4f} >= {f1_orig:.4f})")
             else:
                 f1 = f1_orig
+                use_ema = False
                 print(f"  -> Original wins ({f1_orig:.4f} > {f1_ema:.4f})")
-        else:
-            f1 = f1_orig
 
-        # Save best model
-        if f1 > best_f1:
-            best_f1 = f1
-            best_epoch = epoch
-            patience_counter = 0
-            if use_ema_for_save:
-                ema.apply_shadow()
-                save_model(model, args.output_model_path)
-                ema.restore()
+            if f1 > best_f1:
+                best_f1 = f1
+                best_epoch = args.phase1_epochs + epoch
+                patience_counter = 0
+                if use_ema:
+                    ema.apply_shadow()
+                    save_model(model, args.output_model_path)
+                    ema.restore()
+                else:
+                    save_model(model, args.output_model_path)
+                print(f"New best model saved! F1: {best_f1:.4f}")
             else:
-                save_model(model, args.output_model_path)
-            print(f"New best model saved! F1: {best_f1:.4f}")
-        else:
-            patience_counter += 1
-            print(f"No improvement. Patience: {patience_counter}/{args.earlystop}")
+                patience_counter += 1
+                print(f"No improvement. Patience: {patience_counter}/{args.earlystop}")
 
-        if patience_counter >= args.earlystop:
-            print(f"Early stopping at epoch {epoch}")
-            break
+            if patience_counter >= args.earlystop:
+                print(f"Early stopping at Phase 2 epoch {epoch}")
+                break
+
+    else:
+        # ========== SINGLE-PHASE TRAINING (original behavior) ==========
+        args.train_steps = int(len(train_data) * args.epochs_num / args.batch_size) + 1
+        optimizer, scheduler = build_optimizer(args, model)
+
+        if args.use_llrd:
+            print(f"  LLRD: encoder={args.llrd_encoder_ratio}x, fusion={args.llrd_fusion_ratio}x, classifier=1x")
+
+        # Setup EMA (initialized after first epoch)
+        ema = EMA(model, decay=0.999)
+        print(f"  EMA: Enabled (decay=0.999, init after epoch 1)")
+
+        # Training loop
+        print("\n" + "=" * 50)
+        print("Starting training...")
+        print("=" * 50)
+
+        for epoch in range(1, args.epochs_num + 1):
+            print(f"\nEpoch {epoch}/{args.epochs_num}")
+            print("-" * 30)
+
+            # Train
+            avg_loss = train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema)
+            print(f"Training loss: {avg_loss:.4f}")
+
+            # Initialize EMA after first epoch
+            if epoch == 1:
+                ema.init_shadow()
+                print("  EMA initialized with epoch 1 weights")
+
+            # Evaluate on dev set
+            print("\nValidation:")
+            print("  [Original weights]")
+            f1_orig, _ = evaluate(args, model, dev_data)
+
+            # EMA evaluation (only after initialization)
+            use_ema_for_save = False
+            if ema.initialized:
+                ema.apply_shadow()
+                print("  [EMA weights]")
+                f1_ema, _ = evaluate(args, model, dev_data)
+                ema.restore()
+
+                if f1_ema >= f1_orig:
+                    f1 = f1_ema
+                    use_ema_for_save = True
+                    print(f"  -> EMA wins ({f1_ema:.4f} >= {f1_orig:.4f})")
+                else:
+                    f1 = f1_orig
+                    print(f"  -> Original wins ({f1_orig:.4f} > {f1_ema:.4f})")
+            else:
+                f1 = f1_orig
+
+            # Save best model
+            if f1 > best_f1:
+                best_f1 = f1
+                best_epoch = epoch
+                patience_counter = 0
+                if use_ema_for_save:
+                    ema.apply_shadow()
+                    save_model(model, args.output_model_path)
+                    ema.restore()
+                else:
+                    save_model(model, args.output_model_path)
+                print(f"New best model saved! F1: {best_f1:.4f}")
+            else:
+                patience_counter += 1
+                print(f"No improvement. Patience: {patience_counter}/{args.earlystop}")
+
+            if patience_counter >= args.earlystop:
+                print(f"Early stopping at epoch {epoch}")
+                break
 
     # Final evaluation on test set
     if test_data:
