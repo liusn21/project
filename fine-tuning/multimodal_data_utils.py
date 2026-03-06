@@ -32,10 +32,11 @@ from uer.utils.constants import CLS_TOKEN, SEP_TOKEN, PAD_ID
 class MultiModalFlowExtractor:
     """Extract multi-modal features from a single PCAP file"""
 
-    def __init__(self, bytes_per_packet=64, max_raw_packets=8, max_size_packets=256):
+    def __init__(self, bytes_per_packet=64, max_raw_packets=8, max_size_packets=256, raw_token_type='bigram'):
         self.bytes_per_packet = bytes_per_packet
         self.max_raw_packets = max_raw_packets
         self.max_size_packets = max_size_packets
+        self.raw_token_type = raw_token_type
         self.epsilon = 1e-6  # For IAT computation
 
     def extract_pcap(self, pcap_path):
@@ -90,7 +91,7 @@ class MultiModalFlowExtractor:
 
                     # Raw modality (first 8 packets)
                     if raw_packet_count < self.max_raw_packets:
-                        bigram_hex_list = self._bytes_to_bigram_hex(payload[:self.bytes_per_packet])
+                        bigram_hex_list = self._bytes_to_hex_tokens(payload[:self.bytes_per_packet])
                         raw_bigrams.append(bigram_hex_list)
                         raw_directions.append(direction)
                         raw_packet_ids.append(raw_packet_count)
@@ -189,15 +190,22 @@ class MultiModalFlowExtractor:
         except Exception:
             return None
 
-    def _bytes_to_bigram_hex(self, payload_bytes):
-        """Convert bytes to bigram hex string list: ["4500", "0006", ...]"""
-        bigrams = []
-        for i in range(len(payload_bytes) - 1):
-            byte1 = payload_bytes[i]
-            byte2 = payload_bytes[i + 1]
-            bigram_hex = f"{byte1:02x}{byte2:02x}"
-            bigrams.append(bigram_hex)
-        return bigrams
+    def _bytes_to_hex_tokens(self, payload_bytes):
+        """Convert bytes to hex token list.
+
+        bigram mode: ["4500", "0006", ...] (sliding window, N-1 tokens)
+        byte mode:   ["45", "00", "06", ...] (individual bytes, N tokens)
+        """
+        if self.raw_token_type == 'byte':
+            return [f"{b:02x}" for b in payload_bytes]
+        else:
+            bigrams = []
+            for i in range(len(payload_bytes) - 1):
+                byte1 = payload_bytes[i]
+                byte2 = payload_bytes[i + 1]
+                bigram_hex = f"{byte1:02x}{byte2:02x}"
+                bigrams.append(bigram_hex)
+            return bigrams
 
     def _compute_iat_tokens(self, timestamps):
         """
@@ -330,6 +338,13 @@ def tokenize_raw_flow(flow_data, tokenizer_raw, seq_length_raw):
         packet_ids.append(8)
         directions.append(1)
 
+    # Validate token IDs are within embedding range
+    vocab_size = len(vocab)
+    for idx, v in enumerate(src):
+        if v < 0 or v >= vocab_size:
+            print(f"WARNING: raw token ID {v} at pos {idx} out of range [0, {vocab_size}), clamping")
+            src[idx] = min(max(v, 0), vocab_size - 1)
+
     return src, packet_ids, directions
 
 
@@ -413,6 +428,18 @@ def tokenize_size_iat_flow(flow_data, tokenizer_size, tokenizer_temporal, seq_le
     while len(iat_src) < seq_length_size:
         iat_src.append(PAD_ID)
 
+    # Validate token IDs are within embedding range
+    size_vocab_len = len(vocab_size)
+    for idx, v in enumerate(size_src):
+        if v < 0 or v >= size_vocab_len:
+            print(f"WARNING: size token ID {v} at pos {idx} out of range [0, {size_vocab_len}), clamping")
+            size_src[idx] = min(max(v, 0), size_vocab_len - 1)
+    temporal_vocab_len = len(vocab_temporal)
+    for idx, v in enumerate(iat_src):
+        if v < 0 or v >= temporal_vocab_len:
+            print(f"WARNING: IAT token ID {v} at pos {idx} out of range [0, {temporal_vocab_len}), clamping")
+            iat_src[idx] = min(max(v, 0), temporal_vocab_len - 1)
+
     return size_src, iat_src
 
 
@@ -421,7 +448,7 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
                     bytes_per_packet=64, max_raw_packets=8, max_size_packets=256,
                     min_samples_per_class=10, max_samples_per_class=500,
                     train_ratio=0.8, val_ratio=0.1, test_ratio=0.1,
-                    seed=42, test_dir=None):
+                    seed=42, test_dir=None, raw_token_type='bigram'):
     """
     Process all PCAP files in dataset directory
 
@@ -457,7 +484,8 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
     extractor = MultiModalFlowExtractor(
         bytes_per_packet=bytes_per_packet,
         max_raw_packets=max_raw_packets,
-        max_size_packets=max_size_packets
+        max_size_packets=max_size_packets,
+        raw_token_type=raw_token_type
     )
 
     # Collect all samples per label
@@ -683,6 +711,8 @@ def main():
     parser.add_argument('--bytes_per_packet', type=int, default=64)
     parser.add_argument('--max_raw_packets', type=int, default=8)
     parser.add_argument('--max_size_packets', type=int, default=256)
+    parser.add_argument('--raw_token_type', type=str, choices=['bigram', 'byte'], default='bigram',
+                        help='Raw tokenization: bigram (65K vocab, default) or byte (256 vocab)')
 
     # Dataset filtering
     parser.add_argument('--min_samples_per_class', type=int, default=10)
@@ -726,7 +756,8 @@ def main():
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
         seed=args.seed,
-        test_dir=args.test_dir
+        test_dir=args.test_dir,
+        raw_token_type=args.raw_token_type
     )
 
     # Save datasets

@@ -168,6 +168,9 @@ def main():
 
 
     args = parser.parse_args()
+    print("Training arguments:")
+    print(f"Learning rate: {args.learning_rate}")
+    print(f"Encoder learning rate ratio: {args.encoder_lr_ratio}")
 
     if args.target == "cls":
         assert args.labels_num is not None, "Cls target needs the denotation of the number of labels."

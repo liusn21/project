@@ -126,14 +126,19 @@ class Stage2Classifier(nn.Module):
         use_fusion_gate = getattr(args, 'use_fusion_gate', False)
         self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_gate=use_fusion_gate)
 
-        # Classification head (CLS tokens + mean pooling)
-        # Input: [batch, 4 * hidden_size] = [raw_cls, size_cls, raw_mean, size_mean]
-        self.classifier = nn.Sequential(
-            nn.Linear(4 * args.hidden_size, args.hidden_size),
-            nn.Tanh(),
-            nn.Dropout(args.dropout),
-            nn.Linear(args.hidden_size, labels_num)
-        )
+        # Classification head
+        self.simple_classifier = getattr(args, 'simple_classifier', False)
+        if self.simple_classifier:
+            # Simple: CLS-only, single linear layer (less overfitting)
+            self.classifier = nn.Linear(2 * args.hidden_size, labels_num)
+        else:
+            # Full: CLS + mean pooling, two-layer MLP
+            self.classifier = nn.Sequential(
+                nn.Linear(4 * args.hidden_size, args.hidden_size),
+                nn.Tanh(),
+                nn.Dropout(args.dropout),
+                nn.Linear(args.hidden_size, labels_num)
+            )
 
     def forward(self, raw_src, packet_ids, directions, size_src, iat_src):
         """
@@ -164,18 +169,17 @@ class Stage2Classifier(nn.Module):
         raw_cls = raw_fused[:, 0, :]  # [batch, hidden]
         size_cls = size_fused[:, 0, :]  # [batch, hidden]
 
-        # Mean pooling over non-CLS, non-PAD positions
-        raw_mask = raw_seg[:, 1:].unsqueeze(-1).float()  # [batch, seq_len-1, 1]
-        raw_mean = (raw_fused[:, 1:, :] * raw_mask).sum(1) / (raw_mask.sum(1) + 1e-9)  # [batch, hidden]
+        if self.simple_classifier:
+            combined = torch.cat([raw_cls, size_cls], dim=-1)  # [batch, 2*hidden]
+        else:
+            # Mean pooling over non-CLS, non-PAD positions
+            raw_mask = raw_seg[:, 1:].unsqueeze(-1).float()  # [batch, seq_len-1, 1]
+            raw_mean = (raw_fused[:, 1:, :] * raw_mask).sum(1) / (raw_mask.sum(1) + 1e-9)
+            size_mask = size_seg[:, 1:].unsqueeze(-1).float()
+            size_mean = (size_fused[:, 1:, :] * size_mask).sum(1) / (size_mask.sum(1) + 1e-9)
+            combined = torch.cat([raw_cls, size_cls, raw_mean, size_mean], dim=-1)  # [batch, 4*hidden]
 
-        size_mask = size_seg[:, 1:].unsqueeze(-1).float()
-        size_mean = (size_fused[:, 1:, :] * size_mask).sum(1) / (size_mask.sum(1) + 1e-9)  # [batch, hidden]
-
-        # Concat CLS + mean pooling: [batch, 4*hidden]
-        combined = torch.cat([raw_cls, size_cls, raw_mean, size_mean], dim=-1)
-
-        # Classification
-        logits = self.classifier(combined)  # [batch, labels_num]
+        logits = self.classifier(combined)
 
         return logits
 
@@ -666,6 +670,8 @@ def main():
                         help="Label smoothing factor (0.0 = no smoothing)")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Max gradient norm for clipping (0 = no clipping)")
+    parser.add_argument("--simple_classifier", action="store_true",
+                        help="Use simple CLS-only linear classifier instead of CLS+mean MLP")
     parser.add_argument("--use_class_weight", action="store_true",
                         help="Use class weights for imbalanced data")
     parser.add_argument("--class_weight_method", type=str, default="sqrt",

@@ -39,9 +39,10 @@ class FlowFeatureExtractor:
     Labels: Entire flow statistics (flow_bytes, flow_duration)
     """
 
-    def __init__(self, bytes_per_packet=64, max_packets=8):
+    def __init__(self, bytes_per_packet=64, max_packets=8, raw_token_type='bigram'):
         self.bytes_per_packet = bytes_per_packet
         self.max_packets = max_packets
+        self.raw_token_type = raw_token_type
         self.epsilon = 1e-6  # For IAT computation
 
     def extract_pcap(self, pcap_path):
@@ -109,7 +110,7 @@ class FlowFeatureExtractor:
                     # Feature extraction (first 8 packets only)
                     if raw_packet_count < self.max_packets:
                         # Raw modality
-                        bigram_hex_list = self._bytes_to_bigram_hex(payload[:self.bytes_per_packet])
+                        bigram_hex_list = self._bytes_to_hex_tokens(payload[:self.bytes_per_packet])
                         raw_bigrams.append(bigram_hex_list)
                         raw_directions.append(direction)
                         raw_packet_ids.append(raw_packet_count)
@@ -223,15 +224,22 @@ class FlowFeatureExtractor:
         except Exception:
             return None
 
-    def _bytes_to_bigram_hex(self, payload_bytes):
-        """Convert bytes to bigram hex string list: ["4500", "0006", ...]"""
-        bigrams = []
-        for i in range(len(payload_bytes) - 1):
-            byte1 = payload_bytes[i]
-            byte2 = payload_bytes[i + 1]
-            bigram_hex = f"{byte1:02x}{byte2:02x}"
-            bigrams.append(bigram_hex)
-        return bigrams
+    def _bytes_to_hex_tokens(self, payload_bytes):
+        """Convert bytes to hex token list.
+
+        bigram mode: ["4500", "0006", ...] (sliding window, N-1 tokens)
+        byte mode:   ["45", "00", "06", ...] (individual bytes, N tokens)
+        """
+        if self.raw_token_type == 'byte':
+            return [f"{b:02x}" for b in payload_bytes]
+        else:
+            bigrams = []
+            for i in range(len(payload_bytes) - 1):
+                byte1 = payload_bytes[i]
+                byte2 = payload_bytes[i + 1]
+                bigram_hex = f"{byte1:02x}{byte2:02x}"
+                bigrams.append(bigram_hex)
+            return bigrams
 
     def _compute_iat_tokens(self, timestamps):
         """
@@ -420,7 +428,8 @@ def process_pcap_dir(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal
                      seq_length_raw=512, seq_length_size=10,
                      bytes_per_packet=64, max_packets=8,
                      train_ratio=0.8, val_ratio=0.1, test_ratio=0.1,
-                     seed=42, min_flow_bytes=100, max_samples=None):
+                     seed=42, min_flow_bytes=100, max_samples=None,
+                     raw_token_type='bigram'):
     """
     Process all PCAP files in directory for flow prediction.
 
@@ -450,7 +459,8 @@ def process_pcap_dir(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal
 
     extractor = FlowFeatureExtractor(
         bytes_per_packet=bytes_per_packet,
-        max_packets=max_packets
+        max_packets=max_packets,
+        raw_token_type=raw_token_type
     )
 
     all_samples = []
@@ -614,6 +624,8 @@ def main():
     # Feature extraction params
     parser.add_argument('--bytes_per_packet', type=int, default=64)
     parser.add_argument('--max_packets', type=int, default=8)
+    parser.add_argument('--raw_token_type', type=str, choices=['bigram', 'byte'], default='bigram',
+                        help='Raw tokenization: bigram (65K vocab, default) or byte (256 vocab)')
 
     # Dataset filtering
     parser.add_argument('--min_flow_bytes', type=int, default=100,
@@ -657,7 +669,8 @@ def main():
         test_ratio=args.test_ratio,
         seed=args.seed,
         min_flow_bytes=args.min_flow_bytes,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        raw_token_type=args.raw_token_type
     )
 
     # Save datasets

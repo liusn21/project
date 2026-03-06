@@ -10,35 +10,31 @@ Multi-Modal Traffic Data Extractor V3 (uer框架兼容版 + IAT Temporal Informa
 输出格式：
 - corpus_raw.txt: raw packet bigrams
 - corpus_size.txt: packet sizes + IAT temporal tokens
+
+支持流式处理：
+- 使用 PcapReader 流式读取单个 PCAP（不一次性加载整个文件）
+- 处理结果立即写入磁盘，不在内存中累积
+- 适用于超大 pcap_dir，不会 OOM
 """
 
 import os
-import numpy as np
-from scapy.all import rdpcap
+import math
+from scapy.all import PcapReader
 from scapy.layers.inet import IP, TCP, UDP
 from tqdm import tqdm
-import binascii
 from multiprocessing import Pool, cpu_count
 import argparse
-import math
 
 
 class MultiModalExtractorV3:
 
-    def __init__(self, bytes_per_packet=64, max_raw_packets=8):
+    def __init__(self, bytes_per_packet=64, max_raw_packets=8, raw_token_type='bigram'):
         self.bytes_per_packet = bytes_per_packet
         self.max_raw_packets = max_raw_packets
+        self.raw_token_type = raw_token_type
 
     def extract_pcap(self, pcap_path):
-        """从PCAP提取特征，返回文本格式"""
-        try:
-            packets = rdpcap(pcap_path)
-        except Exception:
-            return None
-
-        if len(packets) == 0:
-            return None
-
+        """从PCAP提取特征，使用 PcapReader 流式读取避免 OOM"""
         # 从文件名解析5元组
         tuple_info = self.parse_filename_5tuple(pcap_path)
         if tuple_info is None:
@@ -47,31 +43,35 @@ class MultiModalExtractorV3:
         protocol, src_ip, src_port, dst_ip, dst_port = tuple_info
         flow_src = (src_ip, src_port)
 
-        raw_bigrams = []  # List[str] - hex bigrams
+        raw_bigrams = []  # List[List[str]] - hex bigrams per packet
         raw_directions = []
         packet_sizes = []  # List[int]
         size_directions = []
         timestamps = []  # List[float] - packet timestamps
 
-        for packet in packets:
-            payload = self._extract_payload(packet, protocol)
-            if payload is None or len(payload) == 0:
-                continue
+        try:
+            with PcapReader(pcap_path) as pcap_reader:
+                for packet in pcap_reader:
+                    payload = self._extract_payload(packet, protocol)
+                    if payload is None or len(payload) == 0:
+                        continue
 
-            payload_len = min(len(payload),1500)
-            direction = self._get_direction(packet, protocol, flow_src)
-            timestamp = float(packet.time)  # Extract timestamp
+                    payload_len = min(len(payload), 1500)
+                    direction = self._get_direction(packet, protocol, flow_src)
+                    timestamp = float(packet.time)
 
-            # Raw modality: bigram hex strings
-            if len(raw_bigrams) < self.max_raw_packets:
-                bigram_hex_list = self._bytes_to_bigram_hex(payload[:self.bytes_per_packet])# bigram_hex_list:[4500,0006,0683] only payload
-                raw_bigrams.append(bigram_hex_list)
-                raw_directions.append(direction)
+                    # Raw modality: hex tokens (first max_raw_packets)
+                    if len(raw_bigrams) < self.max_raw_packets:
+                        bigram_hex_list = self._bytes_to_hex_tokens(payload[:self.bytes_per_packet])
+                        raw_bigrams.append(bigram_hex_list)
+                        raw_directions.append(direction)
 
-            # Size modality
-            packet_sizes.append(payload_len)
-            size_directions.append(direction)
-            timestamps.append(timestamp)
+                    # Size modality
+                    packet_sizes.append(payload_len)
+                    size_directions.append(direction)
+                    timestamps.append(timestamp)
+        except Exception:
+            return None
 
         if len(packet_sizes) == 0:
             return None
@@ -89,23 +89,23 @@ class MultiModalExtractorV3:
             'iat_tokens': iat_tokens  # List[int] - IAT temporal tokens (0-999)
         }
 
-    def _bytes_to_bigram_hex(self, payload_bytes):
+    def _bytes_to_hex_tokens(self, payload_bytes):
         """
-        将bytes转换为bigram hex字符串列表（用于文本输出）
+        将bytes转换为hex token列表
 
-        Args:
-            payload_bytes: bytes对象
-
-        Returns:
-            List[str]: ["4500", "0006", "0683", ...]
+        bigram mode: ["4500", "0006", ...] (滑窗bigram, N bytes → N-1 tokens)
+        byte mode:   ["45", "00", "06", ...] (单字节, N bytes → N tokens)
         """
-        bigrams = []
-        for i in range(len(payload_bytes) - 1):
-            byte1 = payload_bytes[i]
-            byte2 = payload_bytes[i + 1]
-            bigram_hex = f"{byte1:02x}{byte2:02x}"
-            bigrams.append(bigram_hex)
-        return bigrams
+        if self.raw_token_type == 'byte':
+            return [f"{b:02x}" for b in payload_bytes]
+        else:
+            bigrams = []
+            for i in range(len(payload_bytes) - 1):
+                byte1 = payload_bytes[i]
+                byte2 = payload_bytes[i + 1]
+                bigram_hex = f"{byte1:02x}{byte2:02x}"
+                bigrams.append(bigram_hex)
+            return bigrams
 
     def _compute_iat_tokens(self, timestamps):
         """
@@ -126,7 +126,7 @@ class MultiModalExtractorV3:
             return []
 
         iat_tokens = []
-        epsilon = 1e-6  
+        epsilon = 1e-6
 
         for i in range(len(timestamps)):
             if i == 0:
@@ -219,68 +219,47 @@ class MultiModalExtractorV3:
             return None
 
 
-def save_to_text_format(flows, output_raw_path, output_size_path):
+def write_flow(flow, f_raw, f_size):
     """
-    保存为文本格式，兼容uer preprocess.py
+    将单个 flow 写入输出文件（流式写入，不累积内存）
 
-    corpus_raw.txt格式：
-    ||
-    6
-    1 4500 0006 0683 3c52 5297 ...
-    -1 4500 0000 003c 3c52 ...
-    ||
-    ...
-
-    corpus_size.txt格式（新增IAT行）：
-    ||
-    6
-    1672 2185 953 ...
-    567 123 456 ...
-    ||...
+    格式与原 save_to_text_format 完全一致。
     """
-    with open(output_raw_path, 'w') as f_raw, \
-         open(output_size_path, 'w') as f_size:
+    protocol = flow['protocol']
 
-        for flow in flows:
-            protocol = flow['protocol']
+    # Raw packet corpus
+    f_raw.write("||\n")
+    f_raw.write(str(protocol))
+    f_raw.write("\n")
+    for i in range(len(flow['raw_bigrams'])):
+        f_raw.write(f"{flow['raw_directions'][i]} ")
+        f_raw.write(" ".join(flow['raw_bigrams'][i]))
+        f_raw.write("\n")
 
-            # Raw packet corpus
-            f_raw.write("||")  # Flow separator
-            # Protocol (6=TCP, 17=UDP)
-            f_raw.write("\n")
-            f_raw.write(str(protocol))
-            f_raw.write("\n")
-
-            for i in range(len(flow['raw_bigrams'])):
-                f_raw.write(f"{flow['raw_directions'][i]} ")  # direction for this packet
-                f_raw.write(" ".join(flow['raw_bigrams'][i]))  # bigrams for this packet
-                f_raw.write("\n")
-
-            # Size corpus (with IAT temporal information)
-            f_size.write("||")
-            # Protocol (6=TCP, 17=UDP)
-            f_size.write("\n")
-            f_size.write(str(protocol))
-            f_size.write("\n")
-            # Line 1: size tokens (direction encoded: size_token = size * direction + 1500)
-            size_tokens = []
-            for size, direction in zip(flow['packet_sizes'], flow['size_directions']):
-                size_token = size * direction + 1500
-                size_tokens.append(str(size_token))
-            f_size.write(" ".join(size_tokens))
-            f_size.write("\n")
-            # Line 2: IAT temporal tokens (0-999)
-            iat_token_strs = [str(token) for token in flow['iat_tokens']]
-            f_size.write(" ".join(iat_token_strs))
-            f_size.write("\n")  # Flow结束
+    # Size corpus (with IAT temporal information)
+    f_size.write("||\n")
+    f_size.write(str(protocol))
+    f_size.write("\n")
+    # Line 1: size tokens (direction encoded: size_token = size * direction + 1500)
+    size_tokens = []
+    for size, direction in zip(flow['packet_sizes'], flow['size_directions']):
+        size_token = size * direction + 1500
+        size_tokens.append(str(size_token))
+    f_size.write(" ".join(size_tokens))
+    f_size.write("\n")
+    # Line 2: IAT temporal tokens (0-999)
+    iat_token_strs = [str(token) for token in flow['iat_tokens']]
+    f_size.write(" ".join(iat_token_strs))
+    f_size.write("\n")
 
 
 def process_single_pcap(args_tuple):
     """单个PCAP文件处理函数，用于多进程"""
-    pcap_path, bytes_per_packet, max_raw_packets = args_tuple
+    pcap_path, bytes_per_packet, max_raw_packets, raw_token_type = args_tuple
     extractor = MultiModalExtractorV3(
         bytes_per_packet=bytes_per_packet,
-        max_raw_packets=max_raw_packets
+        max_raw_packets=max_raw_packets,
+        raw_token_type=raw_token_type
     )
     return extractor.extract_pcap(pcap_path)
 
@@ -295,6 +274,8 @@ def main():
                        help='Output packet size corpus (text)')
     parser.add_argument('--bytes_per_packet', type=int, default=64)
     parser.add_argument('--max_raw_packets', type=int, default=8)
+    parser.add_argument('--raw_token_type', type=str, choices=['bigram', 'byte'], default='bigram',
+                       help='Raw tokenization: bigram (65K vocab, default) or byte (256 vocab)')
     parser.add_argument('--num_workers', type=int, default=None,
                        help='Number of worker processes (default: CPU count)')
 
@@ -302,7 +283,7 @@ def main():
 
     print(f"Extracting from: {args.pcap_dir}")
 
-    # 收集PCAP文件
+    # 收集PCAP文件路径（只存路径字符串，不占内存）
     pcap_files = []
     for root, dirs, files in os.walk(args.pcap_dir):
         for file in files:
@@ -316,25 +297,35 @@ def main():
     print(f"Using {num_workers} worker processes")
 
     # 准备多进程参数
-    task_args = [(pcap_file, args.bytes_per_packet, args.max_raw_packets)
+    task_args = [(pcap_file, args.bytes_per_packet, args.max_raw_packets, args.raw_token_type)
                  for pcap_file in pcap_files]
 
-    # 多进程提取特征
-    flows = []
-    with Pool(num_workers) as pool:
-        results = list(tqdm(
-            pool.imap(process_single_pcap, task_args),
+    # 确保输出目录存在
+    for path in [args.output_raw, args.output_size]:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+    # 流式处理：imap_unordered 逐个返回结果，立即写入磁盘
+    # 内存中同时只有 ~num_workers 个 flow 结果（进程池缓冲区）
+    total_flows = 0
+    failed = 0
+
+    with open(args.output_raw, 'w') as f_raw, \
+         open(args.output_size, 'w') as f_size, \
+         Pool(num_workers) as pool:
+
+        for flow in tqdm(
+            pool.imap_unordered(process_single_pcap, task_args),
             total=len(pcap_files),
             desc="Processing"
-        ))
+        ):
+            if flow is None:
+                failed += 1
+                continue
 
-    # 过滤None结果
-    flows = [flow for flow in results if flow is not None]
+            write_flow(flow, f_raw, f_size)
+            total_flows += 1
 
-    print(f"\nExtracted {len(flows)} flows")
-
-    # 保存文本格式
-    save_to_text_format(flows, args.output_raw, args.output_size)
+    print(f"\nExtracted {total_flows} flows ({failed} failed)")
 
 
 if __name__ == '__main__':
