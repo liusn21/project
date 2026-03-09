@@ -466,17 +466,23 @@ class MultiModalTrainer(Trainer):
         """
         Forward pass for ALBEF-style multimodal pretraining with Masked Reconstruction
 
-        NEW Batch format (7 tensors):
-            (raw_src, raw_packet_ids, raw_directions, size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal)
+        Batch format (9 tensors):
+            (raw_src, raw_packet_ids, raw_directions,
+             size_src_clean, iat_src_clean, size_src_masked, iat_src_masked,
+             tgt_mlm_size, tgt_mlm_temporal)
 
-        Note: Raw is NOT masked; Size and IAT are synchronously masked
+        Design: ITC/ITM use clean Size inputs; Masked Reconstruction uses masked inputs.
         """
-        raw_src, raw_packet_ids, raw_directions, size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal = batch
+        (raw_src, raw_packet_ids, raw_directions,
+         size_src_clean, iat_src_clean, size_src_masked, iat_src_masked,
+         tgt_mlm_size, tgt_mlm_temporal) = batch
 
         # Forward through model (must call through DDP wrapper for gradient synchronization)
         loss_dict = model(
             raw_src, raw_packet_ids, raw_directions,
-            size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal
+            size_src_clean, iat_src_clean,
+            size_src_masked, iat_src_masked,
+            tgt_mlm_size, tgt_mlm_temporal
         )
 
         # Extract losses

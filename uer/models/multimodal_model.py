@@ -184,20 +184,25 @@ class MultiModalModel(nn.Module):
         self.queue_ptr[0] = ptr
 
     def forward(self, raw_src, raw_packet_ids, raw_directions,
-                size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal):
+                size_src_clean, iat_src_clean,
+                size_src_masked, iat_src_masked,
+                tgt_mlm_size, tgt_mlm_temporal):
         """
-        Forward pass for training with Masked Reconstruction
+        Forward pass for training with Masked Reconstruction (ALBEF-style)
 
-        NEW Design:
-            - Raw: NOT masked, provides context for reconstruction
-            - Size + IAT: Synchronously masked, reconstructed using fused features
+        Design:
+            - ITC and ITM use CLEAN (unmasked) Size+IAT inputs
+            - Only Masked Reconstruction uses masked Size+IAT inputs
+            - Raw is always unmasked
 
         Args:
             raw_src: [batch, seq_len_raw] - Raw Packet token IDs (NOT masked)
             raw_packet_ids: [batch, seq_len_raw] - Packet indices
             raw_directions: [batch, seq_len_raw] - Direction indices
-            size_src: [batch, seq_len_size] - Size token IDs (masked)
-            iat_src: [batch, seq_len_size] - IAT token IDs (masked at same positions)
+            size_src_clean: [batch, seq_len_size] - Size token IDs (clean, for ITC/ITM)
+            iat_src_clean: [batch, seq_len_size] - IAT token IDs (clean, for ITC/ITM)
+            size_src_masked: [batch, seq_len_size] - Size token IDs (masked, for reconstruction)
+            iat_src_masked: [batch, seq_len_size] - IAT token IDs (masked, for reconstruction)
             tgt_mlm_size: [batch, seq_len_size] - Size reconstruction targets
             tgt_mlm_temporal: [batch, seq_len_size] - Temporal reconstruction targets
 
@@ -211,14 +216,14 @@ class MultiModalModel(nn.Module):
         raw_seg = (raw_src != PAD_ID).long()
         raw_output = self.encoder_raw(raw_emb, raw_seg)  # [batch, seq_len_raw, hidden]
 
-        # ===== Step 2: Encode Size+IAT with Main Encoder (masked) =====
-        size_emb = self.embedding_size(size_src, iat_src)  # Now takes both size and IAT
-        size_seg = (size_src != PAD_ID).long()
-        size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len_size, hidden]
+        # ===== Step 2: Encode CLEAN Size+IAT with Main Encoder (for ITC/ITM) =====
+        size_emb_clean = self.embedding_size(size_src_clean, iat_src_clean)
+        size_seg = (size_src_clean != PAD_ID).long()
+        size_output_clean = self.encoder_size(size_emb_clean, size_seg)  # [batch, seq_len_size, hidden]
 
         # Extract CLS tokens (before fusion, for ITC)
         raw_cls = raw_output[:, 0, :]  # [batch, hidden]
-        size_cls = size_output[:, 0, :]  # [batch, hidden]
+        size_cls = size_output_clean[:, 0, :]  # [batch, hidden]
 
         # ===== Step 3: Encode with Momentum Encoders (no gradient) =====
         # Note: momentum update AFTER forward pass, so momentum encoder uses
@@ -227,7 +232,7 @@ class MultiModalModel(nn.Module):
             raw_emb_m = self.embedding_raw_m(raw_src, raw_packet_ids, raw_directions)
             raw_output_m = self.encoder_raw_m(raw_emb_m, raw_seg)
 
-            size_emb_m = self.embedding_size_m(size_src, iat_src)  # Now takes both size and IAT
+            size_emb_m = self.embedding_size_m(size_src_clean, iat_src_clean)
             size_output_m = self.encoder_size_m(size_emb_m, size_seg)
 
             # Extract CLS tokens and project (using previous momentum state)
@@ -253,9 +258,9 @@ class MultiModalModel(nn.Module):
         with torch.no_grad():
             self._dequeue_and_enqueue(raw_cls_m_proj, size_cls_m_proj)
 
-        # ===== Step 6: Fusion for Positive Samples =====
-        # Positive pairs: (raw_i, size_i)
-        raw_fused, size_fused = self.fusion(raw_output, size_output, raw_seg, size_seg)
+        # ===== Step 6: Fusion for Positive Samples (clean) =====
+        # Positive pairs: (raw_i, size_clean_i) — ITC/ITM use clean features
+        raw_fused, size_fused = self.fusion(raw_output, size_output_clean, raw_seg, size_seg)
 
         # Extract fused CLS tokens for positive samples
         pos_raw_cls = raw_fused[:, 0, :]  # [batch, hidden]
@@ -268,8 +273,8 @@ class MultiModalModel(nn.Module):
         )
 
         # ===== Step 8: Fusion for Negative Samples =====
-        # Negative type 1: (raw_i, size_neg) - each raw_i paired with its hard negative size
-        neg_size_output_1 = size_output[neg_size_idx]  # [batch, seq_len_size, hidden]
+        # Negative type 1: (raw_i, size_neg) - each raw_i paired with its hard negative size (clean)
+        neg_size_output_1 = size_output_clean[neg_size_idx]  # [batch, seq_len_size, hidden]
         neg_size_seg_1 = size_seg[neg_size_idx]  # [batch, seq_len_size]
 
         neg1_raw_fused, neg1_size_fused = self.fusion(
@@ -278,12 +283,12 @@ class MultiModalModel(nn.Module):
         neg1_raw_cls = neg1_raw_fused[:, 0, :]  # [batch, hidden]
         neg1_size_cls = neg1_size_fused[:, 0, :]  # [batch, hidden]
 
-        # Negative type 2: (raw_neg, size_i) - each size_i paired with its hard negative raw
+        # Negative type 2: (raw_neg, size_i) - each size_i paired with its hard negative raw (clean)
         neg_raw_output_2 = raw_output[neg_raw_idx]  # [batch, seq_len_raw, hidden]
         neg_raw_seg_2 = raw_seg[neg_raw_idx]  # [batch, seq_len_raw]
 
         neg2_raw_fused, neg2_size_fused = self.fusion(
-            neg_raw_output_2, size_output, neg_raw_seg_2, size_seg
+            neg_raw_output_2, size_output_clean, neg_raw_seg_2, size_seg
         )
         neg2_raw_cls = neg2_raw_fused[:, 0, :]  # [batch, hidden]
         neg2_size_cls = neg2_size_fused[:, 0, :]  # [batch, hidden]
@@ -295,10 +300,19 @@ class MultiModalModel(nn.Module):
             neg2_raw_cls, neg2_size_cls     # Negative 2: (raw_neg, size_i)
         )
 
-        # ===== Step 10: Masked Reconstruction Loss (Size + Temporal) =====
-        # Use fused size features to reconstruct masked Size and IAT tokens
+        # ===== Step 10: Encode MASKED Size+IAT with Main Encoder (for reconstruction) =====
+        size_emb_masked = self.embedding_size(size_src_masked, iat_src_masked)
+        size_seg_masked = (size_src_masked != PAD_ID).long()
+        size_output_masked = self.encoder_size(size_emb_masked, size_seg_masked)
+
+        # ===== Step 11: Fusion with Masked Size features =====
+        # Use raw (always clean) + masked size for reconstruction fusion
+        _, size_fused_masked = self.fusion(raw_output, size_output_masked, raw_seg, size_seg_masked)
+
+        # ===== Step 12: Masked Reconstruction Loss (Size + Temporal) =====
+        # Use fused MASKED size features to reconstruct masked Size and IAT tokens
         recon_results = self.target.forward_masked_reconstruction(
-            size_fused, tgt_mlm_size, tgt_mlm_temporal
+            size_fused_masked, tgt_mlm_size, tgt_mlm_temporal
         )
 
         # ===== Return all losses and metrics =====

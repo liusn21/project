@@ -1659,6 +1659,10 @@ class MultiModalDataset(Dataset):
         if not self.dynamic_masking:
             # Static masking: apply synchronized mask here in Dataset
 
+            # Save clean versions before masking (for ITC + ITM)
+            size_src_clean = list(size_src)
+            iat_src_clean = list(iat_src)
+
             # First, mask Size tokens
             size_src_masked, tgt_mlm_size = mask_seq(
                 list(size_src), self.tokenizer_size, self.whole_word_masking,
@@ -1678,10 +1682,8 @@ class MultiModalDataset(Dataset):
                 # Standard BERT masking: 80% [MASK], 10% random, 10% unchanged
                 prob = random.random()
                 if prob < 0.8:
-                    # 80%: Replace with [MASK]
                     iat_src_masked[pos] = self.vocab_temporal.get(MASK_TOKEN)
                 elif prob < 0.9:
-                    # 10%: Replace with random token
                     while True:
                         rdi = random.randint(1, len(self.vocab_temporal) - 1)
                         if rdi not in [self.vocab_temporal.get(CLS_TOKEN),
@@ -1690,14 +1692,15 @@ class MultiModalDataset(Dataset):
                                       PAD_ID]:
                             break
                     iat_src_masked[pos] = rdi
-                # else: 10%: Keep original token (iat_src_masked already has it)
 
-            # Return 7 elements (Raw unmasked, Size+IAT masked)
+            # Return 9 elements: Raw unmasked + Size/IAT clean (ITC/ITM) + masked (Reconstruction)
             return (raw_src, raw_packet_ids, raw_directions_seq,
-                    size_src_masked, iat_src_masked, tgt_mlm_size, tgt_mlm_temporal)
+                    size_src_clean, iat_src_clean,
+                    size_src_masked, iat_src_masked,
+                    tgt_mlm_size, tgt_mlm_temporal)
         else:
             # Dynamic masking: defer masking to DataLoader
-            # Return 5 elements (without tgt_mlm)
+            # Return 5 elements (clean size/iat, masking done in DataLoader)
             return (raw_src, raw_packet_ids, raw_directions_seq, size_src, iat_src)
 
 
@@ -1705,21 +1708,24 @@ class MultiModalDataLoader(DataLoader):
     """
     DataLoader for Multi-Modal Pretraining (Stage 2) with Temporal Information
 
-    NEW Design for Masked Reconstruction:
-        - Raw: NOT masked (provides context for reconstruction via fusion)
-        - Size + IAT: Synchronously masked at same positions
+    ALBEF-style Design:
+        - ITC and ITM use CLEAN (unmasked) Size+IAT inputs
+        - Only Masked Reconstruction uses masked Size+IAT inputs
+        - Raw is always unmasked
 
     Returns positive (matching) samples only.
     ITC/ITM negative sampling and hard negative mining are done in Model/Trainer.
 
     Supports both static and dynamic masking (controlled by args.dynamic_masking).
 
-    Returns:
+    Returns 9 tensors:
         raw_src: [batch, seq_len_raw] - Raw Packet tokens (NOT masked)
         raw_packet_ids: [batch, seq_len_raw] - Packet indices
         raw_directions: [batch, seq_len_raw] - Direction indices
-        size_src: [batch, seq_len_size] - Size tokens (masked for reconstruction)
-        iat_src: [batch, seq_len_size] - IAT tokens (masked at same positions as Size)
+        size_src_clean: [batch, seq_len_size] - Size tokens (clean, for ITC/ITM)
+        iat_src_clean: [batch, seq_len_size] - IAT tokens (clean, for ITC/ITM)
+        size_src_masked: [batch, seq_len_size] - Size tokens (masked, for reconstruction)
+        iat_src_masked: [batch, seq_len_size] - IAT tokens (masked, for reconstruction)
         tgt_mlm_size: [batch, seq_len_size] - Size MLM targets (0=unmasked, token_id=masked)
         tgt_mlm_temporal: [batch, seq_len_size] - Temporal MLM targets (0=unmasked, token_id=masked)
     """
@@ -1750,12 +1756,14 @@ class MultiModalDataLoader(DataLoader):
 
             self.start += self.batch_size
 
-            # Batch lists
+            # Batch lists (9 tensors: raw*3, size/iat clean*2, size/iat masked*2, targets*2)
             raw_src_batch = []
             raw_packet_ids_batch = []
             raw_directions_batch = []
-            size_src_batch = []
-            iat_src_batch = []
+            size_src_clean_batch = []
+            iat_src_clean_batch = []
+            size_src_masked_batch = []
+            iat_src_masked_batch = []
             tgt_mlm_size_batch = []
             tgt_mlm_temporal_batch = []
 
@@ -1763,38 +1771,44 @@ class MultiModalDataLoader(DataLoader):
 
             for ins in instances:
                 # Instance format depends on masking mode:
-                # Static masking (len=7): (raw_src, raw_packet_ids, raw_directions_seq,
-                #                          size_src, iat_src, tgt_mlm_size, tgt_mlm_temporal)
+                # Static masking (len=9): (raw_src, raw_packet_ids, raw_directions_seq,
+                #                          size_src_clean, iat_src_clean,
+                #                          size_src_masked, iat_src_masked,
+                #                          tgt_mlm_size, tgt_mlm_temporal)
                 # Dynamic masking (len=5): (raw_src, raw_packet_ids, raw_directions_seq,
                 #                          size_src, iat_src)
 
-                if len(ins) == 7:
+                if len(ins) == 9:
                     # Static masking: Dataset already applied synchronized masking
                     raw_src = ins[0]
                     raw_packet_ids = ins[1]
                     raw_directions = ins[2]
-                    size_src = ins[3]
-                    iat_src = ins[4]
-                    tgt_mlm_size = ins[5]  # List of (position, token) tuples
-                    tgt_mlm_temporal = ins[6]  # List of (position, token) tuples
+                    size_src_clean = ins[3]
+                    iat_src_clean = ins[4]
+                    size_src_masked = ins[5]
+                    iat_src_masked = ins[6]
+                    tgt_mlm_size = ins[7]  # List of (position, token) tuples
+                    tgt_mlm_temporal = ins[8]  # List of (position, token) tuples
 
                     masked_words_num += len(tgt_mlm_size)
 
                     # Convert tgt_mlm format for size: [(pos, token), ...] -> [0, 0, token, 0, ...]
-                    tgt_size_dense = [0] * len(size_src)
+                    tgt_size_dense = [0] * len(size_src_clean)
                     for pos, token in tgt_mlm_size:
                         tgt_size_dense[pos] = token
 
                     # Convert tgt_mlm format for temporal
-                    tgt_temporal_dense = [0] * len(iat_src)
+                    tgt_temporal_dense = [0] * len(iat_src_clean)
                     for pos, token in tgt_mlm_temporal:
                         tgt_temporal_dense[pos] = token
 
                     raw_src_batch.append(raw_src)
                     raw_packet_ids_batch.append(raw_packet_ids)
                     raw_directions_batch.append(raw_directions)
-                    size_src_batch.append(size_src)
-                    iat_src_batch.append(iat_src)
+                    size_src_clean_batch.append(size_src_clean)
+                    iat_src_clean_batch.append(iat_src_clean)
+                    size_src_masked_batch.append(size_src_masked)
+                    iat_src_masked_batch.append(iat_src_masked)
                     tgt_mlm_size_batch.append(tgt_size_dense)
                     tgt_mlm_temporal_batch.append(tgt_temporal_dense)
 
@@ -1803,12 +1817,12 @@ class MultiModalDataLoader(DataLoader):
                     raw_src = ins[0]  # Raw is NOT masked
                     raw_packet_ids = ins[1]
                     raw_directions = ins[2]
-                    size_src = list(ins[3])  # Copy to avoid modifying original
-                    iat_src = list(ins[4])
+                    size_src_clean = list(ins[3])  # Clean copy for ITC/ITM
+                    iat_src_clean = list(ins[4])
 
-                    # Mask Size tokens
+                    # Mask Size tokens (on a copy)
                     size_src_masked, tgt_mlm_size = mask_seq(
-                        size_src,
+                        list(ins[3]),  # Fresh copy for masking
                         self.tokenizer_size,
                         self.whole_word_masking,
                         self.span_masking,
@@ -1818,11 +1832,11 @@ class MultiModalDataLoader(DataLoader):
 
                     # Apply same mask positions to IAT (synchronized masking)
                     mask_positions = [pos for pos, _ in tgt_mlm_size]
-                    iat_src_masked = list(iat_src)
+                    iat_src_masked = list(ins[4])  # Fresh copy for masking
                     tgt_mlm_temporal = []
 
                     for pos in mask_positions:
-                        original_token = iat_src[pos]
+                        original_token = ins[4][pos]
                         tgt_mlm_temporal.append((pos, original_token))
 
                         # Standard BERT masking: 80% [MASK], 10% random, 10% unchanged
@@ -1843,20 +1857,22 @@ class MultiModalDataLoader(DataLoader):
                     masked_words_num += len(tgt_mlm_size)
 
                     # Convert tgt_mlm format for size
-                    tgt_size_dense = [0] * len(size_src)
+                    tgt_size_dense = [0] * len(size_src_clean)
                     for pos, token in tgt_mlm_size:
                         tgt_size_dense[pos] = token
 
                     # Convert tgt_mlm format for temporal
-                    tgt_temporal_dense = [0] * len(iat_src)
+                    tgt_temporal_dense = [0] * len(iat_src_clean)
                     for pos, token in tgt_mlm_temporal:
                         tgt_temporal_dense[pos] = token
 
                     raw_src_batch.append(raw_src)
                     raw_packet_ids_batch.append(raw_packet_ids)
                     raw_directions_batch.append(raw_directions)
-                    size_src_batch.append(size_src_masked)
-                    iat_src_batch.append(iat_src_masked)
+                    size_src_clean_batch.append(size_src_clean)
+                    iat_src_clean_batch.append(iat_src_clean)
+                    size_src_masked_batch.append(size_src_masked)
+                    iat_src_masked_batch.append(iat_src_masked)
                     tgt_mlm_size_batch.append(tgt_size_dense)
                     tgt_mlm_temporal_batch.append(tgt_temporal_dense)
 
@@ -1872,7 +1888,9 @@ class MultiModalDataLoader(DataLoader):
             yield (torch.LongTensor(raw_src_batch),
                    torch.LongTensor(raw_packet_ids_batch),
                    torch.LongTensor(raw_directions_batch),
-                   torch.LongTensor(size_src_batch),
-                   torch.LongTensor(iat_src_batch),
+                   torch.LongTensor(size_src_clean_batch),
+                   torch.LongTensor(iat_src_clean_batch),
+                   torch.LongTensor(size_src_masked_batch),
+                   torch.LongTensor(iat_src_masked_batch),
                    torch.LongTensor(tgt_mlm_size_batch),
                    torch.LongTensor(tgt_mlm_temporal_batch))
