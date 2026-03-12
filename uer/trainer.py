@@ -702,7 +702,7 @@ def worker(proc_id, gpu_ranks, args, model):
             dist.barrier()
             print(f"Rank{rank}: Barrier passed")
             
-        model = DistributedDataParallel(model, device_ids=[gpu_id], find_unused_parameters=True)
+        model = DistributedDataParallel(model, device_ids=[gpu_id], find_unused_parameters=False)
         print("Worker %d is training ... " % rank)
     else:
         print("Worker is training ...")

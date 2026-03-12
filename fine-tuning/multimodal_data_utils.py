@@ -23,10 +23,15 @@ from tqdm import tqdm
 from collections import defaultdict
 import pickle
 import argparse
+import multiprocessing as mp
 
 from uer.utils.vocab import Vocab
 from uer.utils.tokenizers import BertTokenizer
 from uer.utils.constants import CLS_TOKEN, SEP_TOKEN, PAD_ID
+
+# Pre-computed hex lookup tables (module-level constants)
+_BIGRAM_TABLE = [f"{i:02x}{j:02x}" for i in range(256) for j in range(256)]
+_BYTE_TABLE = [f"{i:02x}" for i in range(256)]
 
 
 class MultiModalFlowExtractor:
@@ -37,26 +42,17 @@ class MultiModalFlowExtractor:
         self.max_raw_packets = max_raw_packets
         self.max_size_packets = max_size_packets
         self.raw_token_type = raw_token_type
-        self.epsilon = 1e-6  # For IAT computation
+        self.epsilon = 1e-6
 
     def extract_pcap(self, pcap_path):
         """
         Extract features from a PCAP file (streaming mode for efficiency)
 
-        Uses streaming PcapReader to avoid loading entire PCAP into memory.
-        Stops reading once we have enough packets (max_size_packets).
-
         Returns:
-            dict with keys:
-                - raw_bigrams: List[List[str]] - bigram hex strings per packet
-                - raw_directions: List[int] - direction per packet (1=up, -1=down)
-                - raw_packet_ids: List[int] - packet index per packet
-                - packet_sizes: List[int] - payload sizes
-                - size_directions: List[int] - direction per size packet
-                - iat_tokens: List[int] - IAT temporal tokens (0-999)
+            dict with raw_bigrams, raw_directions, raw_packet_ids,
+                 packet_sizes, size_directions, iat_tokens
             or None if extraction fails
         """
-        # Parse 5-tuple from filename
         tuple_info = self._parse_filename_5tuple(pcap_path)
         if tuple_info is None:
             return None
@@ -69,15 +65,13 @@ class MultiModalFlowExtractor:
         raw_packet_ids = []
         packet_sizes = []
         size_directions = []
-        timestamps = []  # Collect timestamps for IAT computation
+        timestamps = []
 
         raw_packet_count = 0
 
-        # Streaming PCAP reading for efficiency
         try:
             with PcapReader(pcap_path) as pcap_reader:
                 for packet in pcap_reader:
-                    # Early exit: we have enough packets
                     if len(packet_sizes) >= self.max_size_packets:
                         break
 
@@ -89,7 +83,6 @@ class MultiModalFlowExtractor:
                     direction = self._get_direction(packet, protocol, flow_src)
                     timestamp = float(packet.time)
 
-                    # Raw modality (first 8 packets)
                     if raw_packet_count < self.max_raw_packets:
                         bigram_hex_list = self._bytes_to_hex_tokens(payload[:self.bytes_per_packet])
                         raw_bigrams.append(bigram_hex_list)
@@ -97,7 +90,6 @@ class MultiModalFlowExtractor:
                         raw_packet_ids.append(raw_packet_count)
                         raw_packet_count += 1
 
-                    # Size modality (up to max_size_packets)
                     packet_sizes.append(payload_len)
                     size_directions.append(direction)
                     timestamps.append(timestamp)
@@ -108,7 +100,6 @@ class MultiModalFlowExtractor:
         if len(packet_sizes) == 0:
             return None
 
-        # Compute IAT tokens (normalized and discretized to 0-999)
         iat_tokens = self._compute_iat_tokens(timestamps)
 
         return {
@@ -162,9 +153,9 @@ class MultiModalFlowExtractor:
         src_port = transport_layer.sport
 
         if (src_ip, src_port) == flow_src:
-            return 1  # uplink
+            return 1
         else:
-            return -1  # downlink
+            return -1
 
     def _extract_payload(self, packet, protocol):
         """Extract transport layer payload"""
@@ -191,74 +182,32 @@ class MultiModalFlowExtractor:
             return None
 
     def _bytes_to_hex_tokens(self, payload_bytes):
-        """Convert bytes to hex token list.
-
-        bigram mode: ["4500", "0006", ...] (sliding window, N-1 tokens)
-        byte mode:   ["45", "00", "06", ...] (individual bytes, N tokens)
-        """
+        """Convert bytes to hex token list using pre-computed lookup table."""
         if self.raw_token_type == 'byte':
-            return [f"{b:02x}" for b in payload_bytes]
+            return [_BYTE_TABLE[b] for b in payload_bytes]
         else:
-            bigrams = []
-            for i in range(len(payload_bytes) - 1):
-                byte1 = payload_bytes[i]
-                byte2 = payload_bytes[i + 1]
-                bigram_hex = f"{byte1:02x}{byte2:02x}"
-                bigrams.append(bigram_hex)
-            return bigrams
+            return [_BIGRAM_TABLE[payload_bytes[i] * 256 + payload_bytes[i + 1]]
+                    for i in range(len(payload_bytes) - 1)]
 
     def _compute_iat_tokens(self, timestamps):
-        """
-        Compute IAT (Inter-Arrival Time) tokens
-
-        Method from PTU paper (same as pretraining):
-        1. Calculate time difference between consecutive packets (seconds)
-        2. Normalize: sigmoid(log10(IAT + epsilon))
-        3. Discretize to 1000 bins (0-999)
-
-        Args:
-            timestamps: List[float] - packet timestamps (seconds)
-
-        Returns:
-            List[int]: IAT tokens (0-999)
-        """
-        import math
-
+        """Compute IAT tokens using numpy vectorization."""
         if len(timestamps) == 0:
             return []
 
-        iat_tokens = []
+        ts = np.array(timestamps)
+        iats = np.empty(len(ts))
+        iats[0] = self.epsilon
+        iats[1:] = np.maximum(np.diff(ts), self.epsilon)
 
-        for i in range(len(timestamps)):
-            if i == 0:
-                # First packet uses epsilon
-                iat = self.epsilon
-            else:
-                # Calculate time difference from previous packet
-                iat = timestamps[i] - timestamps[i-1]
-                iat = max(iat, self.epsilon)  # Ensure non-negative and non-zero
+        log_iats = np.log10(iats)
+        normalized = 1.0 / (1.0 + np.exp(-log_iats))
+        tokens = np.clip((normalized * 1000).astype(int), 0, 999)
 
-            # Normalization: sigmoid(log10(IAT))
-            # sigmoid(x) = 1 / (1 + exp(-x))
-            log_iat = math.log10(iat)
-            normalized = 1.0 / (1.0 + math.exp(-log_iat))
-
-            # Discretize to [0, 999]
-            token = int(normalized * 1000)
-            token = min(max(token, 0), 999)  # Clip to [0, 999]
-
-            iat_tokens.append(token)
-
-        return iat_tokens
+        return tokens.tolist()
 
 
 def create_tokenizer(vocab_path):
-    """
-    Create a BertTokenizer compatible with pretraining
-
-    Uses the same tokenizer as pretraining (data.py)
-    """
-    # Create a minimal args object for BertTokenizer
+    """Create a BertTokenizer compatible with pretraining"""
     class Args:
         def __init__(self, vocab_path):
             self.vocab_path = vocab_path
@@ -269,6 +218,222 @@ def create_tokenizer(vocab_path):
     return tokenizer
 
 
+# ============================================================
+# Token cache: pre-compute tokenizer results for all possible
+# token values, eliminating per-call tokenizer overhead.
+# ============================================================
+
+def _build_token_cache(tokenizer, token_strings):
+    """Pre-compute tokenizer results for a list of token strings.
+
+    Returns dict: token_string -> list of token IDs.
+    """
+    cache = {}
+    for token_str in token_strings:
+        tokens = tokenizer.tokenize(token_str)
+        ids = tokenizer.convert_tokens_to_ids(tokens)
+        cache[token_str] = ids
+    return cache
+
+
+def build_all_caches(tokenizer_raw, tokenizer_size, tokenizer_temporal, raw_token_type='bigram'):
+    """Build lookup caches for all three tokenizers (one-time cost)."""
+    print("Building token caches...")
+
+    if raw_token_type == 'bigram':
+        raw_tokens = _BIGRAM_TABLE
+    else:
+        raw_tokens = _BYTE_TABLE
+    raw_cache = _build_token_cache(tokenizer_raw, raw_tokens)
+    print(f"  Raw cache: {len(raw_cache)} entries")
+
+    size_cache = _build_token_cache(tokenizer_size, [str(v) for v in range(3001)])
+    print(f"  Size cache: {len(size_cache)} entries")
+
+    iat_cache = _build_token_cache(tokenizer_temporal, [str(v) for v in range(1000)])
+    print(f"  IAT cache: {len(iat_cache)} entries")
+
+    return raw_cache, size_cache, iat_cache
+
+
+# ============================================================
+# Cached tokenization functions
+# ============================================================
+
+def _tokenize_raw_cached(flow_data, raw_cache, seq_length_raw,
+                          cls_id, sep_id, vocab_size):
+    """Tokenize raw packet data using pre-built cache."""
+    tokens = []
+    token_packet_ids = []
+    token_directions = []
+
+    for pkt_idx, (bigrams, direction) in enumerate(
+            zip(flow_data['raw_bigrams'], flow_data['raw_directions'])):
+        if pkt_idx >= 8:
+            break
+
+        dir_idx = 0 if direction == -1 else 2
+        for bigram in bigrams:
+            ids = raw_cache.get(bigram)
+            if ids is None:
+                continue
+            for token_id in ids:
+                tokens.append(token_id)
+                token_packet_ids.append(pkt_idx)
+                token_directions.append(dir_idx)
+
+    max_tokens = seq_length_raw - 2
+    if len(tokens) > max_tokens:
+        tokens = tokens[:max_tokens]
+        token_packet_ids = token_packet_ids[:max_tokens]
+        token_directions = token_directions[:max_tokens]
+
+    src = [cls_id] + tokens + [sep_id]
+    packet_ids = [8] + token_packet_ids + [8]
+    directions = [1] + token_directions + [1]
+
+    pad_len = seq_length_raw - len(src)
+    if pad_len > 0:
+        src.extend([PAD_ID] * pad_len)
+        packet_ids.extend([8] * pad_len)
+        directions.extend([1] * pad_len)
+
+    for idx in range(len(src)):
+        if src[idx] < 0 or src[idx] >= vocab_size:
+            src[idx] = min(max(src[idx], 0), vocab_size - 1)
+
+    return src, packet_ids, directions
+
+
+def _tokenize_size_iat_cached(flow_data, size_cache, iat_cache, seq_length_size,
+                               cls_id_size, sep_id_size,
+                               cls_id_iat, sep_id_iat,
+                               vocab_len_size, vocab_len_temporal):
+    """Tokenize size+IAT data using pre-built caches."""
+    size_token_ids = []
+    for size, direction in zip(flow_data['packet_sizes'], flow_data['size_directions']):
+        size_token = size * direction + 1500
+        ids = size_cache.get(str(size_token))
+        if ids is not None:
+            size_token_ids.extend(ids)
+
+    iat_token_ids = []
+    for token in flow_data['iat_tokens']:
+        ids = iat_cache.get(str(token))
+        if ids is not None:
+            iat_token_ids.extend(ids)
+
+    min_len = min(len(size_token_ids), len(iat_token_ids))
+    size_token_ids = size_token_ids[:min_len]
+    iat_token_ids = iat_token_ids[:min_len]
+
+    max_tokens = seq_length_size - 2
+    if len(size_token_ids) > max_tokens:
+        size_token_ids = size_token_ids[:max_tokens]
+        iat_token_ids = iat_token_ids[:max_tokens]
+
+    size_src = [cls_id_size] + size_token_ids + [sep_id_size]
+    iat_src = [cls_id_iat] + iat_token_ids + [sep_id_iat]
+
+    pad_len_size = seq_length_size - len(size_src)
+    if pad_len_size > 0:
+        size_src.extend([PAD_ID] * pad_len_size)
+    pad_len_iat = seq_length_size - len(iat_src)
+    if pad_len_iat > 0:
+        iat_src.extend([PAD_ID] * pad_len_iat)
+
+    for idx in range(len(size_src)):
+        if size_src[idx] < 0 or size_src[idx] >= vocab_len_size:
+            size_src[idx] = min(max(size_src[idx], 0), vocab_len_size - 1)
+    for idx in range(len(iat_src)):
+        if iat_src[idx] < 0 or iat_src[idx] >= vocab_len_temporal:
+            iat_src[idx] = min(max(iat_src[idx], 0), vocab_len_temporal - 1)
+
+    return size_src, iat_src
+
+
+# ============================================================
+# Multiprocessing worker
+# ============================================================
+
+_worker_state = {}
+
+
+def _init_worker(extractor_params, raw_cache, size_cache, iat_cache,
+                 vocab_raw, vocab_size, vocab_temporal,
+                 seq_length_raw, seq_length_size):
+    """Initialize per-worker state (called once per worker process)."""
+    _worker_state['extractor'] = MultiModalFlowExtractor(**extractor_params)
+    _worker_state['raw_cache'] = raw_cache
+    _worker_state['size_cache'] = size_cache
+    _worker_state['iat_cache'] = iat_cache
+    _worker_state['seq_length_raw'] = seq_length_raw
+    _worker_state['seq_length_size'] = seq_length_size
+    _worker_state['cls_id_raw'] = vocab_raw.get(CLS_TOKEN, 0)
+    _worker_state['sep_id_raw'] = vocab_raw.get(SEP_TOKEN, 0)
+    _worker_state['cls_id_size'] = vocab_size.get(CLS_TOKEN, 0)
+    _worker_state['sep_id_size'] = vocab_size.get(SEP_TOKEN, 0)
+    _worker_state['cls_id_iat'] = vocab_temporal.get(CLS_TOKEN, 0)
+    _worker_state['sep_id_iat'] = vocab_temporal.get(SEP_TOKEN, 0)
+    _worker_state['vocab_size_raw'] = len(vocab_raw)
+    _worker_state['vocab_size_size'] = len(vocab_size)
+    _worker_state['vocab_size_temporal'] = len(vocab_temporal)
+
+
+def _process_pcap_worker(item):
+    """Worker function: extract + tokenize a single pcap file."""
+    pcap_path, label_name = item
+    st = _worker_state
+
+    flow_data = st['extractor'].extract_pcap(pcap_path)
+    if flow_data is None:
+        return None
+
+    raw_src, packet_ids, directions = _tokenize_raw_cached(
+        flow_data, st['raw_cache'], st['seq_length_raw'],
+        st['cls_id_raw'], st['sep_id_raw'], st['vocab_size_raw']
+    )
+
+    size_src, iat_src = _tokenize_size_iat_cached(
+        flow_data, st['size_cache'], st['iat_cache'], st['seq_length_size'],
+        st['cls_id_size'], st['sep_id_size'],
+        st['cls_id_iat'], st['sep_id_iat'],
+        st['vocab_size_size'], st['vocab_size_temporal']
+    )
+
+    return {
+        'raw_src': raw_src,
+        'packet_ids': packet_ids,
+        'directions': directions,
+        'size_src': size_src,
+        'iat_src': iat_src,
+        'label_name': label_name
+    }
+
+
+def _process_items(work_items, num_workers, init_args, desc="Processing"):
+    """Process work items in parallel or sequentially."""
+    results = []
+    if num_workers > 1 and len(work_items) > 0:
+        with mp.Pool(num_workers, initializer=_init_worker, initargs=init_args) as pool:
+            for result in tqdm(pool.imap_unordered(_process_pcap_worker, work_items, chunksize=16),
+                              total=len(work_items), desc=desc):
+                if result is not None:
+                    results.append(result)
+    else:
+        _init_worker(*init_args)
+        for item in tqdm(work_items, desc=desc):
+            result = _process_pcap_worker(item)
+            if result is not None:
+                results.append(result)
+    return results
+
+
+# ============================================================
+# Backward-compatible tokenization functions
+# (kept for external use; main pipeline uses cached versions)
+# ============================================================
+
 def tokenize_raw_flow(flow_data, tokenizer_raw, seq_length_raw):
     """
     Tokenize raw packet data for a single flow
@@ -278,67 +443,46 @@ def tokenize_raw_flow(flow_data, tokenizer_raw, seq_length_raw):
         - NO SEP tokens between packets (different from BERT sentence-pair!)
         - packet_ids: 0-7 for packets, 8 for special tokens/padding
         - directions: 0=downlink, 1=neutral(special/pad), 2=uplink
-
-    Args:
-        flow_data: dict with 'raw_bigrams' (List[List[str]]) and 'raw_directions' (List[int])
-        tokenizer_raw: BertTokenizer for raw modality
-        seq_length_raw: target sequence length
-
-    Returns:
-        src: List[int] - token IDs
-        packet_ids: List[int] - packet indices
-        directions: List[int] - direction indices (0=down, 1=neutral, 2=up)
     """
     vocab = tokenizer_raw.vocab
 
-    # Collect all tokens from all packets (no SEP between packets!)
     tokens = []
     token_packet_ids = []
     token_directions = []
 
     for pkt_idx, (bigrams, direction) in enumerate(zip(flow_data['raw_bigrams'], flow_data['raw_directions'])):
-        # Limit to 8 packets (indices 0-7)
         if pkt_idx >= 8:
             break
 
-        # Convert bigram list to space-separated string, then tokenize
-        # This matches pretraining: tokenizer.tokenize(bigram_str)
         bigram_str = ' '.join(bigrams)
         pkt_tokens = tokenizer_raw.tokenize(bigram_str)
         pkt_token_ids = tokenizer_raw.convert_tokens_to_ids(pkt_tokens)
 
-        # Add tokens for this packet
+        dir_idx = 0 if direction == -1 else 2
         for token_id in pkt_token_ids:
             tokens.append(token_id)
             token_packet_ids.append(pkt_idx)
-            # Convert direction: -1 -> 0 (downlink), 1 -> 2 (uplink)
-            dir_idx = 0 if direction == -1 else 2
             token_directions.append(dir_idx)
 
-    # Reserve space for [CLS] and [SEP]
     max_tokens = seq_length_raw - 2
-
-    # Truncate if needed
     if len(tokens) > max_tokens:
         tokens = tokens[:max_tokens]
         token_packet_ids = token_packet_ids[:max_tokens]
         token_directions = token_directions[:max_tokens]
 
-    # Build sequence: [CLS] + tokens + [SEP]
     cls_id = vocab.get(CLS_TOKEN, 0)
     sep_id = vocab.get(SEP_TOKEN, 0)
 
     src = [cls_id] + tokens + [sep_id]
-    packet_ids = [8] + token_packet_ids + [8]  # 8 for special tokens
-    directions = [1] + token_directions + [1]  # 1 for neutral
+    packet_ids = [8] + token_packet_ids + [8]
+    directions = [1] + token_directions + [1]
 
-    # Pad to seq_length_raw
-    while len(src) < seq_length_raw:
-        src.append(PAD_ID)
-        packet_ids.append(8)
-        directions.append(1)
+    pad_len = seq_length_raw - len(src)
+    if pad_len > 0:
+        src.extend([PAD_ID] * pad_len)
+        packet_ids.extend([8] * pad_len)
+        directions.extend([1] * pad_len)
 
-    # Validate token IDs are within embedding range
     vocab_size = len(vocab)
     for idx, v in enumerate(src):
         if v < 0 or v >= vocab_size:
@@ -352,83 +496,52 @@ def tokenize_size_iat_flow(flow_data, tokenizer_size, tokenizer_temporal, seq_le
     """
     Tokenize Packet Size modality (Size + IAT) for a single flow
 
-    Size and IAT belong to the same modality and are processed together.
-    Both sequences have the same length and structure.
-
     Format matches pretraining (data.py PacketSizeDataset):
         - Size: [CLS] + size_tokens + [SEP] + [PAD]...
         - IAT:  [CLS] + iat_tokens + [SEP] + [PAD]...
         - Size token = size * direction + 1500 (direction already encoded)
         - IAT tokens are already discretized to 0-999
-
-    Args:
-        flow_data: dict with:
-            - 'packet_sizes' (List[int]): payload sizes
-            - 'size_directions' (List[int]): directions per packet
-            - 'iat_tokens' (List[int]): IAT bins 0-999
-        tokenizer_size: BertTokenizer for size tokens
-        tokenizer_temporal: BertTokenizer for temporal (IAT) tokens
-        seq_length_size: target sequence length for both modalities
-
-    Returns:
-        size_src: List[int] - size token IDs
-        iat_src: List[int] - IAT token IDs
     """
     vocab_size = tokenizer_size.vocab
     vocab_temporal = tokenizer_temporal.vocab
 
-    # ===== Process Size tokens =====
-    # Build size token string: "1672 2185 953 ..."
     size_tokens_str = []
     for size, direction in zip(flow_data['packet_sizes'], flow_data['size_directions']):
-        # Size token = size * direction + 1500
         size_token = size * direction + 1500
         size_tokens_str.append(str(size_token))
 
-    # Tokenize size
     size_str = ' '.join(size_tokens_str)
     size_tokens = tokenizer_size.tokenize(size_str)
     size_token_ids = tokenizer_size.convert_tokens_to_ids(size_tokens)
 
-    # ===== Process IAT tokens =====
-    # Convert IAT bins to string: "567 123 456 ..."
     iat_str = ' '.join([str(token) for token in flow_data['iat_tokens']])
-
-    # Tokenize IAT
     iat_tokens = tokenizer_temporal.tokenize(iat_str)
     iat_token_ids = tokenizer_temporal.convert_tokens_to_ids(iat_tokens)
 
-    # ===== Ensure Size and IAT have same length (CRITICAL for alignment) =====
-    # This matches pretraining behavior (uer/utils/data.py:1638-1640)
-    # Size and IAT must be synchronized because they represent the same packets
     min_len = min(len(size_token_ids), len(iat_token_ids))
     size_token_ids = size_token_ids[:min_len]
     iat_token_ids = iat_token_ids[:min_len]
 
-    # Truncate to max_tokens
-    max_tokens = seq_length_size - 2  # Reserve for [CLS] and [SEP]
+    max_tokens = seq_length_size - 2
     if len(size_token_ids) > max_tokens:
         size_token_ids = size_token_ids[:max_tokens]
-        iat_token_ids = iat_token_ids[:max_tokens]  # Keep synchronized
+        iat_token_ids = iat_token_ids[:max_tokens]
 
-    # ===== Build sequences with special tokens =====
-    # Size sequence
     cls_id_size = vocab_size.get(CLS_TOKEN, 0)
     sep_id_size = vocab_size.get(SEP_TOKEN, 0)
     size_src = [cls_id_size] + size_token_ids + [sep_id_size]
 
-    # IAT sequence
     cls_id_iat = vocab_temporal.get(CLS_TOKEN, 0)
     sep_id_iat = vocab_temporal.get(SEP_TOKEN, 0)
     iat_src = [cls_id_iat] + iat_token_ids + [sep_id_iat]
 
-    # ===== Padding to seq_length_size =====
-    while len(size_src) < seq_length_size:
-        size_src.append(PAD_ID)
-    while len(iat_src) < seq_length_size:
-        iat_src.append(PAD_ID)
+    pad_len_size = seq_length_size - len(size_src)
+    if pad_len_size > 0:
+        size_src.extend([PAD_ID] * pad_len_size)
+    pad_len_iat = seq_length_size - len(iat_src)
+    if pad_len_iat > 0:
+        iat_src.extend([PAD_ID] * pad_len_iat)
 
-    # Validate token IDs are within embedding range
     size_vocab_len = len(vocab_size)
     for idx, v in enumerate(size_src):
         if v < 0 or v >= size_vocab_len:
@@ -443,14 +556,19 @@ def tokenize_size_iat_flow(flow_data, tokenizer_size, tokenizer_temporal, seq_le
     return size_src, iat_src
 
 
+# ============================================================
+# Main processing pipeline
+# ============================================================
+
 def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
                     seq_length_raw=512, seq_length_size=256,
                     bytes_per_packet=64, max_raw_packets=8, max_size_packets=256,
                     min_samples_per_class=10, max_samples_per_class=500,
                     train_ratio=0.8, val_ratio=0.1, test_ratio=0.1,
-                    seed=42, test_dir=None, raw_token_type='bigram'):
+                    seed=42, test_dir=None, raw_token_type='bigram',
+                    num_workers=None):
     """
-    Process all PCAP files in dataset directory
+    Process all PCAP files in dataset directory with parallel processing.
 
     Args:
         pcap_dir: Root directory with structure: pcap_dir/label_name/*.pcap
@@ -468,11 +586,9 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
         val_ratio: Ratio of validation data
         test_ratio: Ratio of test data (ignored when test_dir is specified)
         seed: Random seed
-        test_dir: Separate test directory. When specified:
-            - pcap_dir is used for train/val only (split by train_ratio:val_ratio)
-            - test_dir provides all test samples
-            - label2id is determined by pcap_dir (train directory)
-            - Samples in test_dir with unknown labels are skipped
+        test_dir: Separate test directory
+        raw_token_type: 'bigram' or 'byte'
+        num_workers: Number of parallel workers (default: cpu_count - 1)
 
     Returns:
         train_data, val_data, test_data: Lists of samples
@@ -481,54 +597,51 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
     random.seed(seed)
     np.random.seed(seed)
 
-    extractor = MultiModalFlowExtractor(
-        bytes_per_packet=bytes_per_packet,
-        max_raw_packets=max_raw_packets,
-        max_size_packets=max_size_packets,
-        raw_token_type=raw_token_type
+    # Build token caches (one-time cost, eliminates tokenizer overhead)
+    raw_cache, size_cache, iat_cache = build_all_caches(
+        tokenizer_raw, tokenizer_size, tokenizer_temporal, raw_token_type
     )
 
-    # Collect all samples per label
-    label_samples = defaultdict(list)
+    extractor_params = {
+        'bytes_per_packet': bytes_per_packet,
+        'max_raw_packets': max_raw_packets,
+        'max_size_packets': max_size_packets,
+        'raw_token_type': raw_token_type
+    }
 
-    # Walk through directory structure
+    vocab_raw = tokenizer_raw.vocab
+    vocab_size_dict = tokenizer_size.vocab
+    vocab_temporal = tokenizer_temporal.vocab
+
+    if num_workers is None:
+        num_workers = max(1, (os.cpu_count() or 1) - 1)
+
+    init_args = (extractor_params, raw_cache, size_cache, iat_cache,
+                 vocab_raw, vocab_size_dict, vocab_temporal,
+                 seq_length_raw, seq_length_size)
+
+    # Collect work items for training directory
+    work_items = []
     print(f"Scanning {pcap_dir}...")
-    for label_name in os.listdir(pcap_dir):
+    for label_name in sorted(os.listdir(pcap_dir)):
         label_path = os.path.join(pcap_dir, label_name)
         if not os.path.isdir(label_path):
             continue
-
         pcap_files = [f for f in os.listdir(label_path)
                       if f.endswith('.pcap') or f.endswith('.pcapng')]
+        print(f"  Found label '{label_name}': {len(pcap_files)} files")
+        for pcap_file in pcap_files:
+            work_items.append((os.path.join(label_path, pcap_file), label_name))
 
-        print(f"Processing label '{label_name}': {len(pcap_files)} files")
+    print(f"Total: {len(work_items)} pcap files, using {num_workers} workers")
 
-        for pcap_file in tqdm(pcap_files, desc=label_name):
-            pcap_path = os.path.join(label_path, pcap_file)
-            flow_data = extractor.extract_pcap(pcap_path)
+    # Process all pcap files in parallel
+    results = _process_items(work_items, num_workers, init_args, desc="Processing train/val")
 
-            if flow_data is None:
-                continue
-
-            # Tokenize raw modality (using tokenizer, same as pretraining)
-            raw_src, packet_ids, directions = tokenize_raw_flow(
-                flow_data, tokenizer_raw, seq_length_raw
-            )
-
-            # Tokenize size modality (Size + IAT together, same modality)
-            size_src, iat_src = tokenize_size_iat_flow(
-                flow_data, tokenizer_size, tokenizer_temporal, seq_length_size
-            )
-
-            sample = {
-                'raw_src': raw_src,
-                'packet_ids': packet_ids,
-                'directions': directions,
-                'size_src': size_src,
-                'iat_src': iat_src,  # NEW: IAT temporal tokens
-                'label_name': label_name
-            }
-            label_samples[label_name].append(sample)
+    # Group by label
+    label_samples = defaultdict(list)
+    for result in results:
+        label_samples[result['label_name']].append(result)
 
     # Filter labels with too few samples
     valid_labels = []
@@ -553,19 +666,15 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
         for label_name in valid_labels:
             samples = label_samples[label_name]
 
-            # Limit max samples
             if len(samples) > max_samples_per_class:
                 samples = random.sample(samples, max_samples_per_class)
 
-            # Shuffle
             random.shuffle(samples)
 
-            # Add label ID
             label_id = label2id[label_name]
             for s in samples:
                 s['label'] = label_id
 
-            # Split
             n = len(samples)
             n_train = int(n * train_ratio)
             n_val = int(n * val_ratio)
@@ -575,8 +684,6 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
             test_data.extend(samples[n_train + n_val:])
     else:
         # Separate test directory mode
-        # Step 1: Split train directory into train/val only
-        # Normalize train_ratio and val_ratio
         total_ratio = train_ratio + val_ratio
         norm_train_ratio = train_ratio / total_ratio
 
@@ -585,72 +692,48 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
         for label_name in valid_labels:
             samples = label_samples[label_name]
 
-            # Limit max samples
             if len(samples) > max_samples_per_class:
                 samples = random.sample(samples, max_samples_per_class)
 
-            # Shuffle
             random.shuffle(samples)
 
-            # Add label ID
             label_id = label2id[label_name]
             for s in samples:
                 s['label'] = label_id
 
-            # Split into train/val only (no test from this directory)
             n = len(samples)
             n_train = int(n * norm_train_ratio)
 
             train_data.extend(samples[:n_train])
             val_data.extend(samples[n_train:])
 
-        # Step 2: Process test directory separately
+        # Process test directory in parallel
         print(f"\nProcessing test directory: {test_dir}")
-        test_label_counts = defaultdict(int)
+        test_items = []
         skipped_labels = set()
 
-        for label_name in os.listdir(test_dir):
+        for label_name in sorted(os.listdir(test_dir)):
             label_path = os.path.join(test_dir, label_name)
             if not os.path.isdir(label_path):
                 continue
 
-            # Check if label exists in train's label2id
             if label_name not in label2id:
                 skipped_labels.add(label_name)
                 continue
 
-            label_id = label2id[label_name]
             pcap_files = [f for f in os.listdir(label_path)
                           if f.endswith('.pcap') or f.endswith('.pcapng')]
+            for pcap_file in pcap_files:
+                test_items.append((os.path.join(label_path, pcap_file), label_name))
 
-            for pcap_file in tqdm(pcap_files, desc=f"Test:{label_name}"):
-                pcap_path = os.path.join(label_path, pcap_file)
-                flow_data = extractor.extract_pcap(pcap_path)
+        test_results = _process_items(test_items, num_workers, init_args, desc="Processing test")
 
-                if flow_data is None:
-                    continue
-
-                # Tokenize raw modality
-                raw_src, packet_ids, directions = tokenize_raw_flow(
-                    flow_data, tokenizer_raw, seq_length_raw
-                )
-
-                # Tokenize size modality
-                size_src, iat_src = tokenize_size_iat_flow(
-                    flow_data, tokenizer_size, tokenizer_temporal, seq_length_size
-                )
-
-                sample = {
-                    'raw_src': raw_src,
-                    'packet_ids': packet_ids,
-                    'directions': directions,
-                    'size_src': size_src,
-                    'iat_src': iat_src,
-                    'label_name': label_name,
-                    'label': label_id
-                }
-                test_data.append(sample)
-                test_label_counts[label_name] += 1
+        test_label_counts = defaultdict(int)
+        for result in test_results:
+            label_name = result['label_name']
+            result['label'] = label2id[label_name]
+            test_data.append(result)
+            test_label_counts[label_name] += 1
 
         if skipped_labels:
             print(f"\nSkipped labels in test_dir (not in train): {sorted(skipped_labels)}")
@@ -724,6 +807,8 @@ def main():
     parser.add_argument('--test_ratio', type=float, default=0.1)
 
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='Number of parallel workers (default: cpu_count - 1)')
 
     args = parser.parse_args()
 
@@ -757,7 +842,8 @@ def main():
         test_ratio=args.test_ratio,
         seed=args.seed,
         test_dir=args.test_dir,
-        raw_token_type=args.raw_token_type
+        raw_token_type=args.raw_token_type,
+        num_workers=args.num_workers
     )
 
     # Save datasets

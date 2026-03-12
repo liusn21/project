@@ -390,6 +390,15 @@ def main():
     parser.add_argument("--gpu_ranks", default=[], nargs='+', type=int,
                         help="List of GPU ranks to use. E.g., --gpu_ranks 2 3 to use GPU 2 and 3.")
 
+    parser.add_argument("--is_moe", action="store_true", help="adopt moe layer.")
+    parser.add_argument("--vocab_size", type=int, required=False, help="Number of vocab.")
+    parser.add_argument("--moebert_expert_dim", type=int, required=False, default=3072, help="Dim of expert,default is ffn.")
+    parser.add_argument("--moebert_expert_num", type=int, required=False, help="Number of expert.")
+    parser.add_argument("--moebert_route_method", choices=["gate-token", "gate-sentence", "hash-random", "hash-balance","proto"], default="hash-random",
+                        help="moebert route method.")
+    parser.add_argument("--moebert_route_hash_list", default=None, type=str, help="Path of moebert hash list file.")
+    parser.add_argument("--moebert_load_balance", type=float, default=0.0, help="gate loss weight.")
+
     args = parser.parse_args()
 
     # Load hyperparameters from config

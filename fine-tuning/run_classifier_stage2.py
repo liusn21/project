@@ -336,62 +336,84 @@ def compute_class_weights(dataset, num_classes, method='sqrt'):
     return weights
 
 
-def batch_loader(batch_size, dataset, shuffle=False):
-    """Generate batches from dataset"""
-    if shuffle:
-        random.shuffle(dataset)
+def pre_tensorize(dataset, pin=False):
+    """
+    Pre-convert list-of-dicts dataset into contiguous tensors (one-time cost).
+    Optionally pin memory for faster CPU->GPU transfer.
+    """
+    tensors = {
+        'raw_src': torch.LongTensor([s['raw_src'] for s in dataset]),
+        'packet_ids': torch.LongTensor([s['packet_ids'] for s in dataset]),
+        'directions': torch.LongTensor([s['directions'] for s in dataset]),
+        'size_src': torch.LongTensor([s['size_src'] for s in dataset]),
+        'iat_src': torch.LongTensor([s['iat_src'] for s in dataset]),
+        'label': torch.LongTensor([s['label'] for s in dataset]),
+    }
+    if pin and torch.cuda.is_available():
+        tensors = {k: v.pin_memory() for k, v in tensors.items()}
+    return tensors
 
-    num_batches = (len(dataset) + batch_size - 1) // batch_size
+
+def batch_loader(batch_size, dataset_tensors, shuffle=False):
+    """Generate batches via index slicing on pre-built tensors"""
+    n = dataset_tensors['label'].size(0)
+    indices = torch.randperm(n) if shuffle else torch.arange(n)
+    num_batches = (n + batch_size - 1) // batch_size
 
     for i in range(num_batches):
-        batch = dataset[i * batch_size: (i + 1) * batch_size]
-
-        raw_src = torch.LongTensor([s['raw_src'] for s in batch])
-        packet_ids = torch.LongTensor([s['packet_ids'] for s in batch])
-        directions = torch.LongTensor([s['directions'] for s in batch])
-        size_src = torch.LongTensor([s['size_src'] for s in batch])
-        iat_src = torch.LongTensor([s['iat_src'] for s in batch])
-        tgt = torch.LongTensor([s['label'] for s in batch])
-
-        yield raw_src, packet_ids, directions, size_src, iat_src, tgt
+        idx = indices[i * batch_size: (i + 1) * batch_size]
+        yield (dataset_tensors['raw_src'][idx],
+               dataset_tensors['packet_ids'][idx],
+               dataset_tensors['directions'][idx],
+               dataset_tensors['size_src'][idx],
+               dataset_tensors['iat_src'][idx],
+               dataset_tensors['label'][idx])
 
 
-def train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema):
-    """Train for one epoch"""
+def train_epoch(args, model, optimizer, scheduler, train_data_tensors, criterion, ema, scaler=None):
+    """Train for one epoch (with optional AMP via scaler)"""
     model.train()
     total_loss = 0.0
     step = 0
+    use_amp = scaler is not None
 
-    for raw_src, packet_ids, directions, size_src, iat_src, tgt in batch_loader(args.batch_size, train_data, shuffle=True):
-        raw_src = raw_src.to(args.device)
-        packet_ids = packet_ids.to(args.device)
-        directions = directions.to(args.device)
-        size_src = size_src.to(args.device)
-        iat_src = iat_src.to(args.device)
-        tgt = tgt.to(args.device)
+    for raw_src, packet_ids, directions, size_src, iat_src, tgt in batch_loader(args.batch_size, train_data_tensors, shuffle=True):
+        raw_src = raw_src.to(args.device, non_blocking=True)
+        packet_ids = packet_ids.to(args.device, non_blocking=True)
+        directions = directions.to(args.device, non_blocking=True)
+        size_src = size_src.to(args.device, non_blocking=True)
+        iat_src = iat_src.to(args.device, non_blocking=True)
+        tgt = tgt.to(args.device, non_blocking=True)
 
-        model.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
-        # Get logits from model
-        logits = model(raw_src, packet_ids, directions, size_src, iat_src)
+        # Forward pass (with optional AMP autocast)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logits = model(raw_src, packet_ids, directions, size_src, iat_src)
+            loss = criterion(logits, tgt)
+            # Handle DataParallel case
+            if loss.dim() > 0:
+                loss = torch.mean(loss)
 
-        # Compute loss
-        loss = criterion(logits, tgt)
+        if use_amp:
+            scaler.scale(loss).backward()
+            if args.max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                if hasattr(model, 'module'):
+                    torch.nn.utils.clip_grad_norm_(model.module.parameters(), args.max_grad_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if args.max_grad_norm > 0:
+                if hasattr(model, 'module'):
+                    torch.nn.utils.clip_grad_norm_(model.module.parameters(), args.max_grad_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
 
-        # Handle DataParallel case
-        if loss.dim() > 0:
-            loss = torch.mean(loss)
-
-        loss.backward()
-
-        # Gradient clipping
-        if args.max_grad_norm > 0:
-            if hasattr(model, 'module'):
-                torch.nn.utils.clip_grad_norm_(model.module.parameters(), args.max_grad_norm)
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-        optimizer.step()
         scheduler.step()
 
         # EMA update
@@ -406,7 +428,7 @@ def train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema):
     return total_loss / step
 
 
-def evaluate(args, model, eval_data, print_confusion=False):
+def evaluate(args, model, eval_tensors, print_confusion=False):
     """Evaluate model on dataset"""
     model.eval()
 
@@ -414,13 +436,13 @@ def evaluate(args, model, eval_data, print_confusion=False):
     confusion = torch.zeros(args.labels_num, args.labels_num, dtype=torch.long)
 
     with torch.no_grad():
-        for raw_src, packet_ids, directions, size_src, iat_src, tgt in batch_loader(args.batch_size, eval_data):
-            raw_src = raw_src.to(args.device)
-            packet_ids = packet_ids.to(args.device)
-            directions = directions.to(args.device)
-            size_src = size_src.to(args.device)
-            iat_src = iat_src.to(args.device)
-            tgt = tgt.to(args.device)
+        for raw_src, packet_ids, directions, size_src, iat_src, tgt in batch_loader(args.batch_size, eval_tensors):
+            raw_src = raw_src.to(args.device, non_blocking=True)
+            packet_ids = packet_ids.to(args.device, non_blocking=True)
+            directions = directions.to(args.device, non_blocking=True)
+            size_src = size_src.to(args.device, non_blocking=True)
+            iat_src = iat_src.to(args.device, non_blocking=True)
+            tgt = tgt.to(args.device, non_blocking=True)
 
             logits = model(raw_src, packet_ids, directions, size_src, iat_src)
             pred = torch.argmax(logits, dim=-1)
@@ -697,6 +719,15 @@ def main():
                         choices=["linear", "cosine", "cosine_with_restarts", "constant_with_warmup"],
                         help="Scheduler for Phase 2 (default: cosine)")
 
+    parser.add_argument("--is_moe", action="store_true", help="adopt moe layer.")
+    parser.add_argument("--vocab_size", type=int, required=False, help="Number of vocab.")
+    parser.add_argument("--moebert_expert_dim", type=int, required=False, default=3072, help="Dim of expert,default is ffn.")
+    parser.add_argument("--moebert_expert_num", type=int, required=False, help="Number of expert.")
+    parser.add_argument("--moebert_route_method", choices=["gate-token", "gate-sentence", "hash-random", "hash-balance","proto"], default="hash-random",
+                        help="moebert route method.")
+    parser.add_argument("--moebert_route_hash_list", default=None, type=str, help="Path of moebert hash list file.")
+    parser.add_argument("--moebert_load_balance", type=float, default=0.0, help="gate loss weight.")
+
     # GPU options
     parser.add_argument("--world_size", type=int, default=1,
                         help="Total number of processes (GPUs) for training.")
@@ -739,6 +770,14 @@ def main():
     test_data = load_dataset(args.test_path) if args.test_path else None
 
     print(f"Train: {len(train_data)}, Dev: {len(dev_data)}, Test: {len(test_data) if test_data else 0}")
+
+    # Pre-tensorize datasets (one-time cost, avoids per-batch list comprehension)
+    use_pin = torch.cuda.is_available()
+    print("Pre-tensorizing datasets...")
+    train_tensors = pre_tensorize(train_data, pin=use_pin)
+    dev_tensors = pre_tensorize(dev_data, pin=use_pin)
+    test_tensors = pre_tensorize(test_data, pin=use_pin) if test_data else None
+    print("  Done.")
 
     # Build model
     print("Building model...")
@@ -786,6 +825,11 @@ def main():
         model = model.to(args.device)
         print("Using CPU mode")
 
+    # torch.compile (PyTorch 2.0+): fuse kernels for faster training
+    if hasattr(torch, 'compile') and args.device.type == 'cuda':
+        model = torch.compile(model)
+        print("torch.compile: Enabled")
+
     # Build loss criterion
     print("\nSetting up loss function...")
     class_weights = None
@@ -802,6 +846,12 @@ def main():
     print(f"  Label smoothing: {args.label_smoothing}")
     print(f"  Class weights: {'Enabled (' + args.class_weight_method + ')' if args.use_class_weight else 'Disabled'}")
     print(f"  Gradient clipping: {args.max_grad_norm if args.max_grad_norm > 0 else 'Disabled'}")
+
+    # AMP GradScaler (only for CUDA)
+    use_amp = args.device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp else None
+    if use_amp:
+        print(f"  AMP: Enabled (mixed precision training)")
 
     best_f1 = 0.0
     best_epoch = 0
@@ -829,11 +879,11 @@ def main():
             print(f"\n[Phase 1] Epoch {epoch}/{args.phase1_epochs}")
             print("-" * 30)
 
-            avg_loss = train_epoch(args, model, p1_optimizer, p1_scheduler, train_data, criterion, ema_dummy)
+            avg_loss = train_epoch(args, model, p1_optimizer, p1_scheduler, train_tensors, criterion, ema_dummy, scaler)
             print(f"Training loss: {avg_loss:.4f}")
 
             print("Validation:")
-            f1, _ = evaluate(args, model, dev_data)
+            f1, _ = evaluate(args, model, dev_tensors)
 
             if f1 > best_f1:
                 best_f1 = f1
@@ -869,17 +919,17 @@ def main():
             print(f"\n[Phase 2] Epoch {epoch}/{args.epochs_num}")
             print("-" * 30)
 
-            avg_loss = train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema)
+            avg_loss = train_epoch(args, model, optimizer, scheduler, train_tensors, criterion, ema, scaler)
             print(f"Training loss: {avg_loss:.4f}")
 
             # Evaluate with both original and EMA weights
             print("Validation:")
             print("  [Original weights]")
-            f1_orig, _ = evaluate(args, model, dev_data)
+            f1_orig, _ = evaluate(args, model, dev_tensors)
 
             ema.apply_shadow()
             print("  [EMA weights]")
-            f1_ema, _ = evaluate(args, model, dev_data)
+            f1_ema, _ = evaluate(args, model, dev_tensors)
             ema.restore()
 
             if f1_ema >= f1_orig:
@@ -932,7 +982,7 @@ def main():
             print("-" * 30)
 
             # Train
-            avg_loss = train_epoch(args, model, optimizer, scheduler, train_data, criterion, ema)
+            avg_loss = train_epoch(args, model, optimizer, scheduler, train_tensors, criterion, ema, scaler)
             print(f"Training loss: {avg_loss:.4f}")
 
             # Initialize EMA after first epoch
@@ -943,14 +993,14 @@ def main():
             # Evaluate on dev set
             print("\nValidation:")
             print("  [Original weights]")
-            f1_orig, _ = evaluate(args, model, dev_data)
+            f1_orig, _ = evaluate(args, model, dev_tensors)
 
             # EMA evaluation (only after initialization)
             use_ema_for_save = False
             if ema.initialized:
                 ema.apply_shadow()
                 print("  [EMA weights]")
-                f1_ema, _ = evaluate(args, model, dev_data)
+                f1_ema, _ = evaluate(args, model, dev_tensors)
                 ema.restore()
 
                 if f1_ema >= f1_orig:
@@ -994,7 +1044,7 @@ def main():
         else:
             model.load_state_dict(torch.load(args.output_model_path, map_location=args.device))
 
-        evaluate(args, model, test_data, print_confusion=True)
+        evaluate(args, model, test_tensors, print_confusion=True)
 
     print("\nTraining complete!")
     print(f"Best validation F1: {best_f1:.4f} at epoch {best_epoch}")
