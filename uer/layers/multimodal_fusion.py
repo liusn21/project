@@ -6,10 +6,15 @@ Architecture:
 - 每层包含: Self-Attention + Cross-Attention (双向) + FFN
 - 参考LXMERT的双向设计
 
-Gate mechanism - ITGCA (Information-Theoretic Gated Cross-Attention):
-- Modality gate: flow-level Shannon entropy prior + bilinear CLS correction
-- Token gate: local sliding-window entropy prior + SA residual correction
-- Hierarchical temperature modulation: g = r_mod * g_token + (1-r_mod) * g_default
+Gate mechanism - ITGCA (Information-Theoretic Gated Cross-Attention) — Asymmetric:
+- Size←Raw (Raw source, may degrade):
+  - Source-side V gating: V_raw *= 0.1 + 0.9 * local_ent_raw
+  - Modality gate: flow-level Shannon entropy prior + bilinear CLS correction
+  - Token gate: pure learned (SA residual)
+- Raw←Size (Size source, stable):
+  - Modality gate: pure learned (no statistical prior)
+  - Token gate: pure learned (SA residual)
+- Hierarchical: g = r_mod * g_token + (1-r_mod) * g_default
 - Gate applied AFTER final_linear, per-position [B, L_q, 1]
 """
 
@@ -23,23 +28,25 @@ from uer.layers.position_ffn import PositionwiseFeedForward
 
 class ITGCrossAttentionGate(nn.Module):
     """
-    Information-Theoretic Gated Cross-Attention Gate (ITGCA)
+    Information-Theoretic Gated Cross-Attention Gate (ITGCA) — Asymmetric
 
     Hierarchical gate:
-    1. Modality gate (r_mod): flow-level Shannon entropy prior + bilinear CLS correction
-       r_mod = r_stat + sigmoid(alpha_1) * (r_learned - r_stat)
+    1. Modality gate (r_mod):
+       - If has_modality_prior: r_mod = r_stat + sigmoid(alpha_1) * (r_learned - r_stat)
+       - Otherwise: r_mod = r_learned (pure learned)
 
-    2. Token gate (g_token): local sliding-window entropy prior + SA residual correction
-       g_token = t_stat + sigmoid(alpha_2) * (t_learned - t_stat)
+    2. Token gate (g_token): pure learned from SA residual
+       g_token = sigmoid(sum(W_k(q) * W_v(delta)))
 
     Combined: g = r_mod * g_token + (1 - r_mod) * sigmoid(g_default_logit)
     Output: [B, L_q, 1] (per-position, applied after final_linear)
     """
 
-    def __init__(self, hidden_size, dropout=0.1):
+    def __init__(self, hidden_size, dropout=0.1, has_modality_prior=False):
         super(ITGCrossAttentionGate, self).__init__()
 
         self.hidden_size = hidden_size
+        self.has_modality_prior = has_modality_prior
         bottleneck = hidden_size // 4
 
         # ===== Modality Gate =====
@@ -49,30 +56,29 @@ class ITGCrossAttentionGate(nn.Module):
         nn.init.xavier_uniform_(self.bilinear_W, gain=0.1)
 
         # alpha_1: gated residual mixing. sigmoid(-2.0) ≈ 0.12
-        self.alpha_modality = nn.Parameter(torch.tensor(-2.0))
+        # Only created when has_modality_prior=True (Size←Raw direction)
+        if self.has_modality_prior:
+            self.alpha_modality = nn.Parameter(torch.tensor(-2.0))
 
-        # ===== Token Gate =====
-        # SA residual pointwise attention: t_learned = sigmoid(sum(W_k(q) * W_v(delta)))
+        # ===== Token Gate (pure learned, no local_ent prior) =====
+        # SA residual pointwise attention: g_token = sigmoid(sum(W_k(q) * W_v(delta)))
         self.W_k = nn.Linear(hidden_size, bottleneck, bias=False)
         self.W_v = nn.Linear(hidden_size, bottleneck, bias=False)
-
-        # alpha_2: gated residual mixing. sigmoid(-2.0) ≈ 0.12
-        self.alpha_token = nn.Parameter(torch.tensor(-2.0))
 
         # ===== Default gate (when modality unreliable) =====
         # sigmoid(0.0) = 0.5
         self.g_default_logit = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, query_feat, sa_delta, encoder_cls_q, encoder_cls_k,
-                r_stat, local_ent_q):
+                r_stat):
         """
         Args:
             query_feat: [B, L_q, H] - Query features (post-SA, post-LayerNorm)
             sa_delta: [B, L_q, H] - SA residual (post_SA_normed - pre_SA)
             encoder_cls_q: [B, H] - Query encoder CLS (detached, pre-fusion)
             encoder_cls_k: [B, H] - Source encoder CLS (detached, pre-fusion)
-            r_stat: [B] - Statistical reliability of source modality
-            local_ent_q: [B, L_q] - Local entropy reliability for query positions
+            r_stat: [B] or None - Statistical reliability of source modality
+                    (only used when has_modality_prior=True)
 
         Returns:
             gate: [B, L_q, 1] - Final gate values
@@ -88,20 +94,19 @@ class ITGCrossAttentionGate(nn.Module):
         ) + self.bilinear_bias.squeeze()  # [B]
         r_learned = torch.sigmoid(r_logit)  # [B]
 
-        # Gated residual: r_mod = r_stat + beta_1 * (r_learned - r_stat)
-        beta_1 = torch.sigmoid(self.alpha_modality)
-        r_mod = r_stat + beta_1 * (r_learned - r_stat)  # [B]
+        if self.has_modality_prior and r_stat is not None:
+            # Gated residual: r_mod = r_stat + beta_1 * (r_learned - r_stat)
+            beta_1 = torch.sigmoid(self.alpha_modality)
+            r_mod = r_stat + beta_1 * (r_learned - r_stat)  # [B]
+        else:
+            r_mod = r_learned  # [B]
 
-        # ===== Token Gate =====
-        # t_learned = sigmoid(sum(W_k(query) * W_v(delta), dim=-1))
+        # ===== Token Gate (pure learned) =====
+        # g_token = sigmoid(sum(W_k(query) * W_v(delta), dim=-1))
         q_proj = self.W_k(query_feat)   # [B, L_q, bottleneck]
         d_proj = self.W_v(sa_delta)     # [B, L_q, bottleneck]
         t_logit = (q_proj * d_proj).sum(dim=-1)  # [B, L_q]
-        t_learned = torch.sigmoid(t_logit)  # [B, L_q]
-
-        # Gated residual: g_token = t_stat + beta_2 * (t_learned - t_stat)
-        beta_2 = torch.sigmoid(self.alpha_token)
-        g_token = local_ent_q + beta_2 * (t_learned - local_ent_q)  # [B, L_q]
+        g_token = torch.sigmoid(t_logit)  # [B, L_q]
 
         # ===== Hierarchical Combination =====
         # g = r_mod * g_token + (1 - r_mod) * g_default
@@ -197,16 +202,18 @@ class BidirectionalFusionLayer(nn.Module):
         self.layer_norm_size_3 = LayerNorm(hidden_size)
         self.dropout_size_3 = nn.Dropout(dropout)
 
-        # ===== Gate Modules =====
+        # ===== Gate Modules (Asymmetric) =====
         if self.use_itgca:
-            self.gate_raw = ITGCrossAttentionGate(hidden_size, dropout)
-            self.gate_size = ITGCrossAttentionGate(hidden_size, dropout)
+            # Raw←Size: no statistical prior (Size is stable source)
+            self.gate_raw = ITGCrossAttentionGate(hidden_size, dropout, has_modality_prior=False)
+            # Size←Raw: has modality prior (Raw source may degrade)
+            self.gate_size = ITGCrossAttentionGate(hidden_size, dropout, has_modality_prior=True)
 
     def forward(self, raw_feat, size_feat, raw_mask, size_mask,
                 cross_mask_r2s, cross_mask_s2r,
                 raw_cls_enc=None, size_cls_enc=None,
-                r_stat_raw=None, r_stat_size=None,
-                local_ent_raw=None, local_ent_size=None):
+                r_stat_raw=None,
+                local_ent_raw=None):
         """
         Args:
             raw_feat: [batch, seq_len_raw, hidden]
@@ -217,10 +224,8 @@ class BidirectionalFusionLayer(nn.Module):
             cross_mask_s2r: [batch, 1, seq_len_size, seq_len_raw]
             raw_cls_enc: [batch, hidden] - Raw encoder CLS (detached), for ITGCA
             size_cls_enc: [batch, hidden] - Size encoder CLS (detached), for ITGCA
-            r_stat_raw: [batch] - Raw flow-level reliability, for ITGCA
-            r_stat_size: [batch] - Size flow-level reliability, for ITGCA
-            local_ent_raw: [batch, seq_len_raw] - Raw local entropy reliability, for ITGCA
-            local_ent_size: [batch, seq_len_size] - Size local entropy reliability, for ITGCA
+            r_stat_raw: [batch] - Raw flow-level reliability, for ITGCA (Size←Raw direction only)
+            local_ent_raw: [batch, seq_len_raw] - Raw local entropy, for source-side V gating
 
         Returns:
             raw_out: [batch, seq_len_raw, hidden]
@@ -244,27 +249,34 @@ class BidirectionalFusionLayer(nn.Module):
             raw_delta = raw_feat_sa - raw_feat    # [B, L_raw, H]
             size_delta = size_feat_sa - size_feat  # [B, L_size, H]
 
-            # Gate for Raw←Size (raw receives from size)
-            # Source is size, so r_stat = r_stat_size; query is raw, so local_ent = local_ent_raw
+            # Gate for Raw←Size (raw receives from size): no statistical prior
             gate_raw, r_mod_r2s = self.gate_raw(
                 raw_feat_sa, raw_delta, raw_cls_enc, size_cls_enc,
-                r_stat_size, local_ent_raw
+                r_stat=None
             )
 
-            # Gate for Size←Raw (size receives from raw)
-            # Source is raw, so r_stat = r_stat_raw; query is size, so local_ent = local_ent_size
+            # Gate for Size←Raw (size receives from raw): has modality prior
             gate_size, r_mod_s2r = self.gate_size(
                 size_feat_sa, size_delta, size_cls_enc, raw_cls_enc,
-                r_stat_raw, local_ent_size
+                r_stat=r_stat_raw
             )
 
+            # Source-side V gating for Size←Raw: scale Raw values by local entropy
+            # raw_V_gated ∈ [0.1, 1.0] * raw_feat_sa (low entropy → attenuated)
+            if local_ent_raw is not None:
+                raw_V_gated = raw_feat_sa * (0.1 + 0.9 * local_ent_raw.unsqueeze(-1))
+            else:
+                raw_V_gated = raw_feat_sa
+
             # Cross-attention with ITGCA gate
+            # Raw←Size: Key=size, Value=size, Query=raw
             raw_cross, _ = self.cross_attn_raw(
                 size_feat_sa, size_feat_sa, raw_feat_sa,
                 cross_mask_r2s, None, logits_gate=gate_raw
             )
+            # Size←Raw: Key=raw, Value=raw_V_gated (source-side gated), Query=size
             size_cross, _ = self.cross_attn_size(
-                raw_feat_sa, raw_feat_sa, size_feat_sa,
+                raw_feat_sa, raw_V_gated, size_feat_sa,
                 cross_mask_s2r, None, logits_gate=gate_size
             )
 
@@ -330,8 +342,8 @@ class MultiModalFusionEncoder(nn.Module):
 
     def forward(self, raw_feat, size_feat, raw_seg, size_seg,
                 raw_cls_enc=None, size_cls_enc=None,
-                r_stat_raw=None, r_stat_size=None,
-                local_ent_raw=None, local_ent_size=None):
+                r_stat_raw=None,
+                local_ent_raw=None):
         """
         Args:
             raw_feat: [batch, seq_len_raw, hidden]
@@ -340,10 +352,8 @@ class MultiModalFusionEncoder(nn.Module):
             size_seg: [batch, seq_len_size] - for mask generation
             raw_cls_enc: [batch, hidden] - Raw encoder CLS (detached), for ITGCA
             size_cls_enc: [batch, hidden] - Size encoder CLS (detached), for ITGCA
-            r_stat_raw: [batch] - Raw flow-level reliability, for ITGCA
-            r_stat_size: [batch] - Size flow-level reliability, for ITGCA
-            local_ent_raw: [batch, seq_len_raw] - Raw local entropy reliability, for ITGCA
-            local_ent_size: [batch, seq_len_size] - Size local entropy reliability, for ITGCA
+            r_stat_raw: [batch] - Raw flow-level reliability, for ITGCA (Size←Raw only)
+            local_ent_raw: [batch, seq_len_raw] - Raw local entropy, for source-side V gating
 
         Returns:
             raw_fused: [batch, seq_len_raw, hidden]
@@ -384,9 +394,7 @@ class MultiModalFusionEncoder(nn.Module):
                 raw_cls_enc=raw_cls_enc,
                 size_cls_enc=size_cls_enc,
                 r_stat_raw=r_stat_raw,
-                r_stat_size=r_stat_size,
-                local_ent_raw=local_ent_raw,
-                local_ent_size=local_ent_size
+                local_ent_raw=local_ent_raw
             )
             if gate_info is not None:
                 all_gate_info.append(gate_info)

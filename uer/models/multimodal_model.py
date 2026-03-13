@@ -79,87 +79,71 @@ def compute_flow_reliability_raw(raw_src, pad_id=0):
     return torch.from_numpy(result).to(device)
 
 
-@torch.no_grad()
-def compute_flow_reliability_size(size_src, pad_id=0):
+def compute_local_entropy_np(tokens_np, window_size=16, pad_id=0):
     """
-    Compute flow-level reliability for size modality.
-    r_stat = unique_tokens / total_tokens (token diversity)
+    Compute local sliding-window Shannon entropy for each position (pure numpy).
 
-    Encryption doesn't change packet sizes, so this is usually moderate-to-high.
-
-    Args:
-        size_src: [B, L] - Size token IDs
-        pad_id: PAD token ID to exclude
-
-    Returns:
-        reliability: [B] - Flow-level reliability in [0, 1]
-    """
-    B, L = size_src.shape
-    device = size_src.device
-    tokens_cpu = size_src.cpu().numpy()
-    result = np.zeros(B, dtype=np.float32)
-
-    for b in range(B):
-        tokens = tokens_cpu[b]
-        tokens = tokens[tokens != pad_id]
-        n = len(tokens)
-        if n == 0:
-            result[b] = 0.0
-            continue
-        num_unique = len(np.unique(tokens))
-        result[b] = min(1.0, num_unique / n)
-
-    return torch.from_numpy(result).to(device)
-
-
-@torch.no_grad()
-def compute_local_entropy(tokens, window_size=16, pad_id=0):
-    """
-    Compute local sliding-window Shannon entropy for each position.
+    Can be called from DataLoader workers (no torch dependency).
     t_stat[j] = 1 - H(window_j) / log(window_size)
 
-    High entropy (encrypted/random) → t_stat ≈ 0 (unreliable)
-    Low entropy (structured patterns) → t_stat ≈ 1 (reliable)
-
-    This signal is:
-    - Precomputed from raw input tokens (no model dependency)
-    - Zero GPU cost (computed on CPU, no gradients)
-    - Domain-specific: exploits encryption's local high-entropy fingerprint
-
     Args:
-        tokens: [B, L] - Token IDs
+        tokens_np: numpy array [L] (single sample) or [B, L] (batch)
         window_size: Sliding window size (default 16)
         pad_id: PAD token ID to exclude
 
     Returns:
-        local_reliability: [B, L] - Per-position reliability in [0, 1]
+        numpy array of same shape as input, values in [0, 1]
     """
-    B, L = tokens.shape
-    device = tokens.device
+    if tokens_np.ndim == 1:
+        tokens_np = tokens_np[np.newaxis, :]  # [1, L]
+        squeeze = True
+    else:
+        squeeze = False
+
+    B, L = tokens_np.shape
     half_w = window_size // 2
     H_max = math.log(window_size) if window_size > 1 else 1.0
 
-    tokens_cpu = tokens.cpu().numpy()
     result = np.zeros((B, L), dtype=np.float32)
 
     for b in range(B):
         for j in range(L):
-            if tokens_cpu[b, j] == pad_id:
-                result[b, j] = 0.0  # PAD position → unreliable
+            if tokens_np[b, j] == pad_id:
                 continue
             start = max(0, j - half_w)
             end = min(L, j + half_w + 1)
-            window = tokens_cpu[b, start:end]
+            window = tokens_np[b, start:end]
             window = window[window != pad_id]
             n = len(window)
             if n <= 1:
-                result[b, j] = 1.0  # Single token → fully reliable
+                result[b, j] = 1.0
                 continue
             _, counts = np.unique(window, return_counts=True)
             probs = counts.astype(np.float32) / n
             entropy = -np.sum(probs * np.log(probs + 1e-10))
             result[b, j] = max(0.0, min(1.0, 1.0 - entropy / H_max))
 
+    return result[0] if squeeze else result
+
+
+@torch.no_grad()
+def compute_local_entropy(tokens, window_size=16, pad_id=0):
+    """
+    Compute local sliding-window Shannon entropy (torch wrapper).
+
+    Prefer using precomputed local_ent from DataLoader to avoid GPU idle time.
+    This function is kept for inference / fine-tuning where precomputation is not set up.
+
+    Args:
+        tokens: [B, L] - Token IDs (torch tensor)
+        window_size: Sliding window size (default 16)
+        pad_id: PAD token ID to exclude
+
+    Returns:
+        local_reliability: [B, L] - Per-position reliability in [0, 1]
+    """
+    device = tokens.device
+    result = compute_local_entropy_np(tokens.cpu().numpy(), window_size, pad_id)
     return torch.from_numpy(result).to(device)
 
 
@@ -344,23 +328,28 @@ class MultiModalModel(nn.Module):
 
         self.queue_ptr[0] = ptr
 
-    def _compute_itgca_signals(self, raw_src, size_src, raw_cls, size_cls):
+    def _compute_itgca_signals(self, raw_src, raw_cls, size_cls,
+                               local_ent_raw=None):
         """
-        Compute all ITGCA statistical priors and encoder CLS signals.
+        Compute ITGCA statistical priors and encoder CLS signals (asymmetric).
+
+        Only computes priors for the Raw modality (Size is stable, no prior needed).
 
         Args:
             raw_src: [B, L_raw] - Raw token IDs
-            size_src: [B, L_size] - Size token IDs
             raw_cls: [B, H] - Raw encoder CLS (will be detached)
             size_cls: [B, H] - Size encoder CLS (will be detached)
+            local_ent_raw: [B, L_raw] or None - Precomputed local entropy (from DataLoader)
 
         Returns:
             itgca_kwargs: dict of keyword arguments for fusion forward
         """
         r_stat_raw = compute_flow_reliability_raw(raw_src)
-        r_stat_size = compute_flow_reliability_size(size_src)
-        local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
-        local_ent_size = compute_local_entropy(size_src, self.itgca_window_size)
+
+        # Use precomputed local entropy if available, otherwise compute on-the-fly
+        if local_ent_raw is None:
+            local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
+
         raw_cls_enc = raw_cls.detach()
         size_cls_enc = size_cls.detach()
 
@@ -368,19 +357,20 @@ class MultiModalModel(nn.Module):
             'raw_cls_enc': raw_cls_enc,
             'size_cls_enc': size_cls_enc,
             'r_stat_raw': r_stat_raw,
-            'r_stat_size': r_stat_size,
             'local_ent_raw': local_ent_raw,
-            'local_ent_size': local_ent_size,
         }
 
-    def _compute_itgca_losses(self, gate_info_list, r_stat_raw, r_stat_size):
+    def _compute_itgca_losses(self, gate_info_list, r_stat_raw):
         """
-        Compute ITGCA auxiliary losses from gate info.
+        Compute ITGCA auxiliary losses from gate info (asymmetric).
+
+        CRC loss only for Size←Raw direction (where r_stat_raw is the prior).
+        Raw←Size has no statistical prior, so no CRC needed.
+        Entropy regularization applies to all gates (both directions).
 
         Args:
             gate_info_list: list of gate_info dicts (one per fusion layer)
             r_stat_raw: [B] - Raw statistical reliability
-            r_stat_size: [B] - Size statistical reliability
 
         Returns:
             crc_loss: scalar - CRC ranking loss
@@ -390,11 +380,8 @@ class MultiModalModel(nn.Module):
         all_gates = []
 
         for gi in gate_info_list:
-            # CRC for raw←size direction (source is size)
-            crc_r2s = compute_crc_loss(gi['r_mod_r2s'], r_stat_size, self.crc_margin)
-            # CRC for size←raw direction (source is raw)
-            crc_s2r = compute_crc_loss(gi['r_mod_s2r'], r_stat_raw, self.crc_margin)
-            crc_loss = crc_loss + (crc_r2s + crc_s2r) / 2
+            # CRC only for Size←Raw direction (source is raw, has statistical prior)
+            crc_loss = crc_loss + compute_crc_loss(gi['r_mod_s2r'], r_stat_raw, self.crc_margin)
 
             all_gates.append(gi['gate_raw'])
             all_gates.append(gi['gate_size'])
@@ -407,7 +394,8 @@ class MultiModalModel(nn.Module):
     def forward(self, raw_src, raw_packet_ids, raw_directions,
                 size_src_clean, iat_src_clean,
                 size_src_masked, iat_src_masked,
-                tgt_mlm_size, tgt_mlm_temporal):
+                tgt_mlm_size, tgt_mlm_temporal,
+                local_ent_raw=None):
         """
         Forward pass for training with Masked Reconstruction (ALBEF-style).
 
@@ -421,6 +409,7 @@ class MultiModalModel(nn.Module):
             iat_src_masked: [batch, seq_len_size] - IAT token IDs (masked, for reconstruction)
             tgt_mlm_size: [batch, seq_len_size] - Size reconstruction targets
             tgt_mlm_temporal: [batch, seq_len_size] - Temporal reconstruction targets
+            local_ent_raw: [batch, seq_len_raw] or None - Precomputed local entropy from DataLoader
 
         Returns:
             loss_dict: Dictionary containing all losses and metrics
@@ -444,7 +433,8 @@ class MultiModalModel(nn.Module):
         # ===== ITGCA: Compute statistical priors =====
         if self.use_itgca:
             itgca_kwargs = self._compute_itgca_signals(
-                raw_src, size_src_clean, raw_cls, size_cls
+                raw_src, raw_cls, size_cls,
+                local_ent_raw=local_ent_raw
             )
         else:
             itgca_kwargs = {}
@@ -501,9 +491,7 @@ class MultiModalModel(nn.Module):
                 'raw_cls_enc': itgca_kwargs['raw_cls_enc'],
                 'size_cls_enc': itgca_kwargs['size_cls_enc'][neg_size_idx],
                 'r_stat_raw': itgca_kwargs['r_stat_raw'],
-                'r_stat_size': itgca_kwargs['r_stat_size'][neg_size_idx],
                 'local_ent_raw': itgca_kwargs['local_ent_raw'],
-                'local_ent_size': itgca_kwargs['local_ent_size'][neg_size_idx],
             }
         else:
             itgca_kwargs_neg1 = {}
@@ -524,9 +512,7 @@ class MultiModalModel(nn.Module):
                 'raw_cls_enc': itgca_kwargs['raw_cls_enc'][neg_raw_idx],
                 'size_cls_enc': itgca_kwargs['size_cls_enc'],
                 'r_stat_raw': itgca_kwargs['r_stat_raw'][neg_raw_idx],
-                'r_stat_size': itgca_kwargs['r_stat_size'],
                 'local_ent_raw': itgca_kwargs['local_ent_raw'][neg_raw_idx],
-                'local_ent_size': itgca_kwargs['local_ent_size'],
             }
         else:
             itgca_kwargs_neg2 = {}
@@ -571,8 +557,7 @@ class MultiModalModel(nn.Module):
         if self.use_itgca and gate_info_pos is not None:
             crc_loss, ent_loss = self._compute_itgca_losses(
                 gate_info_pos,
-                itgca_kwargs['r_stat_raw'],
-                itgca_kwargs['r_stat_size']
+                itgca_kwargs['r_stat_raw']
             )
         else:
             crc_loss = torch.tensor(0.0, device=raw_src.device)
@@ -617,7 +602,7 @@ class MultiModalModel(nn.Module):
             raw_cls = raw_output[:, 0, :]
             size_cls = size_output[:, 0, :]
             itgca_kwargs = self._compute_itgca_signals(
-                raw_src, size_src, raw_cls, size_cls
+                raw_src, raw_cls, size_cls
             )
         else:
             itgca_kwargs = {}

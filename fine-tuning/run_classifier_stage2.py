@@ -95,7 +95,7 @@ from uer.utils.constants import PAD_ID
 from uer.utils import *
 from uer.opts import finetune_opts
 from uer.models.multimodal_model import (
-    compute_flow_reliability_raw, compute_flow_reliability_size, compute_local_entropy
+    compute_flow_reliability_raw, compute_local_entropy
 )
 
 
@@ -177,9 +177,7 @@ class Stage2Classifier(nn.Module):
                 'raw_cls_enc': raw_cls,
                 'size_cls_enc': size_cls,
                 'r_stat_raw': compute_flow_reliability_raw(raw_src),
-                'r_stat_size': compute_flow_reliability_size(size_src),
                 'local_ent_raw': compute_local_entropy(raw_src, self.itgca_window_size),
-                'local_ent_size': compute_local_entropy(size_src, self.itgca_window_size),
             }
         else:
             itgca_kwargs = {}

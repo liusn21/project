@@ -20,6 +20,7 @@ from uer.layers import RawPacketEmbedding, PacketSizeEmbedding
 from uer.layers.multimodal_fusion import MultiModalFusionEncoder
 from uer.encoders import str2encoder
 from uer.utils.constants import PAD_ID
+from uer.models.multimodal_model import compute_flow_reliability_raw, compute_local_entropy
 
 
 class WindowFeatureExtractor(nn.Module):
@@ -41,6 +42,10 @@ class WindowFeatureExtractor(nn.Module):
 
         self.hidden_size = args.hidden_size
 
+        # ITGCA support
+        self.use_itgca = getattr(args, 'use_itgca', False)
+        self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
+
         # Raw modality encoder
         self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
         self.encoder_raw = str2encoder[args.encoder](args)
@@ -51,8 +56,7 @@ class WindowFeatureExtractor(nn.Module):
 
         # Fusion module
         num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
-        use_itgca = getattr(args, 'use_itgca', False)
-        self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_itgca=use_itgca)
+        self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_itgca=self.use_itgca)
 
     def forward(self, raw_src, packet_ids, directions, size_src, iat_src):
         """
@@ -78,8 +82,21 @@ class WindowFeatureExtractor(nn.Module):
         size_seg = (size_src != PAD_ID).long()
         size_output = self.encoder_size(size_emb, size_seg)
 
+        # ITGCA signals
+        if self.use_itgca:
+            raw_cls = raw_output[:, 0, :].detach()
+            size_cls = size_output[:, 0, :].detach()
+            itgca_kwargs = {
+                'raw_cls_enc': raw_cls,
+                'size_cls_enc': size_cls,
+                'r_stat_raw': compute_flow_reliability_raw(raw_src),
+                'local_ent_raw': compute_local_entropy(raw_src, self.itgca_window_size),
+            }
+        else:
+            itgca_kwargs = {}
+
         # Fusion
-        raw_fused, size_fused, _ = self.fusion(raw_output, size_output, raw_seg, size_seg)
+        raw_fused, size_fused, _ = self.fusion(raw_output, size_output, raw_seg, size_seg, **itgca_kwargs)
 
         # Extract and concat CLS tokens
         raw_cls = raw_fused[:, 0, :]  # [batch, hidden]

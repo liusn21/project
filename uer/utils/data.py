@@ -1,6 +1,7 @@
 import os
 import random
 import pickle
+import numpy as np
 import torch
 from multiprocessing import Pool
 from uer.utils.constants import *
@@ -1226,6 +1227,9 @@ class MultiModalDataset(Dataset):
         self.seq_length_raw = getattr(args, 'seq_length_raw', 512)
         self.seq_length_size = getattr(args, 'seq_length_size', 256)
 
+        # ITGCA window size for local entropy precomputation
+        self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
+
         self.short_seq_prob = args.short_seq_prob if hasattr(args, 'short_seq_prob') else 0.0
 
     def build_and_save(self, workers_num):
@@ -1693,15 +1697,33 @@ class MultiModalDataset(Dataset):
                             break
                     iat_src_masked[pos] = rdi
 
-            # Return 9 elements: Raw unmasked + Size/IAT clean (ITC/ITM) + masked (Reconstruction)
+            # Precompute local entropy for ITGCA (pure numpy, no torch needed)
+            # This avoids GPU idle time during training forward pass
+            # Only compute for Raw (Size is stable, no local entropy prior needed)
+            itgca_window = getattr(self, 'itgca_window_size', 16)
+            from uer.models.multimodal_model import compute_local_entropy_np
+            local_ent_raw = compute_local_entropy_np(
+                np.array(raw_src, dtype=np.int64), itgca_window
+            ).tolist()
+
+            # Return 10 elements: Raw*3 + Size/IAT clean*2 + masked*2 + targets*2 + local_ent_raw
             return (raw_src, raw_packet_ids, raw_directions_seq,
                     size_src_clean, iat_src_clean,
                     size_src_masked, iat_src_masked,
-                    tgt_mlm_size, tgt_mlm_temporal)
+                    tgt_mlm_size, tgt_mlm_temporal,
+                    local_ent_raw)
         else:
             # Dynamic masking: defer masking to DataLoader
-            # Return 5 elements (clean size/iat, masking done in DataLoader)
-            return (raw_src, raw_packet_ids, raw_directions_seq, size_src, iat_src)
+            # Return 6 elements: clean data + precomputed local_ent_raw
+            # (masking done per-batch in DataLoader, but local_ent is static)
+            itgca_window = getattr(self, 'itgca_window_size', 16)
+            from uer.models.multimodal_model import compute_local_entropy_np
+            local_ent_raw = compute_local_entropy_np(
+                np.array(raw_src, dtype=np.int64), itgca_window
+            ).tolist()
+            return (raw_src, raw_packet_ids, raw_directions_seq,
+                    size_src, iat_src,
+                    local_ent_raw)
 
 
 class MultiModalDataLoader(DataLoader):
@@ -1718,7 +1740,7 @@ class MultiModalDataLoader(DataLoader):
 
     Supports both static and dynamic masking (controlled by args.dynamic_masking).
 
-    Returns 9 tensors:
+    Returns 10 tensors:
         raw_src: [batch, seq_len_raw] - Raw Packet tokens (NOT masked)
         raw_packet_ids: [batch, seq_len_raw] - Packet indices
         raw_directions: [batch, seq_len_raw] - Direction indices
@@ -1728,6 +1750,7 @@ class MultiModalDataLoader(DataLoader):
         iat_src_masked: [batch, seq_len_size] - IAT tokens (masked, for reconstruction)
         tgt_mlm_size: [batch, seq_len_size] - Size MLM targets (0=unmasked, token_id=masked)
         tgt_mlm_temporal: [batch, seq_len_size] - Temporal MLM targets (0=unmasked, token_id=masked)
+        local_ent_raw: [batch, seq_len_raw] - Raw local entropy (for ITGCA source-side V gating)
     """
 
     def __init__(self, args, dataset_path, batch_size, proc_id, proc_num, shuffle=False):
@@ -1744,6 +1767,9 @@ class MultiModalDataLoader(DataLoader):
         self.vocab_temporal = getattr(args, 'vocab_temporal', args.vocab_size)
         self.tokenizer_temporal = getattr(args, 'tokenizer_temporal', args.tokenizer_size)
 
+        # ITGCA window size for local entropy precomputation
+        self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
+
     def __iter__(self):
         while True:
             while self._empty():
@@ -1756,7 +1782,7 @@ class MultiModalDataLoader(DataLoader):
 
             self.start += self.batch_size
 
-            # Batch lists (9 tensors: raw*3, size/iat clean*2, size/iat masked*2, targets*2)
+            # Batch lists (10 tensors: raw*3, size/iat clean*2, size/iat masked*2, targets*2, local_ent_raw)
             raw_src_batch = []
             raw_packet_ids_batch = []
             raw_directions_batch = []
@@ -1766,20 +1792,29 @@ class MultiModalDataLoader(DataLoader):
             iat_src_masked_batch = []
             tgt_mlm_size_batch = []
             tgt_mlm_temporal_batch = []
+            local_ent_raw_batch = []
 
             masked_words_num = 0
 
             for ins in instances:
                 # Instance format depends on masking mode:
-                # Static masking (len=9): (raw_src, raw_packet_ids, raw_directions_seq,
-                #                          size_src_clean, iat_src_clean,
-                #                          size_src_masked, iat_src_masked,
-                #                          tgt_mlm_size, tgt_mlm_temporal)
-                # Dynamic masking (len=5): (raw_src, raw_packet_ids, raw_directions_seq,
-                #                          size_src, iat_src)
+                # Static masking (len=10): (raw_src, raw_packet_ids, raw_directions_seq,
+                #                           size_src_clean, iat_src_clean,
+                #                           size_src_masked, iat_src_masked,
+                #                           tgt_mlm_size, tgt_mlm_temporal,
+                #                           local_ent_raw)
+                # Legacy static (len=11): same + local_ent_size (ignored)
+                # Legacy static (len=9): same without local_ent (computed on-the-fly)
+                # Dynamic masking (len=6): (raw_src, raw_packet_ids, raw_directions_seq,
+                #                          size_src, iat_src, local_ent_raw)
+                # Legacy dynamic (len=7): same + local_ent_size (ignored)
+                # Legacy dynamic (len=5): same without local_ent
 
-                if len(ins) == 9:
+                if len(ins) in (10, 11, 9):
                     # Static masking: Dataset already applied synchronized masking
+                    # len=10: new format (local_ent_raw only)
+                    # len=11: legacy format (local_ent_raw + local_ent_size)
+                    # len=9: legacy format (no local_ent)
                     raw_src = ins[0]
                     raw_packet_ids = ins[1]
                     raw_directions = ins[2]
@@ -1802,6 +1837,15 @@ class MultiModalDataLoader(DataLoader):
                     for pos, token in tgt_mlm_temporal:
                         tgt_temporal_dense[pos] = token
 
+                    # Precomputed local entropy for Raw
+                    if len(ins) == 10:
+                        local_ent_raw = ins[9]
+                    elif len(ins) == 11:
+                        local_ent_raw = ins[9]
+                        # ins[10] (local_ent_size) is ignored in asymmetric ITGCA
+                    else:
+                        local_ent_raw = [0.0] * len(raw_src)
+
                     raw_src_batch.append(raw_src)
                     raw_packet_ids_batch.append(raw_packet_ids)
                     raw_directions_batch.append(raw_directions)
@@ -1811,14 +1855,31 @@ class MultiModalDataLoader(DataLoader):
                     iat_src_masked_batch.append(iat_src_masked)
                     tgt_mlm_size_batch.append(tgt_size_dense)
                     tgt_mlm_temporal_batch.append(tgt_temporal_dense)
+                    local_ent_raw_batch.append(local_ent_raw)
 
-                elif len(ins) == 5:
+                elif len(ins) in (6, 7, 5):
                     # Dynamic masking: Apply synchronized mask here in DataLoader
+                    # len=6: new format (local_ent_raw only)
+                    # len=7: legacy format (local_ent_raw + local_ent_size)
+                    # len=5: legacy format (no local_ent)
                     raw_src = ins[0]  # Raw is NOT masked
                     raw_packet_ids = ins[1]
                     raw_directions = ins[2]
                     size_src_clean = list(ins[3])  # Clean copy for ITC/ITM
                     iat_src_clean = list(ins[4])
+
+                    # Precomputed local entropy for Raw
+                    if len(ins) == 6:
+                        local_ent_raw = ins[5]
+                    elif len(ins) == 7:
+                        local_ent_raw = ins[5]
+                        # ins[6] (local_ent_size) is ignored in asymmetric ITGCA
+                    else:
+                        from uer.models.multimodal_model import compute_local_entropy_np
+                        itgca_window = getattr(self, 'itgca_window_size', 16)
+                        local_ent_raw = compute_local_entropy_np(
+                            np.array(raw_src, dtype=np.int64), itgca_window
+                        ).tolist()
 
                     # Mask Size tokens (on a copy)
                     size_src_masked, tgt_mlm_size = mask_seq(
@@ -1875,6 +1936,7 @@ class MultiModalDataLoader(DataLoader):
                     iat_src_masked_batch.append(iat_src_masked)
                     tgt_mlm_size_batch.append(tgt_size_dense)
                     tgt_mlm_temporal_batch.append(tgt_temporal_dense)
+                    local_ent_raw_batch.append(local_ent_raw)
 
                 else:
                     # Unknown format, skip
@@ -1893,4 +1955,5 @@ class MultiModalDataLoader(DataLoader):
                    torch.LongTensor(size_src_masked_batch),
                    torch.LongTensor(iat_src_masked_batch),
                    torch.LongTensor(tgt_mlm_size_batch),
-                   torch.LongTensor(tgt_mlm_temporal_batch))
+                   torch.LongTensor(tgt_mlm_temporal_batch),
+                   torch.FloatTensor(local_ent_raw_batch))

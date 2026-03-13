@@ -119,7 +119,7 @@ def train_and_validate(args):
         # ITGCA gate parameters have specific initializations for implicit curriculum learning
         # (alpha=-2.0 → sigmoid≈0.12, g_default_logit=0.0, bilinear xavier gain=0.1)
         # These must NOT be overwritten by blanket normal_(0, 0.02)
-        itgca_param_names = ('alpha_modality', 'alpha_token', 'g_default_logit',
+        itgca_param_names = ('alpha_modality', 'g_default_logit',
                              'bilinear_W', 'bilinear_bias')
         for n, p in list(model.named_parameters()):
             if "gamma" not in n and "beta" not in n:
@@ -476,23 +476,27 @@ class MultiModalTrainer(Trainer):
         """
         Forward pass for ALBEF-style multimodal pretraining with Masked Reconstruction
 
-        Batch format (9 tensors):
+        Batch format (10 tensors):
             (raw_src, raw_packet_ids, raw_directions,
              size_src_clean, iat_src_clean, size_src_masked, iat_src_masked,
-             tgt_mlm_size, tgt_mlm_temporal)
+             tgt_mlm_size, tgt_mlm_temporal,
+             local_ent_raw)
 
         Design: ITC/ITM use clean Size inputs; Masked Reconstruction uses masked inputs.
+        local_ent_raw is precomputed in DataLoader to avoid GPU idle time.
         """
         (raw_src, raw_packet_ids, raw_directions,
          size_src_clean, iat_src_clean, size_src_masked, iat_src_masked,
-         tgt_mlm_size, tgt_mlm_temporal) = batch
+         tgt_mlm_size, tgt_mlm_temporal,
+         local_ent_raw) = batch
 
         # Forward through model (must call through DDP wrapper for gradient synchronization)
         loss_dict = model(
             raw_src, raw_packet_ids, raw_directions,
             size_src_clean, iat_src_clean,
             size_src_masked, iat_src_masked,
-            tgt_mlm_size, tgt_mlm_temporal
+            tgt_mlm_size, tgt_mlm_temporal,
+            local_ent_raw=local_ent_raw
         )
 
         # Extract losses
