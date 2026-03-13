@@ -424,7 +424,7 @@ def main():
     parser.add_argument('--mlp_hidden', type=int, default=256,
                         help='Hidden dimension for MLP predictor')
     parser.add_argument('--num_fusion_layers', type=int, default=6)
-    parser.add_argument('--use_fusion_gate', action='store_true')
+    parser.add_argument('--use_itgca', action='store_true')
 
     # Encoder freezing
     parser.add_argument('--freeze_encoder', action='store_true')

@@ -51,8 +51,8 @@ class WindowFeatureExtractor(nn.Module):
 
         # Fusion module
         num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
-        use_fusion_gate = getattr(args, 'use_fusion_gate', False)
-        self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_gate=use_fusion_gate)
+        use_itgca = getattr(args, 'use_itgca', False)
+        self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_itgca=use_itgca)
 
     def forward(self, raw_src, packet_ids, directions, size_src, iat_src):
         """
@@ -79,7 +79,7 @@ class WindowFeatureExtractor(nn.Module):
         size_output = self.encoder_size(size_emb, size_seg)
 
         # Fusion
-        raw_fused, size_fused = self.fusion(raw_output, size_output, raw_seg, size_seg)
+        raw_fused, size_fused, _ = self.fusion(raw_output, size_output, raw_seg, size_seg)
 
         # Extract and concat CLS tokens
         raw_cls = raw_fused[:, 0, :]  # [batch, hidden]

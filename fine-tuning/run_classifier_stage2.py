@@ -18,7 +18,7 @@ Usage:
         --config_path models/bert/base_config.json \
         --epochs_num 10 \
         --batch_size 32 \
-        --use_fusion_gate  # Add this if pretrained model was trained with gate
+        --use_itgca  # Add this if pretrained model was trained with ITGCA
 """
 
 import os
@@ -94,6 +94,9 @@ from uer.model_saver import save_model
 from uer.utils.constants import PAD_ID
 from uer.utils import *
 from uer.opts import finetune_opts
+from uer.models.multimodal_model import (
+    compute_flow_reliability_raw, compute_flow_reliability_size, compute_local_entropy
+)
 
 
 class Stage2Classifier(nn.Module):
@@ -113,6 +116,10 @@ class Stage2Classifier(nn.Module):
         self.hidden_size = args.hidden_size
         self.labels_num = labels_num
 
+        # ITGCA support
+        self.use_itgca = getattr(args, 'use_itgca', False)
+        self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
+
         # Raw modality encoder
         self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
         self.encoder_raw = str2encoder[args.encoder](args)
@@ -123,8 +130,8 @@ class Stage2Classifier(nn.Module):
 
         # Fusion module
         num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
-        use_fusion_gate = getattr(args, 'use_fusion_gate', False)
-        self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_gate=use_fusion_gate)
+        use_itgca = getattr(args, 'use_itgca', False)
+        self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_itgca=use_itgca)
 
         # Classification head
         self.simple_classifier = getattr(args, 'simple_classifier', False)
@@ -162,8 +169,25 @@ class Stage2Classifier(nn.Module):
         size_seg = (size_src != PAD_ID).long()
         size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len, hidden]
 
+        # ITGCA signals for inference
+        if self.use_itgca:
+            raw_cls = raw_output[:, 0, :].detach()
+            size_cls = size_output[:, 0, :].detach()
+            itgca_kwargs = {
+                'raw_cls_enc': raw_cls,
+                'size_cls_enc': size_cls,
+                'r_stat_raw': compute_flow_reliability_raw(raw_src),
+                'r_stat_size': compute_flow_reliability_size(size_src),
+                'local_ent_raw': compute_local_entropy(raw_src, self.itgca_window_size),
+                'local_ent_size': compute_local_entropy(size_src, self.itgca_window_size),
+            }
+        else:
+            itgca_kwargs = {}
+
         # Fusion
-        raw_fused, size_fused = self.fusion(raw_output, size_output, raw_seg, size_seg)
+        raw_fused, size_fused, _ = self.fusion(
+            raw_output, size_output, raw_seg, size_seg, **itgca_kwargs
+        )
 
         # Extract fused CLS tokens
         raw_cls = raw_fused[:, 0, :]  # [batch, hidden]
@@ -677,11 +701,11 @@ def main():
     # Model options
     parser.add_argument("--num_fusion_layers", type=int, default=6,
                         help="Number of fusion layers (should match pretrained model)")
-    parser.add_argument("--use_fusion_gate", action="store_true",
-                        help="Enable learnable gate mechanism in fusion layers. "
-                             "MUST match the pretrained model's configuration! "
-                             "If pretrained model was trained with --use_fusion_gate, "
-                             "this flag MUST be set during fine-tuning to load gate weights.")
+    parser.add_argument("--use_itgca", action="store_true",
+                        help="Enable ITGCA gate mechanism. "
+                             "MUST match the pretrained model's configuration.")
+    parser.add_argument("--itgca_window_size", type=int, default=16,
+                        help="Sliding window size for ITGCA local entropy.")
 
     # Sequence lengths
     parser.add_argument("--seq_length_raw", type=int, default=512)

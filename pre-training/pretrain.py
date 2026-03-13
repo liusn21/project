@@ -113,12 +113,6 @@ def main():
     # ALBEF-style architecture parameters
     parser.add_argument("--num_fusion_layers", type=int, default=6,
                         help="Number of bidirectional cross-attention fusion layers.")
-    parser.add_argument("--use_fusion_gate", action="store_true",
-                        help="Enable learnable gate mechanism in fusion layers. "
-                             "Gate controls cross-attention at logits level (before softmax) "
-                             "to suppress noisy modality information. "
-                             "Useful for scenarios where one modality may be unreliable "
-                             "(e.g., encrypted traffic, Tor with uniform packet sizes).")
     parser.add_argument("--queue_size", type=int, default=4096,
                         help="Size of the feature queue for ITC contrastive learning.")
     parser.add_argument("--momentum", type=float, default=0.995,
@@ -141,6 +135,22 @@ def main():
                         help="Weight for Size reconstruction loss (for multimodal target).")
     parser.add_argument("--lambda_recon_temporal", type=float, default=1.0,
                         help="Weight for Temporal reconstruction loss (for multimodal target).")
+
+    # ITGCA (Information-Theoretic Gated Cross-Attention) options
+    parser.add_argument("--use_itgca", action="store_true",
+                        help="Enable ITGCA gate mechanism in fusion layers. "
+                             "Replaces legacy gate with information-theoretic hierarchical gate: "
+                             "modality gate (flow-level entropy + bilinear CLS) + "
+                             "token gate (local entropy + SA residual).")
+    parser.add_argument("--itgca_window_size", type=int, default=16,
+                        help="Sliding window size for local entropy computation in ITGCA token gate. "
+                             "Recommended range: 16-32 for bigram token sequences.")
+    parser.add_argument("--lambda_crc", type=float, default=0.1,
+                        help="Weight for CRC (Contrastive Reliability Calibration) ranking loss.")
+    parser.add_argument("--lambda_ent", type=float, default=0.01,
+                        help="Weight for entropy regularization loss (prevents gate collapse).")
+    parser.add_argument("--crc_margin", type=float, default=0.1,
+                        help="Margin for CRC ranking loss.")
 
     # Temperature parameters
     parser.add_argument("--itc_temperature", type=float, default=0.07,

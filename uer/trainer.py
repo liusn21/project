@@ -116,9 +116,16 @@ def train_and_validate(args):
         pretrained_prefixes = ('embedding_raw.', 'encoder_raw.', 'embedding_size.', 'encoder_size.',
                                'embedding_raw_m.', 'encoder_raw_m.', 'embedding_size_m.', 'encoder_size_m.',
                                'itc_proj_raw_m.', 'itc_proj_size_m.')
+        # ITGCA gate parameters have specific initializations for implicit curriculum learning
+        # (alpha=-2.0 → sigmoid≈0.12, g_default_logit=0.0, bilinear xavier gain=0.1)
+        # These must NOT be overwritten by blanket normal_(0, 0.02)
+        itgca_param_names = ('alpha_modality', 'alpha_token', 'g_default_logit',
+                             'bilinear_W', 'bilinear_bias')
         for n, p in list(model.named_parameters()):
             if "gamma" not in n and "beta" not in n:
                 if not n.startswith(pretrained_prefixes):
+                    if any(ip in n for ip in itgca_param_names):
+                        continue  # Preserve ITGCA-specific initialization
                     p.data.normal_(0, 0.02)
     else:
         # Initialize with normal distribution.
@@ -438,12 +445,15 @@ class MultiModalTrainer(Trainer):
 
     def __init__(self, args):
         super(MultiModalTrainer, self).__init__(args)
+        self.args = args
 
         # Loss tracking
         self.total_loss_itc = 0.0
         self.total_loss_itm = 0.0
         self.total_loss_recon_size = 0.0
         self.total_loss_recon_temporal = 0.0
+        self.total_loss_crc = 0.0
+        self.total_loss_ent = 0.0
 
         # Accuracy tracking
         self.total_acc_itm = 0.0
@@ -490,12 +500,20 @@ class MultiModalTrainer(Trainer):
         itm_loss = loss_dict['itm_loss']
         recon_size_loss = loss_dict['recon_size_loss']
         recon_temporal_loss = loss_dict['recon_temporal_loss']
+        crc_loss = loss_dict.get('crc_loss', torch.tensor(0.0))
+        ent_loss = loss_dict.get('ent_loss', torch.tensor(0.0))
+
+        # ITGCA loss weights
+        lambda_crc = getattr(self, 'lambda_crc', getattr(self.args, 'lambda_crc', 0.1))
+        lambda_ent = getattr(self, 'lambda_ent', getattr(self.args, 'lambda_ent', 0.01))
 
         # Combined loss
         loss = (self.lambda_itc * itc_loss +
                 self.lambda_itm * itm_loss +
                 self.lambda_recon_size * recon_size_loss +
-                self.lambda_recon_temporal * recon_temporal_loss)
+                self.lambda_recon_temporal * recon_temporal_loss +
+                lambda_crc * crc_loss +
+                lambda_ent * ent_loss)
 
         # Update statistics
         self.total_loss += loss.item()
@@ -503,6 +521,8 @@ class MultiModalTrainer(Trainer):
         self.total_loss_itm += itm_loss.item()
         self.total_loss_recon_size += recon_size_loss.item()
         self.total_loss_recon_temporal += recon_temporal_loss.item()
+        self.total_loss_crc += crc_loss.item()
+        self.total_loss_ent += ent_loss.item()
 
         self.total_acc_itm += loss_dict['itm_acc'].item()
         self.total_correct_recon_size += loss_dict['recon_size_correct'].item()
@@ -528,28 +548,32 @@ class MultiModalTrainer(Trainer):
         avg_loss_itm = self.total_loss_itm / n
         avg_loss_recon_sz = self.total_loss_recon_size / n
         avg_loss_recon_tp = self.total_loss_recon_temporal / n
+        avg_loss_crc = self.total_loss_crc / n
+        avg_loss_ent = self.total_loss_ent / n
 
         avg_acc_itm = self.total_acc_itm / n
         acc_recon_sz = self.total_correct_recon_size / self.total_denominator_recon_size if self.total_denominator_recon_size > 0 else 0.0
         acc_recon_tp_ex = self.total_correct_recon_temporal_exact / self.total_denominator_recon_temporal if self.total_denominator_recon_temporal > 0 else 0.0
         acc_recon_tp_rg = self.total_correct_recon_temporal_range / self.total_denominator_recon_temporal if self.total_denominator_recon_temporal > 0 else 0.0
 
-        print("| {:8d}/{:8d} steps"
-              " | {:3.1f}s"
-              " | loss {:5.2f}"
-              " | itc: {:4.2f}"
-              " | itm: {:4.2f}"
-              " | rc_sz: {:4.2f}"
-              " | rc_tp: {:4.2f}"
-              " | itm_acc: {:4.2f}"
-              " | sz_acc: {:4.2f}"
-              " | tp_ex_acc: {:4.2f}"
-              " | tp_rg_acc: {:4.2f}".format(
-            self.current_step, self.total_steps,
-            (time.time() - self.start_time),
-            avg_loss, avg_loss_itc, avg_loss_itm, avg_loss_recon_sz, avg_loss_recon_tp,
-            avg_acc_itm, acc_recon_sz, acc_recon_tp_ex, acc_recon_tp_rg
-        ))
+        # Build log line
+        log_parts = [
+            "| {:8d}/{:8d} steps".format(self.current_step, self.total_steps),
+            " | {:3.1f}s".format(time.time() - self.start_time),
+            " | loss {:5.2f}".format(avg_loss),
+            " | itc: {:4.2f}".format(avg_loss_itc),
+            " | itm: {:4.2f}".format(avg_loss_itm),
+            " | rc_sz: {:4.2f}".format(avg_loss_recon_sz),
+            " | rc_tp: {:4.2f}".format(avg_loss_recon_tp),
+            " | itm_acc: {:4.2f}".format(avg_acc_itm),
+            " | sz_acc: {:4.2f}".format(acc_recon_sz),
+            " | tp_ex: {:4.2f}".format(acc_recon_tp_ex),
+            " | tp_rg: {:4.2f}".format(acc_recon_tp_rg),
+        ]
+        if avg_loss_crc > 0 or avg_loss_ent != 0:
+            log_parts.append(" | crc: {:4.3f}".format(avg_loss_crc))
+            log_parts.append(" | ent: {:4.3f}".format(avg_loss_ent))
+        print("".join(log_parts))
 
         # Reset statistics
         self.total_loss = 0.0
@@ -557,6 +581,8 @@ class MultiModalTrainer(Trainer):
         self.total_loss_itm = 0.0
         self.total_loss_recon_size = 0.0
         self.total_loss_recon_temporal = 0.0
+        self.total_loss_crc = 0.0
+        self.total_loss_ent = 0.0
         self.total_acc_itm = 0.0
         self.total_correct_recon_size = 0.0
         self.total_denominator_recon_size = 0.0
