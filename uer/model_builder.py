@@ -114,9 +114,7 @@ def build_model(args):
         print(f"  ITGCA: {use_itgca}")
         if use_itgca:
             print(f"  ITGCA window size: {getattr(args, 'itgca_window_size', 16)}")
-            print(f"  ITGCA CRC margin: {getattr(args, 'crc_margin', 0.1)}")
-            print(f"  ITGCA lambda_crc: {getattr(args, 'lambda_crc', 0.1)}")
-            print(f"  ITGCA lambda_ent: {getattr(args, 'lambda_ent', 0.01)}")
+            print(f"  ITGCA lambda_l2_beta: {getattr(args, 'lambda_l2_beta', 0.01)}")
         print(f"  Queue size: {queue_size}")
         print(f"  Momentum: {momentum}")
         print(f"  ITC temperature: {getattr(args, 'itc_temperature', 0.07)}")

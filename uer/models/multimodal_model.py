@@ -149,74 +149,6 @@ def compute_local_entropy(tokens, window_size=16, pad_id=0):
 
 # ===== ITGCA Auxiliary Losses =====
 
-def compute_crc_loss(r_mod, r_stat, margin=0.1, k_ratio=0.25):
-    """
-    Contrastive Reliability Calibration (CRC) ranking loss.
-
-    Ensures the modality gate preserves the ordering of statistical reliability:
-    if r_stat(A) > r_stat(B), then r_mod(A) should be > r_mod(B) + margin.
-
-    Only requires ordering preservation, not value matching (unlike MSE).
-    Uses top-k vs bottom-k pairs for efficiency.
-
-    Args:
-        r_mod: [B] - Learned modality gate values
-        r_stat: [B] - Statistical reliability values
-        margin: Ranking margin
-        k_ratio: Fraction of batch for top-k and bottom-k
-
-    Returns:
-        crc_loss: scalar
-    """
-    B = r_stat.shape[0]
-    k = max(1, int(B * k_ratio))
-
-    if B < 2 or k < 1:
-        return torch.tensor(0.0, device=r_mod.device)
-
-    _, sorted_idx = r_stat.sort(descending=True)
-    top_idx = sorted_idx[:k]
-    bottom_idx = sorted_idx[-k:]
-
-    r_mod_top = r_mod[top_idx]        # [k]
-    r_mod_bottom = r_mod[bottom_idx]  # [k]
-
-    # Pairwise margin ranking: max(0, margin - (top - bottom))
-    diff = r_mod_top.unsqueeze(1) - r_mod_bottom.unsqueeze(0)  # [k, k]
-    loss = F.relu(margin - diff)
-
-    return loss.mean()
-
-
-def compute_entropy_reg(gate_values_list):
-    """
-    Entropy regularization to prevent gate collapse (all-open or all-closed).
-
-    Encourages batch-mean gate value toward 0.5 (maximum binary entropy).
-
-    Args:
-        gate_values_list: list of [B, L] gate tensors
-
-    Returns:
-        neg_entropy: scalar (minimize to maximize entropy)
-    """
-    if not gate_values_list:
-        return torch.tensor(0.0)
-
-    total_sum = 0.0
-    total_count = 0
-    for g in gate_values_list:
-        total_sum = total_sum + g.sum()
-        total_count += g.numel()
-
-    gate_mean = total_sum / total_count
-
-    eps = 1e-7
-    gate_mean = gate_mean.clamp(eps, 1 - eps)
-    entropy = -(gate_mean * gate_mean.log() + (1 - gate_mean) * (1 - gate_mean).log())
-
-    return -entropy  # Negative entropy as loss
-
 
 class MultiModalModel(nn.Module):
     """
@@ -236,9 +168,7 @@ class MultiModalModel(nn.Module):
         self.use_itgca = getattr(args, 'use_itgca', False)
         if self.use_itgca:
             self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
-            self.crc_margin = getattr(args, 'crc_margin', 0.1)
-            self.lambda_crc = getattr(args, 'lambda_crc', 0.1)
-            self.lambda_ent = getattr(args, 'lambda_ent', 0.01)
+            self.lambda_l2_beta = getattr(args, 'lambda_l2_beta', 0.01)
 
         # ===== Main Encoders =====
         self.embedding_raw = embedding_raw
@@ -360,36 +290,28 @@ class MultiModalModel(nn.Module):
             'local_ent_raw': local_ent_raw,
         }
 
-    def _compute_itgca_losses(self, gate_info_list, r_stat_raw):
+    def _compute_itgca_losses(self):
         """
-        Compute ITGCA auxiliary losses from gate info (asymmetric).
+        Compute ITGCA auxiliary loss: L2 on β = sigmoid(alpha_modality).
 
-        CRC loss only for Size←Raw direction (where r_stat_raw is the prior).
-        Raw←Size has no statistical prior, so no CRC needed.
-        Entropy regularization applies to all gates (both directions).
+        Prevents β from growing too large, which would completely override
+        the statistical prior r_stat in the modality gate.
 
-        Args:
-            gate_info_list: list of gate_info dicts (one per fusion layer)
-            r_stat_raw: [B] - Raw statistical reliability
+        Only applies to Size←Raw gates (has_modality_prior=True).
 
         Returns:
-            crc_loss: scalar - CRC ranking loss
-            ent_loss: scalar - Entropy regularization loss
+            l2_beta_loss: scalar
         """
-        crc_loss = torch.tensor(0.0, device=r_stat_raw.device)
-        all_gates = []
-
-        for gi in gate_info_list:
-            # CRC only for Size←Raw direction (source is raw, has statistical prior)
-            crc_loss = crc_loss + compute_crc_loss(gi['r_mod_s2r'], r_stat_raw, self.crc_margin)
-
-            all_gates.append(gi['gate_raw'])
-            all_gates.append(gi['gate_size'])
-
-        crc_loss = crc_loss / len(gate_info_list)
-        ent_loss = compute_entropy_reg(all_gates)
-
-        return crc_loss, ent_loss
+        l2_beta = torch.tensor(0.0, device=next(self.fusion.parameters()).device)
+        count = 0
+        for layer in self.fusion.fusion_layers:
+            if hasattr(layer, 'gate_size') and hasattr(layer.gate_size, 'alpha_modality'):
+                beta = torch.sigmoid(layer.gate_size.alpha_modality)
+                l2_beta = l2_beta + beta ** 2
+                count += 1
+        if count > 0:
+            l2_beta = l2_beta / count
+        return l2_beta
 
     def forward(self, raw_src, raw_packet_ids, raw_directions,
                 size_src_clean, iat_src_clean,
@@ -553,15 +475,11 @@ class MultiModalModel(nn.Module):
             size_fused_masked, tgt_mlm_size, tgt_mlm_temporal
         )
 
-        # ===== ITGCA Auxiliary Losses =====
-        if self.use_itgca and gate_info_pos is not None:
-            crc_loss, ent_loss = self._compute_itgca_losses(
-                gate_info_pos,
-                itgca_kwargs['r_stat_raw']
-            )
+        # ===== ITGCA Auxiliary Loss =====
+        if self.use_itgca:
+            l2_beta_loss = self._compute_itgca_losses()
         else:
-            crc_loss = torch.tensor(0.0, device=raw_src.device)
-            ent_loss = torch.tensor(0.0, device=raw_src.device)
+            l2_beta_loss = torch.tensor(0.0, device=raw_src.device)
 
         # ===== Return all losses =====
         loss_dict = {
@@ -575,8 +493,7 @@ class MultiModalModel(nn.Module):
             'recon_temporal_correct_exact': recon_results['temporal_correct_exact'],
             'recon_temporal_correct_range': recon_results['temporal_correct_range'],
             'recon_temporal_denom': recon_results['temporal_denom'],
-            'crc_loss': crc_loss,
-            'ent_loss': ent_loss,
+            'l2_beta_loss': l2_beta_loss,
         }
 
         return loss_dict

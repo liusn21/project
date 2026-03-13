@@ -138,19 +138,14 @@ def main():
 
     # ITGCA (Information-Theoretic Gated Cross-Attention) options
     parser.add_argument("--use_itgca", action="store_true",
-                        help="Enable ITGCA gate mechanism in fusion layers. "
-                             "Replaces legacy gate with information-theoretic hierarchical gate: "
-                             "modality gate (flow-level entropy + bilinear CLS) + "
-                             "token gate (local entropy + SA residual).")
+                        help="Enable asymmetric ITGCA gate mechanism in fusion layers. "
+                             "Size←Raw: source-side V gating + modality prior + learned token gate. "
+                             "Raw←Size: pure learned gate (no prior).")
     parser.add_argument("--itgca_window_size", type=int, default=16,
                         help="Sliding window size for local entropy computation in ITGCA token gate. "
                              "Recommended range: 16-32 for bigram token sequences.")
-    parser.add_argument("--lambda_crc", type=float, default=0.1,
-                        help="Weight for CRC (Contrastive Reliability Calibration) ranking loss.")
-    parser.add_argument("--lambda_ent", type=float, default=0.01,
-                        help="Weight for entropy regularization loss (prevents gate collapse).")
-    parser.add_argument("--crc_margin", type=float, default=0.1,
-                        help="Margin for CRC ranking loss.")
+    parser.add_argument("--lambda_l2_beta", type=float, default=0.01,
+                        help="Weight for L2 regularization on beta (prevents statistical prior override).")
 
     # Temperature parameters
     parser.add_argument("--itc_temperature", type=float, default=0.07,
