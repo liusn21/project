@@ -8,7 +8,7 @@ Architecture:
 
 Gate mechanism - ITGCA (Information-Theoretic Gated Cross-Attention) — Asymmetric:
 - Size←Raw (Raw source, may degrade):
-  - Source-side V gating: V_raw *= 0.1 + 0.9 * local_ent_raw
+  - Source-side attention reweighting: add log(0.1 + 0.9*local_ent_raw) to attention scores
   - Modality gate: flow-level Shannon entropy prior + bilinear CLS correction
   - Token gate: pure learned (SA residual)
 - Raw←Size (Size source, stable):
@@ -261,12 +261,16 @@ class BidirectionalFusionLayer(nn.Module):
                 r_stat=r_stat_raw
             )
 
-            # Source-side V gating for Size←Raw: scale Raw values by local entropy
-            # raw_V_gated ∈ [0.1, 1.0] * raw_feat_sa (low entropy → attenuated)
+            # Source-side attention reweighting for Size←Raw:
+            # Instead of V-scaling (creates extra [B,L,H] tensor → OOM),
+            # add log(s_j) to attention scores before softmax via position_bias.
+            # Effect: redistribute attention away from low-entropy (unreliable) positions.
+            # s_j = 0.1 + 0.9 * local_ent_raw_j → log(s_j) ∈ [-2.3, 0.0]
             if local_ent_raw is not None:
-                raw_V_gated = raw_feat_sa * (0.1 + 0.9 * local_ent_raw.unsqueeze(-1))
+                source_bias = torch.log(0.1 + 0.9 * local_ent_raw + 1e-8)  # [B, L_raw]
+                source_bias = source_bias.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, L_raw]
             else:
-                raw_V_gated = raw_feat_sa
+                source_bias = None
 
             # Cross-attention with ITGCA gate
             # Raw←Size: Key=size, Value=size, Query=raw
@@ -274,10 +278,11 @@ class BidirectionalFusionLayer(nn.Module):
                 size_feat_sa, size_feat_sa, raw_feat_sa,
                 cross_mask_r2s, None, logits_gate=gate_raw
             )
-            # Size←Raw: Key=raw, Value=raw_V_gated (source-side gated), Query=size
+            # Size←Raw: Key=raw, Value=raw (same tensor!), Query=size
+            # source_bias via position_bias attenuates attention to unreliable Raw positions
             size_cross, _ = self.cross_attn_size(
-                raw_feat_sa, raw_V_gated, size_feat_sa,
-                cross_mask_s2r, None, logits_gate=gate_size
+                raw_feat_sa, raw_feat_sa, size_feat_sa,
+                cross_mask_s2r, source_bias, logits_gate=gate_size
             )
 
             gate_info = {
@@ -327,7 +332,6 @@ class MultiModalFusionEncoder(nn.Module):
         self.num_layers = num_layers
         self.hidden_size = args.hidden_size
         self.use_itgca = use_itgca
-
         self.fusion_layers = nn.ModuleList([
             BidirectionalFusionLayer(
                 hidden_size=args.hidden_size,
@@ -353,12 +357,12 @@ class MultiModalFusionEncoder(nn.Module):
             raw_cls_enc: [batch, hidden] - Raw encoder CLS (detached), for ITGCA
             size_cls_enc: [batch, hidden] - Size encoder CLS (detached), for ITGCA
             r_stat_raw: [batch] - Raw flow-level reliability, for ITGCA (Size←Raw only)
-            local_ent_raw: [batch, seq_len_raw] - Raw local entropy, for source-side V gating
+            local_ent_raw: [batch, seq_len_raw] - Raw local entropy, for attention reweighting
 
         Returns:
             raw_fused: [batch, seq_len_raw, hidden]
             size_fused: [batch, seq_len_size, hidden]
-            all_gate_info: list of gate_info dicts (one per layer) or None
+            None (gate_info removed — no longer used after CRC/entropy loss removal)
         """
         batch_size = raw_feat.size(0)
         seq_len_raw = raw_feat.size(1)
@@ -384,10 +388,9 @@ class MultiModalFusionEncoder(nn.Module):
         # ===== Layer-by-layer Fusion =====
         raw_hidden = raw_feat
         size_hidden = size_feat
-        all_gate_info = []
 
         for layer in self.fusion_layers:
-            raw_hidden, size_hidden, gate_info = layer(
+            raw_hidden, size_hidden, _ = layer(
                 raw_hidden, size_hidden,
                 raw_mask, size_mask,
                 cross_mask_r2s, cross_mask_s2r,
@@ -396,7 +399,5 @@ class MultiModalFusionEncoder(nn.Module):
                 r_stat_raw=r_stat_raw,
                 local_ent_raw=local_ent_raw
             )
-            if gate_info is not None:
-                all_gate_info.append(gate_info)
 
-        return raw_hidden, size_hidden, all_gate_info if all_gate_info else None
+        return raw_hidden, size_hidden, None

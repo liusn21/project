@@ -173,6 +173,11 @@ class Trainer(object):
     def train(self, args, gpu_id, rank, loader, model, optimizer, scheduler):
         model.train()
         loader_iter = iter(loader)
+
+        # Native PyTorch AMP
+        use_amp = getattr(args, 'fp16', False) and gpu_id is not None
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
         while True:
             if self.current_step == self.total_steps + 1:
                 break
@@ -182,26 +187,20 @@ class Trainer(object):
                 for i in range(len(batch)):
                     batch[i] = batch[i].cuda(gpu_id)
 
-            loss = self.forward_propagation(batch, model)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                loss = self.forward_propagation(batch, model)
 
-            if args.fp16:
-                with args.amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            scaler.scale(loss).backward()
 
             if self.current_step % self.accumulation_steps == 0:
                 if hasattr(args, 'clip_grad_norm') and args.clip_grad_norm > 0:
-                    if args.fp16:
-                        torch.nn.utils.clip_grad_norm_(
-                            args.amp.master_params(optimizer), args.clip_grad_norm
-                        )
-                    else:
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), args.clip_grad_norm
-                        )
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.clip_grad_norm
+                    )
 
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 model.zero_grad()
 
@@ -701,14 +700,6 @@ def worker(proc_id, gpu_ranks, args, model):
         scheduler = str2scheduler[args.scheduler](optimizer, args.total_steps*args.warmup)
     else:
         scheduler = str2scheduler[args.scheduler](optimizer, args.total_steps*args.warmup, args.total_steps)
-
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
-        args.amp = amp
 
     debug = True
     if args.dist_train:
