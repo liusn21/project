@@ -79,60 +79,16 @@ def compute_flow_reliability_raw(raw_src, pad_id=0):
     return torch.from_numpy(result).to(device)
 
 
-def compute_local_entropy_np(tokens_np, window_size=16, pad_id=0):
-    """
-    Compute local sliding-window Shannon entropy for each position (pure numpy).
-
-    Can be called from DataLoader workers (no torch dependency).
-    t_stat[j] = 1 - H(window_j) / log(window_size)
-
-    Args:
-        tokens_np: numpy array [L] (single sample) or [B, L] (batch)
-        window_size: Sliding window size (default 16)
-        pad_id: PAD token ID to exclude
-
-    Returns:
-        numpy array of same shape as input, values in [0, 1]
-    """
-    if tokens_np.ndim == 1:
-        tokens_np = tokens_np[np.newaxis, :]  # [1, L]
-        squeeze = True
-    else:
-        squeeze = False
-
-    B, L = tokens_np.shape
-    half_w = window_size // 2
-    H_max = math.log(window_size) if window_size > 1 else 1.0
-
-    result = np.zeros((B, L), dtype=np.float32)
-
-    for b in range(B):
-        for j in range(L):
-            if tokens_np[b, j] == pad_id:
-                continue
-            start = max(0, j - half_w)
-            end = min(L, j + half_w + 1)
-            window = tokens_np[b, start:end]
-            window = window[window != pad_id]
-            n = len(window)
-            if n <= 1:
-                result[b, j] = 1.0
-                continue
-            _, counts = np.unique(window, return_counts=True)
-            probs = counts.astype(np.float32) / n
-            entropy = -np.sum(probs * np.log(probs + 1e-10))
-            result[b, j] = max(0.0, min(1.0, 1.0 - entropy / H_max))
-
-    return result[0] if squeeze else result
-
-
 @torch.no_grad()
 def compute_local_entropy(tokens, window_size=16, pad_id=0):
     """
-    Compute local sliding-window Shannon entropy (torch wrapper).
+    Vectorized GPU computation of local sliding-window Shannon entropy.
+    t_stat[j] = 1 - H(window_j) / log(n_j)
 
-    Prefer using precomputed local_ent from DataLoader to avoid GPU idle time.
-    This function is kept for inference / fine-tuning where precomputation is not set up.
+    H_max is per-position log(n) where n = number of non-pad tokens in the window,
+    so that all-unique tokens always give reliability ≈ 0 regardless of window size.
+
+    Uses pairwise equality within windows — no Python loops, runs entirely on GPU.
 
     Args:
         tokens: [B, L] - Token IDs (torch tensor)
@@ -142,9 +98,42 @@ def compute_local_entropy(tokens, window_size=16, pad_id=0):
     Returns:
         local_reliability: [B, L] - Per-position reliability in [0, 1]
     """
-    device = tokens.device
-    result = compute_local_entropy_np(tokens.cpu().numpy(), window_size, pad_id)
-    return torch.from_numpy(result).to(device)
+    B, L = tokens.shape
+    half_w = window_size // 2
+    actual_w = 2 * half_w + 1
+
+    # Pad with pad_id so boundary positions get correct variable-size windows
+    padded = F.pad(tokens, (half_w, half_w), value=pad_id)  # [B, L + 2*half_w]
+    windows = padded.unfold(1, actual_w, 1)                 # [B, L, actual_w]
+
+    # Non-pad mask within each window
+    non_pad = (windows != pad_id)                            # [B, L, actual_w]
+    n = non_pad.float().sum(dim=-1)                          # [B, L]
+
+    # Pairwise equality within each window (both positions must be non-pad)
+    eq = (windows.unsqueeze(-1) == windows.unsqueeze(-2))    # [B, L, W, W]
+    eq = eq & non_pad.unsqueeze(-1) & non_pad.unsqueeze(-2)
+    counts = eq.sum(dim=-1).float()                          # [B, L, W]
+
+    # H = log(n) - (1/n) * sum_i log(count_i)  over non-pad positions
+    log_counts = torch.log(counts.clamp(min=1))              # [B, L, W]
+    sum_log_counts = (log_counts * non_pad.float()).sum(dim=-1)  # [B, L]
+    n_safe = n.clamp(min=1)
+    H = torch.log(n_safe) - sum_log_counts / n_safe         # [B, L]
+
+    # Per-position H_max = log(n): all-unique → H=log(n) → reliability=0
+    H_max = torch.log(n_safe)                                # [B, L]
+
+    # n <= 1: H=0, H_max=0 → reliability=1 (single token = fully predictable)
+    # n >= 2: reliability = 1 - H / log(n), clamped to [0, 1]
+    valid = H_max > 0
+    result = torch.where(valid, (1.0 - H / H_max).clamp(0.0, 1.0),
+                         torch.ones_like(H))
+
+    # Pad positions in original input → 0
+    result[tokens == pad_id] = 0.0
+
+    return result
 
 
 # ===== ITGCA Auxiliary Losses =====
@@ -258,27 +247,23 @@ class MultiModalModel(nn.Module):
 
         self.queue_ptr[0] = ptr
 
-    def _compute_itgca_signals(self, raw_src, raw_cls, size_cls,
-                               local_ent_raw=None):
+    def _compute_itgca_signals(self, raw_src, raw_cls, size_cls):
         """
         Compute ITGCA statistical priors and encoder CLS signals (asymmetric).
 
         Only computes priors for the Raw modality (Size is stable, no prior needed).
+        Local entropy is computed on-the-fly using vectorized GPU ops (< 1ms/batch).
 
         Args:
             raw_src: [B, L_raw] - Raw token IDs
             raw_cls: [B, H] - Raw encoder CLS (will be detached)
             size_cls: [B, H] - Size encoder CLS (will be detached)
-            local_ent_raw: [B, L_raw] or None - Precomputed local entropy (from DataLoader)
 
         Returns:
             itgca_kwargs: dict of keyword arguments for fusion forward
         """
         r_stat_raw = compute_flow_reliability_raw(raw_src)
-
-        # Use precomputed local entropy if available, otherwise compute on-the-fly
-        if local_ent_raw is None:
-            local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
+        local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
 
         raw_cls_enc = raw_cls.detach()
         size_cls_enc = size_cls.detach()
@@ -316,8 +301,7 @@ class MultiModalModel(nn.Module):
     def forward(self, raw_src, raw_packet_ids, raw_directions,
                 size_src_clean, iat_src_clean,
                 size_src_masked, iat_src_masked,
-                tgt_mlm_size, tgt_mlm_temporal,
-                local_ent_raw=None):
+                tgt_mlm_size, tgt_mlm_temporal):
         """
         Forward pass for training with Masked Reconstruction (ALBEF-style).
 
@@ -331,7 +315,6 @@ class MultiModalModel(nn.Module):
             iat_src_masked: [batch, seq_len_size] - IAT token IDs (masked, for reconstruction)
             tgt_mlm_size: [batch, seq_len_size] - Size reconstruction targets
             tgt_mlm_temporal: [batch, seq_len_size] - Temporal reconstruction targets
-            local_ent_raw: [batch, seq_len_raw] or None - Precomputed local entropy from DataLoader
 
         Returns:
             loss_dict: Dictionary containing all losses and metrics
@@ -355,8 +338,7 @@ class MultiModalModel(nn.Module):
         # ===== ITGCA: Compute statistical priors =====
         if self.use_itgca:
             itgca_kwargs = self._compute_itgca_signals(
-                raw_src, raw_cls, size_cls,
-                local_ent_raw=local_ent_raw
+                raw_src, raw_cls, size_cls
             )
         else:
             itgca_kwargs = {}
