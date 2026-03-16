@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from uer.layers.multi_headed_attn import MultiHeadedAttention
 from uer.layers.layer_norm import LayerNorm
 from uer.layers.position_ffn import PositionwiseFeedForward
+import math
 
 
 class ITGCrossAttentionGate(nn.Module):
@@ -271,7 +272,6 @@ class BidirectionalFusionLayer(nn.Module):
             # Note: position_bias is added BEFORE ÷sqrt(d) in MultiHeadedAttention,
             # so we pre-multiply by sqrt(d) to compensate.
             if local_ent_raw is not None:
-                import math
                 scale = math.sqrt(self.attention_head_size)
                 source_bias = torch.log(0.1 + 0.9 * local_ent_raw + 1e-8) * scale  # [B, L_raw]
                 source_bias = source_bias.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, L_raw]

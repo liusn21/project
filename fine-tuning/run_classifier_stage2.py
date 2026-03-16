@@ -119,6 +119,7 @@ class Stage2Classifier(nn.Module):
         # ITGCA support
         self.use_itgca = getattr(args, 'use_itgca', False)
         self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
+        self.vocab_size_raw = vocab_size_raw
 
         # Raw modality encoder
         self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
@@ -176,7 +177,7 @@ class Stage2Classifier(nn.Module):
             itgca_kwargs = {
                 'raw_cls_enc': raw_cls,
                 'size_cls_enc': size_cls,
-                'r_stat_raw': compute_flow_reliability_raw(raw_src),
+                'r_stat_raw': compute_flow_reliability_raw(raw_src, vocab_size=self.vocab_size_raw),
                 'local_ent_raw': compute_local_entropy(raw_src, self.itgca_window_size),
             }
         else:

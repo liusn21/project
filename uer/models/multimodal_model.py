@@ -43,40 +43,53 @@ def concat_all_gather(tensor):
 # ===== ITGCA Statistical Prior Computation =====
 
 @torch.no_grad()
-def compute_flow_reliability_raw(raw_src, pad_id=0):
+def compute_flow_reliability_raw(raw_src, pad_id=0, vocab_size=None):
     """
-    Compute flow-level reliability for raw modality.
+    Compute flow-level reliability for raw modality (GPU-vectorized).
     r_stat = 1 - H(flow) / H_max
 
     Encrypted payload has near-uniform bigram distribution → high entropy → low reliability.
     Plaintext has repeated patterns (HTTP headers, HTML) → low entropy → high reliability.
 
+    Uses scatter_add for GPU-side bincount — no CPU transfer or Python loops.
+
     Args:
         raw_src: [B, L] - Raw token IDs
         pad_id: PAD token ID to exclude
+        vocab_size: int or None - Vocabulary size (avoids GPU-CPU sync for max())
 
     Returns:
         reliability: [B] - Flow-level reliability in [0, 1]
     """
     B, L = raw_src.shape
     device = raw_src.device
-    tokens_cpu = raw_src.cpu().numpy()
-    result = np.zeros(B, dtype=np.float32)
+    V = vocab_size if vocab_size is not None else int(raw_src.max().item()) + 1
 
-    for b in range(B):
-        tokens = tokens_cpu[b]
-        tokens = tokens[tokens != pad_id]
-        n = len(tokens)
-        if n <= 1:
-            result[b] = 1.0
-            continue
-        _, counts = np.unique(tokens, return_counts=True)
-        probs = counts.astype(np.float32) / n
-        entropy = -np.sum(probs * np.log(probs + 1e-10))
-        H_max = np.log(n)
-        result[b] = max(0.0, min(1.0, 1.0 - entropy / H_max))
+    # Non-pad mask and token count per sample
+    non_pad = (raw_src != pad_id)                            # [B, L]
+    n = non_pad.float().sum(dim=1)                           # [B]
 
-    return torch.from_numpy(result).to(device)
+    # Bincount via scatter_add: count occurrences of each token per sample
+    # PAD positions contribute 0.0 (non_pad is False), so counts are unaffected
+    counts = torch.zeros(B, V, device=device)
+    counts.scatter_add_(1, raw_src, non_pad.float())         # [B, V]
+
+    # Shannon entropy: H = -Σ p * log(p)
+    n_safe = n.clamp(min=1)
+    probs = counts / n_safe.unsqueeze(1)                     # [B, V]
+    entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=1) # [B]
+
+    # Normalized reliability: 1 - H / H_max
+    # n <= 1: single token or empty → fully predictable → reliability = 1.0
+    H_max = torch.log(n_safe)                                # [B]
+    valid = H_max > 0
+    reliability = torch.where(
+        valid,
+        (1.0 - entropy / H_max).clamp(0.0, 1.0),
+        torch.ones_like(entropy)
+    )
+
+    return reliability
 
 
 @torch.no_grad()
@@ -158,6 +171,7 @@ class MultiModalModel(nn.Module):
         if self.use_itgca:
             self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
             self.lambda_l2_beta = getattr(args, 'lambda_l2_beta', 0.01)
+            self.vocab_size_raw = embedding_raw.token_embedding.num_embeddings
 
         # ===== Main Encoders =====
         self.embedding_raw = embedding_raw
@@ -262,7 +276,7 @@ class MultiModalModel(nn.Module):
         Returns:
             itgca_kwargs: dict of keyword arguments for fusion forward
         """
-        r_stat_raw = compute_flow_reliability_raw(raw_src)
+        r_stat_raw = compute_flow_reliability_raw(raw_src, vocab_size=self.vocab_size_raw)
         local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
 
         raw_cls_enc = raw_cls.detach()

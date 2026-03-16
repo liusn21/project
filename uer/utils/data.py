@@ -24,7 +24,7 @@ def mask_seq(src, tokenizer, whole_word_masking, span_masking, span_geo_prob, sp
         src = src_no_pad
 
     random.shuffle(tokens_index)
-    num_to_predict = max(1, int(round(len(src_no_pad) * 0.3))) 
+    num_to_predict = max(1, int(round(len(src_no_pad) * 0.15))) 
     tgt_mlm = []
     for index_set in tokens_index:
         if len(tgt_mlm) >= num_to_predict:

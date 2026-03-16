@@ -712,7 +712,12 @@ def worker(proc_id, gpu_ranks, args, model):
             dist.barrier()
             print(f"Rank{rank}: Barrier passed")
             
-        model = DistributedDataParallel(model, device_ids=[gpu_id], find_unused_parameters=False)
+        # broadcast_buffers=False for multimodal: let each rank maintain its own
+        # feature queue independently, avoiding all_gather hangs while preserving
+        # queue diversity (each rank accumulates features from its own data stream).
+        broadcast_bufs = (args.target != "multimodal")
+        model = DistributedDataParallel(model, device_ids=[gpu_id], find_unused_parameters=False,
+                                        broadcast_buffers=broadcast_bufs)
         print("Worker %d is training ... " % rank)
     else:
         print("Worker is training ...")
