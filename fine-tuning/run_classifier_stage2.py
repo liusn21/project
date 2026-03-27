@@ -99,6 +99,200 @@ from uer.models.multimodal_model import (
 )
 
 
+# ============ Attention Pooling ============
+class AttentionPooling(nn.Module):
+    """Learnable attention pooling replacing mean pooling"""
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attention = nn.Linear(hidden_size, 1)
+
+    def forward(self, hidden, mask):
+        scores = self.attention(hidden).squeeze(-1)       # [B, L]
+        scores = scores.masked_fill(~mask.bool(), -1e4)
+        weights = F.softmax(scores, dim=-1)               # [B, L]
+        return (weights.unsqueeze(-1) * hidden).sum(1)    # [B, H]
+
+
+# ============ Supervised Contrastive Loss ============
+class SupConLoss(nn.Module):
+    """
+    Supervised Contrastive Loss (Khosla et al., NeurIPS 2020)
+    with optional feature queue (MoCo-style) for small batch sizes.
+
+    Queue stores (feature, label) pairs from recent batches as extra
+    positives/negatives. Gradients only flow through current batch features.
+    """
+    def __init__(self, temperature=0.1, queue_size=0):
+        super().__init__()
+        self.temperature = temperature
+        self.queue_size = queue_size
+        # Queue lazily initialized on first forward (auto-device)
+        self._queue_feat = None
+        self._queue_labels = None
+        self._queue_ptr = 0
+        self._queue_full = False
+
+    @torch.no_grad()
+    def _enqueue(self, features, labels):
+        if self.queue_size <= 0:
+            return
+        B = features.size(0)
+        if self._queue_feat is None:
+            self._queue_feat = torch.zeros(self.queue_size, features.size(1),
+                                           device=features.device, dtype=torch.float32)
+            self._queue_labels = torch.full((self.queue_size,), -1,
+                                            dtype=torch.long, device=features.device)
+        ptr = self._queue_ptr
+        if ptr + B <= self.queue_size:
+            self._queue_feat[ptr:ptr + B] = features
+            self._queue_labels[ptr:ptr + B] = labels
+        else:
+            tail = self.queue_size - ptr
+            self._queue_feat[ptr:] = features[:tail]
+            self._queue_labels[ptr:] = labels[:tail]
+            head = B - tail
+            self._queue_feat[:head] = features[tail:]
+            self._queue_labels[:head] = labels[tail:]
+        new_ptr = (ptr + B) % self.queue_size
+        if not self._queue_full and (new_ptr <= ptr or B >= self.queue_size):
+            self._queue_full = True
+        self._queue_ptr = new_ptr
+
+    def forward(self, features, labels):
+        # Force FP32: FP16 下 exp/log 精度不足会产生 NaN
+        features = features.float()
+        device = features.device
+        B = features.shape[0]
+        if B <= 1:
+            self._enqueue(features.detach(), labels)
+            return torch.tensor(0.0, device=device)
+
+        # Combine current batch with queue for more positive/negative pairs
+        if self.queue_size > 0 and self._queue_feat is not None:
+            valid_len = self.queue_size if self._queue_full else self._queue_ptr
+            if valid_len > 0:
+                q_feat = self._queue_feat[:valid_len]    # detached (stored without grad)
+                q_labels = self._queue_labels[:valid_len]
+                all_feat = torch.cat([features, q_feat], dim=0)    # [B+Q, D]
+                all_labels = torch.cat([labels, q_labels], dim=0)  # [B+Q]
+            else:
+                all_feat, all_labels = features, labels
+        else:
+            all_feat, all_labels = features, labels
+
+        N = all_feat.shape[0]
+
+        # Similarity: [B, N] — gradients only for current batch (left side)
+        sim = torch.matmul(features, all_feat.T) / self.temperature
+
+        # Positive mask: same class (exclude self in batch×batch block)
+        mask_pos = (labels.unsqueeze(1) == all_labels.unsqueeze(0)).float()  # [B, N]
+        mask_pos[:, :B].fill_diagonal_(0)
+
+        if mask_pos.sum() == 0:
+            self._enqueue(features.detach(), labels)
+            return torch.tensor(0.0, device=device)
+
+        # Numerical stability
+        logits_max, _ = sim.max(dim=1, keepdim=True)
+        sim = sim - logits_max.detach()
+
+        # Denominator: all pairs except self
+        mask_denom = torch.ones(B, N, device=device)
+        mask_denom[:, :B].fill_diagonal_(0)
+        exp_sim = torch.exp(sim) * mask_denom
+        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+        # Mean log-prob of positives
+        num_pos = mask_pos.sum(dim=1)
+        mean_log_prob = (mask_pos * log_prob).sum(dim=1) / (num_pos + 1e-8)
+        valid = num_pos > 0
+        if valid.sum() == 0:
+            self._enqueue(features.detach(), labels)
+            return torch.tensor(0.0, device=device)
+
+        loss = -mean_log_prob[valid].mean()
+
+        # Update queue
+        self._enqueue(features.detach(), labels)
+        return loss
+
+
+# ============ SWA (Stochastic Weight Averaging) ============
+class SWA:
+    """Stochastic Weight Averaging for flatter minima"""
+    def __init__(self, model):
+        self.model = model
+        self.swa_state = {}
+        self.n_averaged = 0
+
+    def update(self):
+        actual = self.model.module if hasattr(self.model, 'module') else self.model
+        for name, param in actual.named_parameters():
+            if name not in self.swa_state:
+                self.swa_state[name] = param.data.clone()
+            else:
+                self.swa_state[name] = (
+                    self.swa_state[name] * self.n_averaged + param.data
+                ) / (self.n_averaged + 1)
+        self.n_averaged += 1
+
+    def apply(self):
+        actual = self.model.module if hasattr(self.model, 'module') else self.model
+        self.backup = {}
+        for name, param in actual.named_parameters():
+            self.backup[name] = param.data.clone()
+            if name in self.swa_state:
+                param.data.copy_(self.swa_state[name])
+
+    def restore(self):
+        actual = self.model.module if hasattr(self.model, 'module') else self.model
+        for name, param in actual.named_parameters():
+            if name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss (Lin et al., ICCV 2017)
+
+    Downweights well-classified samples, focuses training on hard examples.
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Compatible with class weights and label smoothing.
+    """
+    def __init__(self, gamma=2.0, weight=None, label_smoothing=0.0, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        # Compute standard CE (with label smoothing) per sample
+        ce_loss = F.cross_entropy(
+            logits, targets,
+            weight=self.weight,
+            label_smoothing=self.label_smoothing,
+            reduction='none'
+        )
+        # p_t: probability of the true class
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = torch.exp(log_probs)
+        p_t = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        # Focal modulation: (1 - p_t)^gamma
+        focal_weight = (1.0 - p_t) ** self.gamma
+        loss = focal_weight * ce_loss
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+
 class Stage2Classifier(nn.Module):
     """
     Stage 2 Multi-Modal Classifier
@@ -134,13 +328,21 @@ class Stage2Classifier(nn.Module):
         use_itgca = getattr(args, 'use_itgca', False)
         self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_itgca=use_itgca)
 
+        # Multi-Sample Dropout
+        self.num_dropouts = getattr(args, 'num_dropouts', 1)
+        self.dropout_rate = args.dropout
+
+        # Attention Pooling
+        self.use_attn_pooling = getattr(args, 'use_attn_pooling', False)
+        if self.use_attn_pooling:
+            self.attn_pool_raw = AttentionPooling(args.hidden_size)
+            self.attn_pool_size = AttentionPooling(args.hidden_size)
+
         # Classification head
         self.simple_classifier = getattr(args, 'simple_classifier', False)
         if self.simple_classifier:
-            # Simple: CLS-only, single linear layer (less overfitting)
             self.classifier = nn.Linear(2 * args.hidden_size, labels_num)
         else:
-            # Full: CLS + mean pooling, two-layer MLP
             self.classifier = nn.Sequential(
                 nn.Linear(4 * args.hidden_size, args.hidden_size),
                 nn.Tanh(),
@@ -148,35 +350,37 @@ class Stage2Classifier(nn.Module):
                 nn.Linear(args.hidden_size, labels_num)
             )
 
+        # Supervised Contrastive Learning projection head
+        self.use_scl = getattr(args, 'use_scl', False)
+        if self.use_scl:
+            proj_in = 2 * args.hidden_size if self.simple_classifier else 4 * args.hidden_size
+            self.scl_projection = nn.Sequential(
+                nn.Linear(proj_in, args.hidden_size),
+                nn.ReLU(),
+                nn.Linear(args.hidden_size, 128)
+            )
+
     def forward(self, raw_src, packet_ids, directions, size_src, iat_src):
         """
-        Args:
-            raw_src: [batch, seq_len_raw] - Raw token IDs
-            packet_ids: [batch, seq_len_raw] - Packet indices
-            directions: [batch, seq_len_raw] - Direction indices
-            size_src: [batch, seq_len_size] - Size token IDs
-            iat_src: [batch, seq_len_size] - IAT temporal token IDs
-
         Returns:
             logits: [batch, labels_num]
+            — or (logits, scl_feat) during training when use_scl=True
         """
         # Raw encoder
         raw_emb = self.embedding_raw(raw_src, packet_ids, directions)
         raw_seg = (raw_src != PAD_ID).long()
-        raw_output = self.encoder_raw(raw_emb, raw_seg)  # [batch, seq_len, hidden]
+        raw_output = self.encoder_raw(raw_emb, raw_seg)
 
-        # Size encoder (with IAT temporal information)
+        # Size encoder
         size_emb = self.embedding_size(size_src, iat_src)
         size_seg = (size_src != PAD_ID).long()
-        size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len, hidden]
+        size_output = self.encoder_size(size_emb, size_seg)
 
-        # ITGCA signals for inference
+        # ITGCA signals (no detach — let gate gradients flow to encoder)
         if self.use_itgca:
-            raw_cls = raw_output[:, 0, :].detach()
-            size_cls = size_output[:, 0, :].detach()
             itgca_kwargs = {
-                'raw_cls_enc': raw_cls,
-                'size_cls_enc': size_cls,
+                'raw_cls_enc': raw_output[:, 0, :],
+                'size_cls_enc': size_output[:, 0, :],
                 'r_stat_raw': compute_flow_reliability_raw(raw_src, vocab_size=self.vocab_size_raw),
                 'local_ent_raw': compute_local_entropy(raw_src, self.itgca_window_size),
             }
@@ -188,22 +392,38 @@ class Stage2Classifier(nn.Module):
             raw_output, size_output, raw_seg, size_seg, **itgca_kwargs
         )
 
-        # Extract fused CLS tokens
-        raw_cls = raw_fused[:, 0, :]  # [batch, hidden]
-        size_cls = size_fused[:, 0, :]  # [batch, hidden]
+        # Fused CLS tokens
+        raw_cls = raw_fused[:, 0, :]
+        size_cls = size_fused[:, 0, :]
 
         if self.simple_classifier:
-            combined = torch.cat([raw_cls, size_cls], dim=-1)  # [batch, 2*hidden]
+            combined = torch.cat([raw_cls, size_cls], dim=-1)
         else:
-            # Mean pooling over non-CLS, non-PAD positions
-            raw_mask = raw_seg[:, 1:].unsqueeze(-1).float()  # [batch, seq_len-1, 1]
-            raw_mean = (raw_fused[:, 1:, :] * raw_mask).sum(1) / (raw_mask.sum(1) + 1e-9)
-            size_mask = size_seg[:, 1:].unsqueeze(-1).float()
-            size_mean = (size_fused[:, 1:, :] * size_mask).sum(1) / (size_mask.sum(1) + 1e-9)
-            combined = torch.cat([raw_cls, size_cls, raw_mean, size_mean], dim=-1)  # [batch, 4*hidden]
+            # Pooling over non-CLS, non-PAD positions
+            if self.use_attn_pooling:
+                raw_pool = self.attn_pool_raw(raw_fused[:, 1:, :], raw_seg[:, 1:])
+                size_pool = self.attn_pool_size(size_fused[:, 1:, :], size_seg[:, 1:])
+            else:
+                raw_mask = raw_seg[:, 1:].unsqueeze(-1).float()
+                raw_pool = (raw_fused[:, 1:, :] * raw_mask).sum(1) / (raw_mask.sum(1).clamp(min=1.0))
+                size_mask = size_seg[:, 1:].unsqueeze(-1).float()
+                size_pool = (size_fused[:, 1:, :] * size_mask).sum(1) / (size_mask.sum(1).clamp(min=1.0))
+            combined = torch.cat([raw_cls, size_cls, raw_pool, size_pool], dim=-1)
 
-        logits = self.classifier(combined)
+        # Multi-Sample Dropout
+        if self.training and self.num_dropouts > 1:
+            logits = torch.mean(torch.stack(
+                [self.classifier(F.dropout(combined, p=self.dropout_rate, training=True))
+                 for _ in range(self.num_dropouts)]
+            ), dim=0)
+        else:
+            logits = self.classifier(combined)
 
+        # Supervised Contrastive Learning (FP32: 防止 FP16 反向梯度溢出)
+        if self.use_scl and self.training:
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                proj = self.scl_projection(combined.float())
+            return logits, F.normalize(proj, dim=-1)
         return logits
 
 
@@ -242,9 +462,10 @@ def load_pretrained_model(model, pretrained_path):
     # Load into model
     missing, unexpected = model.load_state_dict(filtered_state, strict=False)
 
-    # Only classifier weights should be missing (they are randomly initialized)
-    classifier_missing = [k for k in missing if k.startswith('classifier')]
-    other_missing = [k for k in missing if not k.startswith('classifier')]
+    # Classifier and new fine-tuning modules should be missing (randomly initialized)
+    ft_prefixes = ('classifier', 'scl_projection', 'attn_pool')
+    classifier_missing = [k for k in missing if any(k.startswith(p) for p in ft_prefixes)]
+    other_missing = [k for k in missing if not any(k.startswith(p) for p in ft_prefixes)]
 
     # Count excluded parameters by category
     excluded_count = len(state_dict) - len(filtered_state)
@@ -255,6 +476,22 @@ def load_pretrained_model(model, pretrained_path):
     print(f"  Missing keys: {len(missing)} (classifier: {len(classifier_missing)}, other: {len(other_missing)})")
     print(f"  Unexpected keys: {len(unexpected)}")
 
+    # ===== ITGCA config mismatch detection =====
+    has_itgca_in_checkpoint = any(
+        k.startswith('fusion.fusion_layers.0.gate_') for k in filtered_state.keys()
+    )
+    model_uses_itgca = getattr(model, 'use_itgca', False)
+
+    if has_itgca_in_checkpoint and not model_uses_itgca:
+        print(f"  WARNING: Pretrained model was trained WITH ITGCA, "
+              f"but fine-tuning does NOT use --use_itgca.")
+        print(f"           ITGCA gate weights will be discarded. "
+              f"Consider adding --use_itgca to match pretrained config.")
+    elif not has_itgca_in_checkpoint and model_uses_itgca:
+        print(f"  WARNING: Pretrained model was trained WITHOUT ITGCA, "
+              f"but fine-tuning uses --use_itgca.")
+        print(f"           ITGCA gate parameters will be randomly initialized!")
+
     if len(other_missing) == 0 and len(unexpected) == 0:
         # Count loaded parameters by module
         from collections import defaultdict
@@ -263,7 +500,7 @@ def load_pretrained_model(model, pretrained_path):
             module = k.split('.')[0]
             loaded_by_module[module] += 1
 
-        print(f"  ✓ All encoder/fusion parameters loaded successfully!")
+        print(f"  All encoder/fusion parameters loaded successfully!")
         print(f"    Loaded modules:")
         for module in ['embedding_raw', 'encoder_raw', 'embedding_size', 'encoder_size', 'fusion']:
             if module in loaded_by_module:
@@ -271,17 +508,19 @@ def load_pretrained_model(model, pretrained_path):
 
         # Verify temporal_embedding was loaded
         if 'embedding_size.temporal_embedding.weight' in filtered_state:
-            print(f"    ✓ temporal_embedding loaded (IAT support enabled)")
+            print(f"    temporal_embedding loaded (IAT support enabled)")
+        if has_itgca_in_checkpoint and model_uses_itgca:
+            print(f"    ITGCA gate parameters loaded")
 
         print(f"  Classifier randomly initialized ({len(classifier_missing)} params)")
     else:
-        print(f"  ✗ Load incomplete:")
+        print(f"  Load incomplete:")
         if other_missing:
             print(f"    Missing non-classifier keys ({len(other_missing)}): {other_missing[:10]}...")
 
             # CRITICAL: Check for temporal_embedding in Size encoder
             if 'embedding_size.temporal_embedding.weight' in other_missing:
-                print(f"    ⚠️  CRITICAL: embedding_size.temporal_embedding.weight is missing!")
+                print(f"    CRITICAL: embedding_size.temporal_embedding.weight is missing!")
                 print(f"    This indicates the pretrained model was trained WITHOUT IAT temporal information.")
                 print(f"    The temporal_embedding layer will use random initialization,")
                 print(f"    which will significantly hurt performance. Please use a pretrained model that includes IAT.")
@@ -359,6 +598,38 @@ def compute_class_weights(dataset, num_classes, method='sqrt'):
     return weights
 
 
+def few_shot_sample(dataset, ratio, seed=42):
+    """
+    Stratified sampling: keep `ratio` fraction of training data per class.
+    Guarantees at least 1 sample per class.
+    """
+    from collections import defaultdict
+    rng = random.Random(seed)
+
+    # Group by label
+    class_samples = defaultdict(list)
+    for sample in dataset:
+        class_samples[sample['label']].append(sample)
+
+    sampled = []
+    for label, samples in class_samples.items():
+        k = max(1, int(len(samples) * ratio))
+        k = min(k, len(samples))
+        sampled.extend(rng.sample(samples, k))
+
+    rng.shuffle(sampled)
+
+    # Print per-class stats
+    original_total = len(dataset)
+    sampled_total = len(sampled)
+    print(f"  Few-shot sampling: ratio={ratio}, {original_total} -> {sampled_total} samples "
+          f"({sampled_total/original_total*100:.1f}%)")
+    print(f"  Classes: {len(class_samples)}, min samples/class: "
+          f"{min(max(1, int(len(v)*ratio)) for v in class_samples.values())}")
+
+    return sampled
+
+
 def pre_tensorize(dataset, pin=False):
     """
     Pre-convert list-of-dicts dataset into contiguous tensors (one-time cost).
@@ -393,7 +664,7 @@ def batch_loader(batch_size, dataset_tensors, shuffle=False):
                dataset_tensors['label'][idx])
 
 
-def train_epoch(args, model, optimizer, scheduler, train_data_tensors, criterion, ema, scaler=None):
+def train_epoch(args, model, optimizer, scheduler, train_data_tensors, criterion, ema, scaler=None, scl_criterion=None):
     """Train for one epoch (with optional AMP via scaler)"""
     model.train()
     total_loss = 0.0
@@ -411,21 +682,33 @@ def train_epoch(args, model, optimizer, scheduler, train_data_tensors, criterion
         optimizer.zero_grad(set_to_none=True)
 
         # Forward pass (with optional AMP autocast)
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            logits = model(raw_src, packet_ids, directions, size_src, iat_src)
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            output = model(raw_src, packet_ids, directions, size_src, iat_src)
+            if isinstance(output, tuple):
+                logits, scl_feat = output
+            else:
+                logits, scl_feat = output, None
             loss = criterion(logits, tgt)
             # Handle DataParallel case
             if loss.dim() > 0:
                 loss = torch.mean(loss)
 
+        # Supervised Contrastive Loss (outside autocast — full FP32 forward+backward)
+        if scl_feat is not None and scl_criterion is not None:
+            loss = loss + args.scl_weight * scl_criterion(scl_feat, tgt)
+
         if use_amp:
             scaler.scale(loss).backward()
             if args.max_grad_norm > 0:
                 scaler.unscale_(optimizer)
-                if hasattr(model, 'module'):
-                    torch.nn.utils.clip_grad_norm_(model.module.parameters(), args.max_grad_norm)
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                # 只在无 inf/nan 时裁剪，避免 clip_grad_norm 中 inf*0=NaN
+                found_inf = sum(v.item() for state in scaler._per_optimizer_states.values()
+                                for v in state["found_inf_per_device"].values()) > 0
+                if not found_inf:
+                    if hasattr(model, 'module'):
+                        torch.nn.utils.clip_grad_norm_(model.module.parameters(), args.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -467,7 +750,8 @@ def evaluate(args, model, eval_tensors, print_confusion=False):
             iat_src = iat_src.to(args.device, non_blocking=True)
             tgt = tgt.to(args.device, non_blocking=True)
 
-            logits = model(raw_src, packet_ids, directions, size_src, iat_src)
+            output = model(raw_src, packet_ids, directions, size_src, iat_src)
+            logits = output[0] if isinstance(output, tuple) else output
             pred = torch.argmax(logits, dim=-1)
 
             for p, g in zip(pred.cpu().tolist(), tgt.cpu().tolist()):
@@ -629,10 +913,11 @@ def build_optimizer(args, model):
 
 
 def freeze_backbone(model):
-    """Freeze all parameters except classifier head"""
+    """Freeze all parameters except classifier head and fine-tuning modules"""
     actual_model = model.module if hasattr(model, 'module') else model
+    trainable_prefixes = ('classifier', 'scl_projection', 'attn_pool')
     for name, param in actual_model.named_parameters():
-        if not name.startswith('classifier'):
+        if not any(name.startswith(p) for p in trainable_prefixes):
             param.requires_grad = False
     trainable = sum(p.numel() for p in actual_model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in actual_model.parameters())
@@ -697,6 +982,11 @@ def main():
     # Training options
     parser.add_argument("--earlystop", type=int, default=5)
 
+    # Few-shot
+    parser.add_argument("--few_shot", type=float, default=None,
+                        help="Few-shot ratio: fraction of training data to use (e.g. 0.1 = 10%%). "
+                             "Stratified sampling preserves class distribution, min 1 sample/class.")
+
     # Model options
     parser.add_argument("--num_fusion_layers", type=int, default=6,
                         help="Number of fusion layers (should match pretrained model)")
@@ -741,6 +1031,36 @@ def main():
     parser.add_argument("--phase2_scheduler", type=str, default="cosine",
                         choices=["linear", "cosine", "cosine_with_restarts", "constant_with_warmup"],
                         help="Scheduler for Phase 2 (default: cosine)")
+
+    # Multi-Sample Dropout
+    parser.add_argument("--num_dropouts", type=int, default=1,
+                        help="Number of dropout samples for Multi-Sample Dropout (1=disabled, 5 recommended)")
+
+    # Supervised Contrastive Learning
+    parser.add_argument("--use_scl", action="store_true",
+                        help="Enable Supervised Contrastive Learning loss")
+    parser.add_argument("--scl_weight", type=float, default=0.1,
+                        help="Weight for SupCon loss (typical range: 0.05-0.5)")
+    parser.add_argument("--scl_temperature", type=float, default=0.1,
+                        help="Temperature for SupCon loss")
+    parser.add_argument("--scl_queue_size", type=int, default=1024,
+                        help="Feature queue size for SupCon (0=no queue, 1024 recommended for small batch)")
+
+    # Focal Loss
+    parser.add_argument("--use_focal_loss", action="store_true",
+                        help="Use Focal Loss instead of CrossEntropy (focuses on hard samples)")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="Focal Loss gamma: higher = stronger focus on hard samples (typical: 1.0-5.0)")
+
+    # Attention Pooling
+    parser.add_argument("--use_attn_pooling", action="store_true",
+                        help="Use learnable attention pooling instead of mean pooling")
+
+    # Stochastic Weight Averaging
+    parser.add_argument("--use_swa", action="store_true",
+                        help="Enable Stochastic Weight Averaging")
+    parser.add_argument("--swa_start_epoch", type=int, default=-1,
+                        help="Epoch to start SWA collection (-1 = auto: 50%% of epochs)")
 
     parser.add_argument("--is_moe", action="store_true", help="adopt moe layer.")
     parser.add_argument("--vocab_size", type=int, required=False, help="Number of vocab.")
@@ -791,6 +1111,11 @@ def main():
     train_data = load_dataset(args.train_path)
     dev_data = load_dataset(args.dev_path)
     test_data = load_dataset(args.test_path) if args.test_path else None
+
+    # Few-shot sampling (only affects training set)
+    if args.few_shot is not None:
+        assert 0.0 < args.few_shot <= 1.0, f"--few_shot must be in (0, 1], got {args.few_shot}"
+        train_data = few_shot_sample(train_data, args.few_shot, seed=args.seed)
 
     print(f"Train: {len(train_data)}, Dev: {len(dev_data)}, Test: {len(test_data) if test_data else 0}")
 
@@ -848,11 +1173,6 @@ def main():
         model = model.to(args.device)
         print("Using CPU mode")
 
-    # torch.compile (PyTorch 2.0+): fuse kernels for faster training
-    if hasattr(torch, 'compile') and args.device.type == 'cuda':
-        model = torch.compile(model)
-        print("torch.compile: Enabled")
-
     # Build loss criterion
     print("\nSetting up loss function...")
     class_weights = None
@@ -860,21 +1180,42 @@ def main():
         class_weights = compute_class_weights(train_data, args.labels_num, method=args.class_weight_method)
         class_weights = class_weights.to(args.device)
 
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights,
-        label_smoothing=args.label_smoothing
-    )
-
-    print(f"  Loss: CrossEntropy")
+    if getattr(args, 'use_focal_loss', False):
+        criterion = FocalLoss(
+            gamma=args.focal_gamma,
+            weight=class_weights,
+            label_smoothing=args.label_smoothing
+        )
+        print(f"  Loss: FocalLoss (gamma={args.focal_gamma})")
+    else:
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=args.label_smoothing
+        )
+        print(f"  Loss: CrossEntropy")
     print(f"  Label smoothing: {args.label_smoothing}")
     print(f"  Class weights: {'Enabled (' + args.class_weight_method + ')' if args.use_class_weight else 'Disabled'}")
     print(f"  Gradient clipping: {args.max_grad_norm if args.max_grad_norm > 0 else 'Disabled'}")
 
-    # AMP GradScaler (only for CUDA)
-    use_amp = args.device.type == 'cuda'
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp else None
-    if use_amp:
-        print(f"  AMP: Enabled (mixed precision training)")
+    # AMP (mixed precision): off by default, enable with --fp16
+    use_amp = getattr(args, 'fp16', False) and args.device.type == 'cuda'
+    scaler = torch.amp.GradScaler(device="cuda", enabled=use_amp) if use_amp else None
+    print(f"  AMP: {'Enabled' if use_amp else 'Disabled'}")
+
+    # SCL setup
+    scl_criterion = None
+    if getattr(args, 'use_scl', False):
+        scl_criterion = SupConLoss(temperature=args.scl_temperature,
+                                   queue_size=args.scl_queue_size)
+        print(f"  SupCon: weight={args.scl_weight}, temp={args.scl_temperature}, queue={args.scl_queue_size}")
+
+    # SWA setup
+    swa = None
+    swa_start = 0
+    if getattr(args, 'use_swa', False):
+        swa = SWA(model)
+        swa_start = args.swa_start_epoch if args.swa_start_epoch >= 0 else max(1, args.epochs_num // 2)
+        print(f"  SWA: start collecting from epoch {swa_start}")
 
     best_f1 = 0.0
     best_epoch = 0
@@ -902,7 +1243,7 @@ def main():
             print(f"\n[Phase 1] Epoch {epoch}/{args.phase1_epochs}")
             print("-" * 30)
 
-            avg_loss = train_epoch(args, model, p1_optimizer, p1_scheduler, train_tensors, criterion, ema_dummy, scaler)
+            avg_loss = train_epoch(args, model, p1_optimizer, p1_scheduler, train_tensors, criterion, ema_dummy, scaler, scl_criterion=None)
             print(f"Training loss: {avg_loss:.4f}")
 
             print("Validation:")
@@ -942,7 +1283,7 @@ def main():
             print(f"\n[Phase 2] Epoch {epoch}/{args.epochs_num}")
             print("-" * 30)
 
-            avg_loss = train_epoch(args, model, optimizer, scheduler, train_tensors, criterion, ema, scaler)
+            avg_loss = train_epoch(args, model, optimizer, scheduler, train_tensors, criterion, ema, scaler, scl_criterion=scl_criterion)
             print(f"Training loss: {avg_loss:.4f}")
 
             # Evaluate with both original and EMA weights
@@ -979,6 +1320,10 @@ def main():
                 patience_counter += 1
                 print(f"No improvement. Patience: {patience_counter}/{args.earlystop}")
 
+            # SWA update
+            if swa is not None and epoch >= swa_start:
+                swa.update()
+
             if patience_counter >= args.earlystop:
                 print(f"Early stopping at Phase 2 epoch {epoch}")
                 break
@@ -1005,7 +1350,7 @@ def main():
             print("-" * 30)
 
             # Train
-            avg_loss = train_epoch(args, model, optimizer, scheduler, train_tensors, criterion, ema, scaler)
+            avg_loss = train_epoch(args, model, optimizer, scheduler, train_tensors, criterion, ema, scaler, scl_criterion=scl_criterion)
             print(f"Training loss: {avg_loss:.4f}")
 
             # Initialize EMA after first epoch
@@ -1052,9 +1397,27 @@ def main():
                 patience_counter += 1
                 print(f"No improvement. Patience: {patience_counter}/{args.earlystop}")
 
+            # SWA update
+            if swa is not None and epoch >= swa_start:
+                swa.update()
+
             if patience_counter >= args.earlystop:
                 print(f"Early stopping at epoch {epoch}")
                 break
+
+    # SWA final evaluation
+    if swa is not None and swa.n_averaged > 0:
+        print(f"\nSWA Evaluation (averaged {swa.n_averaged} checkpoints)")
+        swa.apply()
+        print("Validation [SWA weights]:")
+        f1_swa, _ = evaluate(args, model, dev_tensors)
+        if f1_swa > best_f1:
+            print(f"  SWA wins! F1: {f1_swa:.4f} > {best_f1:.4f}")
+            best_f1 = f1_swa
+            save_model(model, args.output_model_path)
+        else:
+            print(f"  SWA F1: {f1_swa:.4f} <= best {best_f1:.4f}, keeping original")
+        swa.restore()
 
     # Final evaluation on test set
     if test_data:

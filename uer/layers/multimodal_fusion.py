@@ -14,7 +14,7 @@ Gate mechanism - ITGCA (Information-Theoretic Gated Cross-Attention) — Asymmet
 - Raw←Size (Size source, stable):
   - Modality gate: pure learned (no statistical prior)
   - Token gate: pure learned (SA residual)
-- Hierarchical: g = r_mod * g_token + (1-r_mod) * g_default
+- Multiplicative: g = r_mod * g_token
 - Gate applied AFTER final_linear, per-position [B, L_q, 1]
 """
 
@@ -31,15 +31,20 @@ class ITGCrossAttentionGate(nn.Module):
     """
     Information-Theoretic Gated Cross-Attention Gate (ITGCA) — Asymmetric
 
-    Hierarchical gate:
-    1. Modality gate (r_mod):
-       - If has_modality_prior: r_mod = r_stat + sigmoid(alpha_1) * (r_learned - r_stat)
+    Multiplicative gate:
+    1. Modality gate (r_mod): flow-level reliability signal
+       - If has_modality_prior: r_mod = r_stat + sigmoid(alpha) * (r_learned - r_stat)
        - Otherwise: r_mod = r_learned (pure learned)
 
-    2. Token gate (g_token): pure learned from SA residual
-       g_token = sigmoid(sum(W_k(q) * W_v(delta)))
+    2. Token gate (g_token): per-token learned from SA residual
+       g_token = sigmoid(W_k(q) · W_v(delta) / sqrt(d) + bias)
+       Initialized default-open (bias=+2.0, sigmoid ≈ 0.88).
 
-    Combined: g = r_mod * g_token + (1 - r_mod) * sigmoid(g_default_logit)
+    Combined: g = r_mod * g_token
+    - Guarantees ∂gate/∂r_stat > 0 (positive correlation with reliability)
+    - Encrypted (r_mod→0) → gate→0 regardless of g_token
+    - Plaintext (r_mod high) → gate ≈ g_token (open, per-token modulated)
+
     Output: [B, L_q, 1] (per-position, applied after final_linear)
     """
 
@@ -62,13 +67,12 @@ class ITGCrossAttentionGate(nn.Module):
             self.alpha_modality = nn.Parameter(torch.tensor(-2.0))
 
         # ===== Token Gate (pure learned, no local_ent prior) =====
-        # SA residual pointwise attention: g_token = sigmoid(sum(W_k(q) * W_v(delta)))
+        # SA residual pointwise attention: g_token = sigmoid(sum(W_k(q) * W_v(delta)) / sqrt(d) + bias)
+        self.bottleneck = bottleneck
         self.W_k = nn.Linear(hidden_size, bottleneck, bias=False)
         self.W_v = nn.Linear(hidden_size, bottleneck, bias=False)
-
-        # ===== Default gate (when modality unreliable) =====
-        # sigmoid(0.0) = 0.5
-        self.g_default_logit = nn.Parameter(torch.tensor(0.0))
+        # Bias +2.0 → sigmoid ≈ 0.88: default-open, let r_mod control suppression
+        self.token_gate_bias = nn.Parameter(torch.tensor(2.0))
 
     def forward(self, query_feat, sa_delta, encoder_cls_q, encoder_cls_k,
                 r_stat):
@@ -103,17 +107,16 @@ class ITGCrossAttentionGate(nn.Module):
             r_mod = r_learned  # [B]
 
         # ===== Token Gate (pure learned) =====
-        # g_token = sigmoid(sum(W_k(query) * W_v(delta), dim=-1))
+        # g_token = sigmoid(sum(W_k(query) * W_v(delta)) / sqrt(d) + bias)
         q_proj = self.W_k(query_feat)   # [B, L_q, bottleneck]
         d_proj = self.W_v(sa_delta)     # [B, L_q, bottleneck]
-        t_logit = (q_proj * d_proj).sum(dim=-1)  # [B, L_q]
+        t_logit = (q_proj * d_proj).sum(dim=-1) / math.sqrt(self.bottleneck) + self.token_gate_bias
         g_token = torch.sigmoid(t_logit)  # [B, L_q]
 
-        # ===== Hierarchical Combination =====
-        # g = r_mod * g_token + (1 - r_mod) * g_default
-        r_mod_ex = r_mod.unsqueeze(1)  # [B, 1]
-        g_def = torch.sigmoid(self.g_default_logit)  # scalar in [0, 1]
-        gate = r_mod_ex * g_token + (1 - r_mod_ex) * g_def  # [B, L_q]
+        # ===== Multiplicative Combination =====
+        # gate = r_mod * g_token: r_mod controls modality-level suppression,
+        # g_token provides per-token modulation. Guarantees ∂gate/∂r_stat > 0.
+        gate = r_mod.unsqueeze(1) * g_token  # [B, L_q]
 
         gate = gate.unsqueeze(-1)  # [B, L_q, 1]
 
