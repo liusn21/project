@@ -1,13 +1,24 @@
 """
-Stage 2 Multi-Modal Classifier — Inference & Evaluation
+Multi-Modal Classifier — Inference & Evaluation (Stage 1 & Stage 2)
 
-Loads a fine-tuned Stage2Classifier .bin checkpoint and evaluates on a test set.
-Prints overall metrics, per-class metrics, and optionally lists misclassified
-samples with confidence scores for error analysis.
+Loads a fine-tuned Stage1Classifier or Stage2Classifier .bin checkpoint and
+evaluates on a test set. Prints overall metrics, per-class metrics, and
+optionally lists misclassified samples with confidence scores for error analysis.
 
 Usage:
-    # Basic: print metrics only
-    python fine-tuning/run_inference.py \
+    # Stage 1 inference
+    python fine-tuning/run_inference.py --stage 1 \
+        --load_model_path models/classifier_stage1.bin \
+        --test_path datasets/processed/test.pkl \
+        --label2id_path datasets/processed/label2id.pkl \
+        --vocab_path_raw models/vocab_raw.txt \
+        --vocab_path_size models/vocab_size.txt \
+        --vocab_path_temporal models/vocab_temporal.txt \
+        --config_path models/bert/base_config.json \
+        --modality both
+
+    # Stage 2 inference
+    python fine-tuning/run_inference.py --stage 2 \
         --load_model_path models/classifier_stage2.bin \
         --test_path datasets/processed/test.pkl \
         --label2id_path datasets/processed/label2id.pkl \
@@ -17,7 +28,7 @@ Usage:
         --config_path models/bert/base_config.json
 
     # Detailed: also show misclassified samples & save to CSV
-    python fine-tuning/run_inference.py \
+    python fine-tuning/run_inference.py --stage 2 \
         --load_model_path models/classifier_stage2.bin \
         --test_path datasets/processed/test.pkl \
         --label2id_path datasets/processed/label2id.pkl \
@@ -42,6 +53,7 @@ from sklearn.metrics import (
     classification_report
 )
 
+from run_classifier_stage1 import Stage1Classifier
 from run_classifier_stage2 import (
     Stage2Classifier, load_dataset, pre_tensorize, batch_loader
 )
@@ -53,9 +65,13 @@ from uer.opts import model_opts
 
 def build_args():
     parser = argparse.ArgumentParser(
-        description="Stage2 Classifier Inference & Evaluation",
+        description="Stage1/Stage2 Classifier Inference & Evaluation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+
+    # ---- Stage selection ----
+    parser.add_argument("--stage", type=int, choices=[1, 2], default=2,
+                        help="Classifier stage: 1 (no fusion) or 2 (with fusion)")
 
     # ---- Path options ----
     parser.add_argument("--load_model_path", type=str, required=True,
@@ -75,16 +91,23 @@ def build_args():
 
     # ---- Model architecture (must match training) ----
     model_opts(parser)
+
+    # Stage 1 options
+    parser.add_argument("--modality", choices=["raw", "size", "both"], default="both",
+                        help="[Stage 1] Modality mode (must match training)")
+
+    # Stage 2 options
     parser.add_argument("--num_fusion_layers", type=int, default=6,
-                        help="Number of fusion layers (must match training)")
+                        help="[Stage 2] Number of fusion layers (must match training)")
     parser.add_argument("--use_itgca", action="store_true",
-                        help="Enable ITGCA (must match training config)")
+                        help="[Stage 2] Enable ITGCA (must match training config)")
     parser.add_argument("--itgca_window_size", type=int, default=16,
-                        help="ITGCA sliding window size")
+                        help="[Stage 2] ITGCA sliding window size")
     parser.add_argument("--simple_classifier", action="store_true",
-                        help="Use simple CLS-only classifier (must match training)")
+                        help="[Stage 2] Use simple CLS-only classifier (must match training)")
     parser.add_argument("--use_attn_pooling", action="store_true",
-                        help="Use attention pooling (must match training)")
+                        help="[Stage 2] Use attention pooling (must match training)")
+
     parser.add_argument("--seq_length_raw", type=int, default=512)
     parser.add_argument("--seq_length_size", type=int, default=256)
 
@@ -121,7 +144,7 @@ def build_args():
 
     args.max_seq_length = max(args.seq_length_raw, args.seq_length_size)
 
-    # These are not needed for inference but Stage2Classifier may reference them
+    # Defaults referenced by classifiers but not needed for inference
     args.num_dropouts = 1
     args.use_scl = False
     args.dropout = getattr(args, 'dropout', 0.1)
@@ -173,7 +196,11 @@ def evaluate_detailed(args, model, eval_tensors, id2label):
             tgt = tgt.to(args.device, non_blocking=True)
 
             output = model(raw_src, packet_ids, directions, size_src, iat_src)
-            logits = output[0] if isinstance(output, tuple) else output
+            # Stage 1 returns (None, logits); Stage 2 returns logits or (logits, scl_feat)
+            if isinstance(output, tuple):
+                logits = output[1] if output[0] is None else output[0]
+            else:
+                logits = output
 
             probs = F.softmax(logits, dim=-1)
             pred = torch.argmax(probs, dim=-1)
@@ -317,6 +344,8 @@ def main():
     args = build_args()
     set_seed(args.seed)
 
+    print(f"Stage: {args.stage}")
+
     # ---- Load vocabularies ----
     print("Loading vocabularies...")
     vocab_raw = Vocab()
@@ -342,9 +371,15 @@ def main():
 
     # ---- Build model ----
     print("Building model...")
-    model = Stage2Classifier(
-        args, len(vocab_raw), len(vocab_size), len(vocab_temporal), args.labels_num
-    )
+    if args.stage == 1:
+        print(f"  Modality: {args.modality}")
+        model = Stage1Classifier(
+            args, len(vocab_raw), len(vocab_size), len(vocab_temporal), args.labels_num
+        )
+    else:
+        model = Stage2Classifier(
+            args, len(vocab_raw), len(vocab_size), len(vocab_temporal), args.labels_num
+        )
 
     # ---- Load checkpoint ----
     print(f"Loading checkpoint: {args.load_model_path}")

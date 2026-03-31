@@ -65,6 +65,10 @@ class ITGCrossAttentionGate(nn.Module):
         # Only created when has_modality_prior=True (Size←Raw direction)
         if self.has_modality_prior:
             self.alpha_modality = nn.Parameter(torch.tensor(-2.0))
+            # r_stat calibration: sigmoid(scale * r_stat + shift) maps entropy
+            # prior from its natural range to gate-useful range, preserving ordering.
+            self.stat_scale = nn.Parameter(torch.tensor(5.0))
+            self.stat_shift = nn.Parameter(torch.tensor(-0.5))
 
         # ===== Token Gate (pure learned, no local_ent prior) =====
         # SA residual pointwise attention: g_token = sigmoid(sum(W_k(q) * W_v(delta)) / sqrt(d) + bias)
@@ -100,9 +104,11 @@ class ITGCrossAttentionGate(nn.Module):
         r_learned = torch.sigmoid(r_logit)  # [B]
 
         if self.has_modality_prior and r_stat is not None:
-            # Gated residual: r_mod = r_stat + beta_1 * (r_learned - r_stat)
+            # Calibrate r_stat: map from natural range to gate-useful range
+            r_calibrated = torch.sigmoid(self.stat_scale * r_stat + self.stat_shift)
+            # Gated residual: r_mod = r_calibrated + beta_1 * (r_learned - r_calibrated)
             beta_1 = torch.sigmoid(self.alpha_modality)
-            r_mod = r_stat + beta_1 * (r_learned - r_stat)  # [B]
+            r_mod = r_calibrated + beta_1 * (r_learned - r_calibrated)  # [B]
         else:
             r_mod = r_learned  # [B]
 
@@ -213,6 +219,9 @@ class BidirectionalFusionLayer(nn.Module):
             self.gate_raw = ITGCrossAttentionGate(hidden_size, dropout, has_modality_prior=False)
             # Size←Raw: has modality prior (Raw source may degrade)
             self.gate_size = ITGCrossAttentionGate(hidden_size, dropout, has_modality_prior=True)
+            # local_ent calibration for source-side attention reweighting
+            self.local_stat_scale = nn.Parameter(torch.tensor(5.0))
+            self.local_stat_shift = nn.Parameter(torch.tensor(-0.5))
 
     def forward(self, raw_feat, size_feat, raw_mask, size_mask,
                 cross_mask_r2s, cross_mask_s2r,
@@ -275,8 +284,9 @@ class BidirectionalFusionLayer(nn.Module):
             # Note: position_bias is added BEFORE ÷sqrt(d) in MultiHeadedAttention,
             # so we pre-multiply by sqrt(d) to compensate.
             if local_ent_raw is not None:
+                local_calibrated = torch.sigmoid(self.local_stat_scale * local_ent_raw + self.local_stat_shift)
                 scale = math.sqrt(self.attention_head_size)
-                source_bias = torch.log(0.1 + 0.9 * local_ent_raw + 1e-8) * scale  # [B, L_raw]
+                source_bias = torch.log(0.1 + 0.9 * local_calibrated + 1e-8) * scale  # [B, L_raw]
                 source_bias = source_bias.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, L_raw]
             else:
                 source_bias = None
