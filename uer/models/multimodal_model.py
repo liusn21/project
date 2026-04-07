@@ -80,8 +80,10 @@ def compute_flow_reliability_raw(raw_src, pad_id=0, vocab_size=None):
     entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=1) # [B]
 
     # Normalized reliability: 1 - H / H_max
+    # H_max = log(min(n, V)): when n > V, entropy can't exceed log(V),
+    # so use log(V) to avoid artificial floor on r_stat.
     # n <= 1: single token or empty → fully predictable → reliability = 1.0
-    H_max = torch.log(n_safe)                                # [B]
+    H_max = torch.log(n_safe.clamp(max=float(V)))            # [B]
     valid = H_max > 0
     reliability = torch.where(
         valid,
@@ -172,6 +174,11 @@ class MultiModalModel(nn.Module):
             self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
             self.lambda_l2_beta = getattr(args, 'lambda_l2_beta', 0.01)
             self.vocab_size_raw = embedding_raw.token_embedding.num_embeddings
+            # Component-level ablation flags
+            self.ablate_r_stat = getattr(args, 'ablate_r_stat', False)
+            self.ablate_r_learned = getattr(args, 'ablate_r_learned', False)
+            self.ablate_g_token = getattr(args, 'ablate_g_token', False)
+            self.ablate_source_bias = getattr(args, 'ablate_source_bias', False)
 
         # ===== Main Encoders =====
         self.embedding_raw = embedding_raw
@@ -276,8 +283,17 @@ class MultiModalModel(nn.Module):
         Returns:
             itgca_kwargs: dict of keyword arguments for fusion forward
         """
-        r_stat_raw = compute_flow_reliability_raw(raw_src, vocab_size=self.vocab_size_raw)
-        local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
+        # Skip r_stat / local_ent computation when their downstream consumers
+        # are ablated — saves a few ms per batch and ensures the gate's
+        # `r_stat is None` branch fires for "w/o r_stat" runs.
+        if self.ablate_r_stat:
+            r_stat_raw = None
+        else:
+            r_stat_raw = compute_flow_reliability_raw(raw_src, vocab_size=self.vocab_size_raw)
+        if self.ablate_source_bias:
+            local_ent_raw = None
+        else:
+            local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
 
         raw_cls_enc = raw_cls.detach()
         size_cls_enc = size_cls.detach()
@@ -426,11 +442,18 @@ class MultiModalModel(nn.Module):
         neg_raw_seg_2 = raw_seg[neg_raw_idx]
 
         if self.use_itgca:
+            # r_stat_raw / local_ent_raw may be None when their components are ablated
+            r_stat_neg2 = itgca_kwargs['r_stat_raw']
+            if r_stat_neg2 is not None:
+                r_stat_neg2 = r_stat_neg2[neg_raw_idx]
+            local_ent_neg2 = itgca_kwargs['local_ent_raw']
+            if local_ent_neg2 is not None:
+                local_ent_neg2 = local_ent_neg2[neg_raw_idx]
             itgca_kwargs_neg2 = {
                 'raw_cls_enc': itgca_kwargs['raw_cls_enc'][neg_raw_idx],
                 'size_cls_enc': itgca_kwargs['size_cls_enc'],
-                'r_stat_raw': itgca_kwargs['r_stat_raw'][neg_raw_idx],
-                'local_ent_raw': itgca_kwargs['local_ent_raw'][neg_raw_idx],
+                'r_stat_raw': r_stat_neg2,
+                'local_ent_raw': local_ent_neg2,
             }
         else:
             itgca_kwargs_neg2 = {}

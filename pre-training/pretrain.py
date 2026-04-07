@@ -147,6 +147,22 @@ def main():
     parser.add_argument("--lambda_l2_beta", type=float, default=0.01,
                         help="Weight for L2 regularization on beta (prevents statistical prior override).")
 
+    # ITGCA component-level ablation flags (for §5.5.2 component decomposition)
+    # Defaults: all False = full ITGCA. Each flag disables one sub-component cleanly.
+    parser.add_argument("--ablate_r_stat", action="store_true",
+                        help="Disable the flow-level Shannon entropy prior r_stat. "
+                             "Gate falls back to r_mod = r_learned on Size←Raw direction.")
+    parser.add_argument("--ablate_r_learned", action="store_true",
+                        help="Disable the bilinear CLS compatibility r_learned. "
+                             "Gate falls back to r_mod = calibrated(r_stat) on directions with prior; "
+                             "r_mod = 1 on directions without prior.")
+    parser.add_argument("--ablate_g_token", action="store_true",
+                        help="Disable the token-level gate g_token (forced to 1.0 constant). "
+                             "Hierarchical gating degrades to flow-level only.")
+    parser.add_argument("--ablate_source_bias", action="store_true",
+                        help="Disable the source-side attention bias b_j computed from "
+                             "sliding-window local entropy. Affects Size←Raw direction only.")
+
     # Temperature parameters
     parser.add_argument("--itc_temperature", type=float, default=0.07,
                         help="Temperature for ITC contrastive loss.")

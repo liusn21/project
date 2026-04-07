@@ -40,7 +40,8 @@ from uer.utils.vocab import Vocab
 from uer.utils.config import load_hyperparam
 from uer.utils.seed import set_seed
 from uer.opts import model_opts
-from uer.models.multimodal_model import compute_flow_reliability_raw
+from collections import defaultdict
+from uer.models.multimodal_model import compute_flow_reliability_raw, compute_local_entropy
 
 
 # ============================================================
@@ -72,8 +73,9 @@ class GateCollector:
                 }
         return hook_fn
 
-    def flush_batch(self, seq_lens_size, r_stat_batch):
-        """Store per-sample gate values + r_stat."""
+    def flush_batch(self, seq_lens_size, r_stat_batch,
+                    seq_lens_raw=None, local_rel_raw_batch=None):
+        """Store per-sample gate values + r_stat (+ optional local raw reliability)."""
         if not self._current:
             return
         B = self._current[0]['gate_size'].shape[0]
@@ -89,6 +91,10 @@ class GateCollector:
                     'gate_size': self._current[layer_idx]['gate_size'][b, :L].numpy(),
                     'r_mod_s2r': self._current[layer_idx]['r_mod_s2r'][b].item(),
                 }
+            if local_rel_raw_batch is not None and seq_lens_raw is not None:
+                L_raw = seq_lens_raw[b].item()
+                sample['seq_len_raw'] = L_raw
+                sample['local_rel_raw'] = local_rel_raw_batch[b, :L_raw].numpy()
             self.records.append(sample)
         self._current = {}
 
@@ -108,8 +114,8 @@ class GateCollector:
 
 @torch.no_grad()
 def collect_gate_values(model, dataset, collector, device, vocab_size_raw,
-                        max_samples=0, batch_size=32):
-    """Run inference and collect gate values + r_stat per sample."""
+                        max_samples=0, batch_size=32, window_size=16):
+    """Run inference and collect gate values + r_stat + per-byte local reliability."""
     model.eval()
     collector.clear()
 
@@ -131,10 +137,14 @@ def collect_gate_values(model, dataset, collector, device, vocab_size_raw,
         ia = iat_src[start:end].to(device)
 
         seq_lens = (s != 0).sum(dim=1).cpu()
+        seq_lens_raw = (r != 0).sum(dim=1).cpu()
         r_stat_batch = compute_flow_reliability_raw(r, vocab_size=vocab_size_raw).cpu()
+        local_rel_batch = compute_local_entropy(r, window_size=window_size).cpu()
 
         _ = model(r, p, d, s, ia)
-        collector.flush_batch(seq_lens, r_stat_batch)
+        collector.flush_batch(seq_lens, r_stat_batch,
+                              seq_lens_raw=seq_lens_raw,
+                              local_rel_raw_batch=local_rel_batch)
 
 
 # ============================================================
@@ -178,44 +188,38 @@ def plot_scatter(records, output_path, title=None, num_layers=6):
 
 
 # ============================================================
-# Plot: Heatmap (per-position per-layer)
+# Plot: Heatmap (averaged across flows, position-normalized)
 # ============================================================
 
-def build_gate_matrix(sample, num_layers=6):
-    L = sample['seq_len_size']
-    matrix = np.zeros((num_layers, L))
-    for layer_idx in range(num_layers):
-        gate = sample['layers'][layer_idx]['gate_size']
-        matrix[layer_idx, :len(gate)] = gate
-    return matrix
+def build_avg_heatmap_normalized(records, num_layers=6, num_bins=16):
+    """
+    Aggregate per-flow gate values into a (num_layers, num_bins) matrix.
 
-
-def pick_representative(records, strategy='median'):
-    if not records:
-        return None
-    avg_gates = np.array([
-        np.mean([rec['layers'][l]['gate_size'].mean() for l in rec['layers']])
-        for rec in records
-    ])
-    if strategy == 'median':
-        idx = np.argmin(np.abs(avg_gates - np.median(avg_gates)))
-    elif strategy == 'min':
-        idx = np.argmin(avg_gates)
-    elif strategy == 'max':
-        idx = np.argmax(avg_gates)
-    else:
-        idx = 0
-    return records[idx]
+    Each flow's valid token range (0..seq_len_size-1) is mapped onto num_bins
+    equal-width bins; the mean gate within each bin contributes to the global
+    accumulator. This makes flows of different lengths comparable position-wise.
+    """
+    accum = np.zeros((num_layers, num_bins))
+    counts = np.zeros((num_layers, num_bins))
+    for rec in records:
+        L = rec['seq_len_size']
+        if L <= 0:
+            continue
+        bin_idx = np.minimum(np.arange(L) * num_bins // L, num_bins - 1).astype(int)
+        for layer_idx in range(num_layers):
+            gate = rec['layers'][layer_idx]['gate_size'][:L]
+            accum[layer_idx] += np.bincount(bin_idx, weights=gate, minlength=num_bins)
+            counts[layer_idx] += np.bincount(bin_idx, minlength=num_bins)
+    return accum / np.maximum(counts, 1)
 
 
 def plot_heatmap(records, output_path, title=None, num_layers=6,
-                 vmin=0.0, vmax=None, strategy='median'):
-    """Heatmap of gate values for a representative sample."""
-    sample = pick_representative(records, strategy=strategy)
-    if sample is None:
-        print("ERROR: No valid samples for heatmap.")
+                 vmin=0.0, vmax=None, num_bins=16):
+    """Averaged heatmap over all records, with normalized token position bins."""
+    if not records:
+        print("ERROR: No records to plot heatmap.")
         return
-    matrix = build_gate_matrix(sample, num_layers)
+    matrix = build_avg_heatmap_normalized(records, num_layers=num_layers, num_bins=num_bins)
 
     if vmax is None:
         vmax = max(matrix.max(), 0.3)
@@ -227,14 +231,14 @@ def plot_heatmap(records, output_path, title=None, num_layers=6,
 
     if title:
         ax.set_title(title, fontsize=10, fontweight='bold')
-    ax.set_xlabel('Token Position', fontsize=9)
+    ax.set_xlabel('Token Position (normalized bins)', fontsize=9)
     ax.set_ylabel('Fusion Layer', fontsize=9)
     ax.set_yticks(range(num_layers))
     ax.set_yticklabels([f'L{i+1}' for i in range(num_layers)], fontsize=8)
     ax.tick_params(axis='x', labelsize=8)
 
     mean_val = matrix.mean()
-    ax.text(0.98, 0.92, f'mean = {mean_val:.3f}',
+    ax.text(0.98, 0.92, f'n = {len(records)}\nmean = {mean_val:.3f}',
             transform=ax.transAxes, fontsize=8, ha='right', va='top',
             bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85))
 
@@ -245,8 +249,263 @@ def plot_heatmap(records, output_path, title=None, num_layers=6,
     plt.tight_layout()
     _save_fig(fig, output_path)
 
-    print(f"  Heatmap sample: seq_len={sample['seq_len_size']}, "
-          f"r_stat={sample['r_stat']:.4f}, mean_gate={mean_val:.4f}")
+    print(f"  Heatmap: averaged over {len(records)} flows, "
+          f"{num_bins} bins, mean_gate={mean_val:.4f}")
+
+
+# ============================================================
+# Plot: Heatmap Compare (low vs high r_stat side-by-side)
+# ============================================================
+
+def plot_heatmap_compare(records, output_path, title=None, num_layers=6,
+                         num_bins=16, top_k=50, vmax=None):
+    """
+    Side-by-side averaged heatmap comparing flows in the low vs high r_stat
+    extremes of the current dataset. Shared colorbar makes the contrast direct.
+
+    Partition is done AFTER collect: sort all records by r_stat and take the
+    bottom-K (low) and top-K (high). This is dataset-self-consistent — works
+    regardless of whether the dataset has class-level entropy diversity.
+    """
+    if len(records) < 2:
+        print("ERROR: Need >= 2 records for heatmap_compare.")
+        return
+
+    # Non-overlapping split: cap K at len/2
+    actual_k = min(top_k, len(records) // 2)
+    if actual_k < top_k:
+        print(f"  WARNING: only {len(records)} records, using k={actual_k} per side")
+
+    sorted_recs = sorted(records, key=lambda r: r['r_stat'])
+    low_recs = sorted_recs[:actual_k]
+    high_recs = sorted_recs[-actual_k:]
+
+    low_mat = build_avg_heatmap_normalized(low_recs, num_layers, num_bins)
+    high_mat = build_avg_heatmap_normalized(high_recs, num_layers, num_bins)
+
+    if vmax is None:
+        vmax = max(low_mat.max(), high_mat.max(), 0.3)
+
+    fig, axes = plt.subplots(1, 2, figsize=(7.5, 2.4), constrained_layout=True)
+
+    low_r = np.array([r['r_stat'] for r in low_recs])
+    high_r = np.array([r['r_stat'] for r in high_recs])
+
+    panels = [
+        (axes[0], low_mat, f"Low r_stat  (n={len(low_recs)}, r̄={low_r.mean():.3f})"),
+        (axes[1], high_mat, f"High r_stat (n={len(high_recs)}, r̄={high_r.mean():.3f})"),
+    ]
+
+    im = None
+    for ax, mat, label in panels:
+        im = ax.imshow(mat, aspect='auto', cmap='RdYlBu_r',
+                       norm=Normalize(vmin=0.0, vmax=vmax),
+                       interpolation='nearest', origin='lower')
+        ax.set_title(label, fontsize=9)
+        ax.set_xlabel('Token Position (normalized)', fontsize=9)
+        ax.set_yticks(range(num_layers))
+        ax.set_yticklabels([f'L{i+1}' for i in range(num_layers)], fontsize=8)
+        ax.tick_params(axis='x', labelsize=8)
+        ax.text(0.97, 0.93, f'mean={mat.mean():.3f}',
+                transform=ax.transAxes, fontsize=7, ha='right', va='top',
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85))
+
+    axes[0].set_ylabel('Fusion Layer', fontsize=9)
+
+    cb = fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02)
+    cb.set_label('Gate Value (Behavior←Content)', fontsize=8)
+    cb.ax.tick_params(labelsize=7)
+
+    if title:
+        fig.suptitle(title, fontsize=10, fontweight='bold')
+
+    _save_fig(fig, output_path)
+
+    print(f"  Heatmap compare: low(k={len(low_recs)}, r̄={low_r.mean():.4f}) "
+          f"mean_gate={low_mat.mean():.4f}  |  "
+          f"high(k={len(high_recs)}, r̄={high_r.mean():.4f}) "
+          f"mean_gate={high_mat.mean():.4f}  |  "
+          f"delta={high_mat.mean() - low_mat.mean():+.4f}")
+
+
+# ============================================================
+# Plot: Local Entropy (raw byte position × flow)
+# ============================================================
+
+def plot_local_entropy(records, output_path, title=None,
+                       first_k=256, max_flows=80, vmax=None):
+    """
+    Stacked per-flow local reliability heatmap.
+
+    Each row = one flow, each column = byte position (0..first_k-1).
+    Rows are sorted by flow-level r_stat descending (high-reliability flows on top).
+    Flows shorter than first_k are NaN-padded; cells render as white background.
+
+    Visual narrative: structured regions (TLS handshake header, HTTP plaintext)
+    appear as warm vertical bands; encrypted payload regions stay cold.
+    Top-to-bottom should naturally show a high→low gradient.
+    """
+    recs = [r for r in records
+            if 'local_rel_raw' in r and len(r['local_rel_raw']) > 0]
+    if not recs:
+        print("ERROR: no local_rel_raw in records (run collect first)")
+        return
+
+    # Sort by flow-level r_stat descending (highest at top)
+    recs = sorted(recs, key=lambda r: r['r_stat'], reverse=True)
+
+    # Subsample evenly if too many flows (keep top, bottom and a stride in between)
+    if len(recs) > max_flows:
+        idx = np.linspace(0, len(recs) - 1, max_flows).astype(int)
+        recs = [recs[i] for i in idx]
+
+    n = len(recs)
+    matrix = np.full((n, first_k), np.nan)
+    for i, rec in enumerate(recs):
+        local = rec['local_rel_raw'][:first_k]
+        matrix[i, :len(local)] = local
+
+    masked = np.ma.array(matrix, mask=np.isnan(matrix))
+
+    # Adaptive vmax: percentile-based, with a small floor so noise data still
+    # spans the colormap (encrypted-only datasets have local_rel near 0).
+    if vmax is None:
+        vmax = max(float(np.nanpercentile(matrix, 99)), 0.05)
+
+    # Auto-scale figure height to row count
+    fig_h = max(2.5, min(6.5, 0.06 * n + 1.5))
+    fig, ax = plt.subplots(figsize=(6.5, fig_h))
+
+    cmap = plt.cm.RdYlBu_r.copy()
+    cmap.set_bad('white')
+
+    im = ax.imshow(masked, aspect='auto', cmap=cmap,
+                   vmin=0.0, vmax=vmax,
+                   interpolation='nearest', origin='upper')
+
+    # Draw a horizontal split line at the median r_stat row, to visually anchor
+    # "above = high-reliability flows, below = low-reliability flows"
+    if n >= 4:
+        split = n // 2
+        ax.axhline(y=split - 0.5, color='black', linewidth=0.8,
+                   linestyle='--', alpha=0.6)
+
+    if title:
+        ax.set_title(title, fontsize=10, fontweight='bold')
+    ax.set_xlabel('Byte Position', fontsize=9)
+    ax.set_ylabel('Flow (sorted by r_stat ↓)', fontsize=9)
+    ax.tick_params(labelsize=8)
+
+    r_stats = np.array([r['r_stat'] for r in recs])
+    ax.text(0.02, 0.98,
+            f'n = {n}\nr_stat: [{r_stats.min():.3f}, {r_stats.max():.3f}]',
+            transform=ax.transAxes, fontsize=7, va='top',
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85))
+
+    cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cb.set_label('Local Reliability (1 - H/log n, w=16)', fontsize=8)
+    cb.ax.tick_params(labelsize=7)
+
+    plt.tight_layout()
+    _save_fig(fig, output_path)
+
+    top_half = matrix[:n // 2]
+    bot_half = matrix[n // 2:]
+    print(f"  Local entropy heatmap: {n} flows × {first_k} bytes")
+    print(f"    top  half mean: {np.nanmean(top_half):.4f}  (high r_stat)")
+    print(f"    bot  half mean: {np.nanmean(bot_half):.4f}  (low  r_stat)")
+    print(f"    delta: {np.nanmean(top_half) - np.nanmean(bot_half):+.4f}")
+
+
+# ============================================================
+# Plot: Per-flow Gate Heatmap (rows sorted by r_stat)
+# ============================================================
+
+def plot_gate_per_flow(records, output_path, title=None, num_layers=6,
+                       max_flows=80, max_positions=None, vmax=None):
+    """
+    Per-flow gate heatmap, gate-side analog of plot_local_entropy.
+
+    Each row = one flow, each column = packet position (un-normalized).
+    Rows are sorted by flow-level r_stat descending (highest at top), so the
+    visual ordering matches plot_local_entropy and the per-flow correspondence
+    becomes immediately readable: top rows (high r_stat) should be warmer
+    overall, bottom rows (low r_stat) cooler.
+
+    Cell color = mean gate_size across L fusion layers at that (flow, position).
+    Flows shorter than max_positions are NaN-padded; cells render as white.
+    """
+    if not records:
+        print("ERROR: No records to plot.")
+        return
+
+    # Sort by r_stat descending (highest at top, matches local_ent)
+    recs = sorted(records, key=lambda r: r['r_stat'], reverse=True)
+
+    if len(recs) > max_flows:
+        idx = np.linspace(0, len(recs) - 1, max_flows).astype(int)
+        recs = [recs[i] for i in idx]
+
+    n = len(recs)
+    if max_positions is None:
+        max_positions = max(rec['seq_len_size'] for rec in recs)
+
+    matrix = np.full((n, max_positions), np.nan)
+    for i, rec in enumerate(recs):
+        L = rec['seq_len_size']
+        if L <= 0:
+            continue
+        per_pos = np.mean(
+            [rec['layers'][l]['gate_size'][:L] for l in range(num_layers)],
+            axis=0,
+        )
+        matrix[i, :min(L, max_positions)] = per_pos[:max_positions]
+
+    masked = np.ma.array(matrix, mask=np.isnan(matrix))
+
+    if vmax is None:
+        vmax = max(float(np.nanpercentile(matrix, 99)), 0.1)
+
+    fig_h = max(2.5, min(6.5, 0.06 * n + 1.5))
+    fig, ax = plt.subplots(figsize=(6.5, fig_h))
+
+    cmap = plt.cm.RdYlBu_r.copy()
+    cmap.set_bad('white')
+
+    im = ax.imshow(masked, aspect='auto', cmap=cmap,
+                   vmin=0.0, vmax=vmax,
+                   interpolation='nearest', origin='upper')
+
+    if n >= 4:
+        split = n // 2
+        ax.axhline(y=split - 0.5, color='black', linewidth=0.8,
+                   linestyle='--', alpha=0.6)
+
+    if title:
+        ax.set_title(title, fontsize=10, fontweight='bold')
+    ax.set_xlabel('Packet Position', fontsize=9)
+    ax.set_ylabel('Flow (sorted by r_stat ↓)', fontsize=9)
+    ax.tick_params(labelsize=8)
+
+    r_stats = np.array([r['r_stat'] for r in recs])
+    ax.text(0.02, 0.98,
+            f'n = {n}\nr_stat: [{r_stats.min():.3f}, {r_stats.max():.3f}]',
+            transform=ax.transAxes, fontsize=7, va='top',
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85))
+
+    cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cb.set_label('Mean Gate Value (Behavior←Content)', fontsize=8)
+    cb.ax.tick_params(labelsize=7)
+
+    plt.tight_layout()
+    _save_fig(fig, output_path)
+
+    top_half = matrix[:n // 2]
+    bot_half = matrix[n // 2:]
+    print(f"  Per-flow gate heatmap: {n} flows × {max_positions} positions")
+    print(f"    top half mean: {np.nanmean(top_half):.4f}  (high r_stat)")
+    print(f"    bot half mean: {np.nanmean(bot_half):.4f}  (low  r_stat)")
+    print(f"    delta: {np.nanmean(top_half) - np.nanmean(bot_half):+.4f}")
 
 
 # ============================================================
@@ -314,16 +573,22 @@ def main():
 
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--vocab_path_raw", type=str, required=True)
-    parser.add_argument("--vocab_path_size", type=str, required=True)
-    parser.add_argument("--vocab_path_temporal", type=str, required=True)
+    parser.add_argument("--vocab_path_raw", type=str, default="./test/vocab_raw.txt")
+    parser.add_argument("--vocab_path_size", type=str, default="./test/vocab_size.txt")
+    parser.add_argument("--vocab_path_temporal", type=str, default="./test/vocab_temporal.txt")
     parser.add_argument("--config_path", type=str, default="models/bert/base_config.json")
     parser.add_argument("--output_path", type=str, default="results/gate.pdf")
     parser.add_argument("--title", type=str, default=None)
 
-    parser.add_argument("--plot_type", choices=["scatter", "heatmap", "bar"],
+    parser.add_argument("--plot_type",
+                        choices=["scatter", "heatmap", "heatmap_compare",
+                                 "local_ent", "gate_per_flow", "bar"],
                         default="scatter",
-                        help="scatter: r_stat vs gate; heatmap: per-position; bar: per-layer")
+                        help="scatter: r_stat vs gate; heatmap: averaged per-position; "
+                             "heatmap_compare: low vs high r_stat side-by-side; "
+                             "local_ent: per-flow local raw reliability stack; "
+                             "gate_per_flow: per-flow gate stack (gate-side analog of local_ent); "
+                             "bar: per-layer")
 
     model_opts(parser)
     parser.add_argument("--num_fusion_layers", type=int, default=6)
@@ -338,9 +603,24 @@ def main():
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
 
+    # Class selection (like plot.py's auto_select_label)
+    parser.add_argument("--label_rule", choices=["all", "low", "high"],
+                        default="all",
+                        help="all: use all classes; low: lowest r_stat class; "
+                             "high: highest r_stat class")
+    parser.add_argument("--label2id_path", type=str, default=None,
+                        help="Path to label2id.pkl for class name display")
+
+    # Flow-level selection (after class selection)
+    parser.add_argument("--flow_rule", choices=["all", "low", "high"],
+                        default="all",
+                        help="Flow-level filter inside (or across) classes by r_stat")
+    parser.add_argument("--flow_top_k", type=int, default=0,
+                        help="Keep top-K flows by r_stat under flow_rule (0=disabled)")
+
     # Heatmap specific
-    parser.add_argument("--sample_strategy", choices=["median", "min", "max"],
-                        default="median")
+    parser.add_argument("--heatmap_bins", type=int, default=16,
+                        help="Number of normalized position bins for averaged heatmap")
     parser.add_argument("--vmax", type=float, default=None)
 
     # Compat
@@ -400,16 +680,73 @@ def main():
         print("ERROR: --use_itgca not set.")
         return
 
-    # ---- Collect ----
+    # ---- Load data ----
     print(f"\nProcessing: {args.data_path}")
     with open(args.data_path, 'rb') as f:
         data = pickle.load(f)
     print(f"  Loaded {len(data)} samples")
 
+    # ---- Class selection ----
+    id2label = None
+    if args.label2id_path:
+        with open(args.label2id_path, 'rb') as f:
+            label2id = pickle.load(f)
+        id2label = {v: k for k, v in label2id.items()}
+
+    # Always print per-class r_stat stats
+    if data and 'label' in data[0]:
+        label_groups = defaultdict(list)
+        for idx, sample in enumerate(data):
+            label_groups[sample['label']].append(idx)
+
+        class_stats = {}
+        for label, indices in label_groups.items():
+            sample_indices = indices[:50]
+            batch = torch.LongTensor([data[i]['raw_src'] for i in sample_indices])
+            r = compute_flow_reliability_raw(batch, vocab_size=len(vocab_raw))
+            class_stats[label] = r.mean().item()
+
+        print(f"\n  Per-class r_stat ({len(class_stats)} classes):")
+        for label, mean_r in sorted(class_stats.items(), key=lambda x: x[1]):
+            lname = id2label[label] if id2label and label in id2label else str(label)
+            print(f"    {lname:25s}: r_stat={mean_r:.4f} (n={len(label_groups[label])})")
+
+        if args.label_rule != 'all':
+            if args.label_rule == 'low':
+                selected = min(class_stats, key=class_stats.get)
+            else:
+                selected = max(class_stats, key=class_stats.get)
+            lname = id2label[selected] if id2label and selected in id2label else str(selected)
+            print(f"  -> Selected [{args.label_rule}]: {lname} "
+                  f"(r_stat={class_stats[selected]:.4f})")
+            data = [data[i] for i in label_groups[selected]]
+            print(f"  Filtered to {len(data)} samples")
+
+    # ---- Flow selection (within current data, after class filter) ----
+    # heatmap_compare partitions records *after* collect, so skip pre-filter.
+    if args.plot_type == 'heatmap_compare' and args.flow_rule != 'all':
+        print("  NOTE: heatmap_compare ignores --flow_rule "
+              "(low and high are derived from the same record set)")
+    if (args.plot_type != 'heatmap_compare' and
+            args.flow_rule != 'all' and args.flow_top_k > 0 and len(data) > 0):
+        all_raw = torch.LongTensor([s['raw_src'] for s in data])
+        all_r = compute_flow_reliability_raw(all_raw, vocab_size=len(vocab_raw))
+        k = min(args.flow_top_k, len(data))
+        largest = (args.flow_rule == 'high')
+        topk_idx = torch.topk(all_r, k=k, largest=largest).indices.tolist()
+        selected_r = all_r[topk_idx]
+        print(f"  Flow filter [{args.flow_rule}, top-{k}]: "
+              f"r_stat range [{selected_r.min().item():.4f}, {selected_r.max().item():.4f}], "
+              f"mean {selected_r.mean().item():.4f}")
+        data = [data[i] for i in topk_idx]
+
+    # ---- Collect ----
+
     collector = GateCollector(model)
     collect_gate_values(model, data, collector, device,
                         vocab_size_raw=len(vocab_raw),
-                        max_samples=args.max_samples, batch_size=args.batch_size)
+                        max_samples=args.max_samples, batch_size=args.batch_size,
+                        window_size=args.itgca_window_size)
     records = collector.records
     collector.remove_hooks()
     print(f"  Collected {len(records)} samples")
@@ -432,7 +769,21 @@ def main():
     elif args.plot_type == 'heatmap':
         plot_heatmap(records, args.output_path, title=args.title,
                      num_layers=args.num_fusion_layers, vmax=args.vmax,
-                     strategy=args.sample_strategy)
+                     num_bins=args.heatmap_bins)
+    elif args.plot_type == 'heatmap_compare':
+        # flow_top_k doubles as per-side k; default to 50 if user left it 0
+        per_side_k = args.flow_top_k if args.flow_top_k > 0 else 50
+        plot_heatmap_compare(records, args.output_path, title=args.title,
+                             num_layers=args.num_fusion_layers,
+                             num_bins=args.heatmap_bins,
+                             top_k=per_side_k, vmax=args.vmax)
+    elif args.plot_type == 'local_ent':
+        plot_local_entropy(records, args.output_path, title=args.title,
+                           first_k=256, max_flows=80, vmax=args.vmax)
+    elif args.plot_type == 'gate_per_flow':
+        plot_gate_per_flow(records, args.output_path, title=args.title,
+                           num_layers=args.num_fusion_layers,
+                           max_flows=80, vmax=args.vmax)
     elif args.plot_type == 'bar':
         plot_bar(records, args.output_path, title=args.title,
                  num_layers=args.num_fusion_layers)

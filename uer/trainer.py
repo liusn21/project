@@ -120,7 +120,10 @@ def train_and_validate(args):
         # (alpha=-2.0 → sigmoid≈0.12, g_default_logit=0.0, bilinear xavier gain=0.1)
         # These must NOT be overwritten by blanket normal_(0, 0.02)
         itgca_param_names = ('alpha_modality', 'g_default_logit',
-                             'bilinear_W', 'bilinear_bias')
+                             'bilinear_W', 'bilinear_bias',
+                             'stat_scale', 'stat_shift',
+                             'local_stat_scale', 'local_stat_shift',
+                             'token_gate_bias')
         for n, p in list(model.named_parameters()):
             if "gamma" not in n and "beta" not in n:
                 if not n.startswith(pretrained_prefixes):
@@ -171,6 +174,7 @@ class Trainer(object):
         raise NotImplementedError
 
     def train(self, args, gpu_id, rank, loader, model, optimizer, scheduler):
+        self.model = model
         model.train()
         loader_iter = iter(loader)
 
@@ -568,6 +572,19 @@ class MultiModalTrainer(Trainer):
             log_parts.append(" | l2b: {:5.4f}".format(avg_loss_l2b))
         print("".join(log_parts))
 
+        # Print ITGCA calibration parameters (gate health monitoring)
+        if getattr(self.args, 'use_itgca', False):
+            model_ref = self.model.module if hasattr(self.model, 'module') else self.model
+            if hasattr(model_ref, 'fusion'):
+                for i, layer in enumerate(model_ref.fusion.fusion_layers):
+                    if hasattr(layer, 'gate_size') and hasattr(layer.gate_size, 'stat_scale'):
+                        g = layer.gate_size
+                        print(f"  ITGCA L{i}: scale={g.stat_scale.item():.3f} "
+                              f"shift={g.stat_shift.item():.3f} "
+                              f"alpha={g.alpha_modality.item():.3f} "
+                              f"beta={torch.sigmoid(g.alpha_modality).item():.3f}")
+                        break  
+
         # Reset statistics
         self.total_loss = 0.0
         self.total_loss_itc = 0.0
@@ -644,6 +661,11 @@ def worker(proc_id, gpu_ranks, args, model):
         encoder_params_no_decay = []
         other_params_decay = []
         other_params_no_decay = []
+        calibration_params = []
+
+        # ITGCA calibration parameter names — need higher LR, no weight decay
+        calibration_names = ('stat_scale', 'stat_shift',
+                             'local_stat_scale', 'local_stat_shift')
 
         for n, p in param_optimizer:
             if not p.requires_grad:
@@ -654,8 +676,11 @@ def worker(proc_id, gpu_ranks, args, model):
                                "embedding_raw" in n or "embedding_size" in n) and
                               "_m" not in n)  # Exclude momentum encoders
             is_no_decay = any(nd in n for nd in no_decay)
+            is_calibration = any(cn in n for cn in calibration_names)
 
-            if is_main_encoder:
+            if is_calibration:
+                calibration_params.append(p)
+            elif is_main_encoder:
                 if is_no_decay:
                     encoder_params_no_decay.append(p)
                 else:
@@ -666,17 +691,20 @@ def worker(proc_id, gpu_ranks, args, model):
                 else:
                     other_params_decay.append(p)
 
+        calibration_lr = args.learning_rate * 10  # 10× higher LR for calibration
         optimizer_grouped_parameters = [
             {"params": encoder_params_decay, "lr": encoder_lr, "weight_decay": 0.01},
             {"params": encoder_params_no_decay, "lr": encoder_lr, "weight_decay": 0.0},
             {"params": other_params_decay, "lr": args.learning_rate, "weight_decay": 0.01},
             {"params": other_params_no_decay, "lr": args.learning_rate, "weight_decay": 0.0},
+            {"params": calibration_params, "lr": calibration_lr, "weight_decay": 0.0},
         ]
 
         print(f"  Encoder params (lr={encoder_lr:.2e}): "
               f"{len(encoder_params_decay)} decay, {len(encoder_params_no_decay)} no_decay")
         print(f"  Other params (lr={args.learning_rate:.2e}): "
               f"{len(other_params_decay)} decay, {len(other_params_no_decay)} no_decay")
+        print(f"  Calibration params (lr={calibration_lr:.2e}, no wd): {len(calibration_params)}")
     else:
         # Non-multimodal: all parameters use same learning rate
         optimizer_grouped_parameters = [

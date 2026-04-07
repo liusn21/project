@@ -314,6 +314,9 @@ class Stage2Classifier(nn.Module):
         self.use_itgca = getattr(args, 'use_itgca', False)
         self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
         self.vocab_size_raw = vocab_size_raw
+        # Component-level ablation flags (must match pretrained checkpoint)
+        self.ablate_r_stat = getattr(args, 'ablate_r_stat', False)
+        self.ablate_source_bias = getattr(args, 'ablate_source_bias', False)
 
         # Raw modality encoder
         self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
@@ -378,11 +381,15 @@ class Stage2Classifier(nn.Module):
 
         # ITGCA signals (no detach — let gate gradients flow to encoder)
         if self.use_itgca:
+            r_stat_raw = (None if self.ablate_r_stat
+                          else compute_flow_reliability_raw(raw_src, vocab_size=self.vocab_size_raw))
+            local_ent_raw = (None if self.ablate_source_bias
+                             else compute_local_entropy(raw_src, self.itgca_window_size))
             itgca_kwargs = {
                 'raw_cls_enc': raw_output[:, 0, :],
                 'size_cls_enc': size_output[:, 0, :],
-                'r_stat_raw': compute_flow_reliability_raw(raw_src, vocab_size=self.vocab_size_raw),
-                'local_ent_raw': compute_local_entropy(raw_src, self.itgca_window_size),
+                'r_stat_raw': r_stat_raw,
+                'local_ent_raw': local_ent_raw,
             }
         else:
             itgca_kwargs = {}
@@ -835,12 +842,16 @@ def build_optimizer(args, model):
             'weight_decay': 0.0
         })
 
-        # Fusion parameters (middle LR)
+        # Fusion parameters (middle LR), with calibration params separated
+        calibration_names = ('stat_scale', 'stat_shift', 'local_stat_scale', 'local_stat_shift')
         fusion_params = []
         fusion_params_no_decay = []
+        calibration_params = []
         for name, param in actual_model.named_parameters():
             if 'fusion' in name:
-                if any(nd in name for nd in no_decay):
+                if any(cn in name for cn in calibration_names):
+                    calibration_params.append(param)
+                elif any(nd in name for nd in no_decay):
                     fusion_params_no_decay.append(param)
                 else:
                     fusion_params.append(param)
@@ -855,6 +866,13 @@ def build_optimizer(args, model):
             'lr': fusion_lr,
             'weight_decay': 0.0
         })
+        if calibration_params:
+            calibration_lr = fusion_lr * 5
+            optimizer_grouped_parameters.append({
+                'params': calibration_params,
+                'lr': calibration_lr,
+                'weight_decay': 0.0
+            })
 
         # Classifier parameters (highest LR)
         classifier_params = []
@@ -878,17 +896,37 @@ def build_optimizer(args, model):
         })
 
         print(f"  LLRD: encoder_lr={encoder_lr:.2e}, fusion_lr={fusion_lr:.2e}, classifier_lr={classifier_lr:.2e}")
+        if calibration_params:
+            print(f"  Calibration params ({len(calibration_params)}): lr={calibration_lr:.2e}, no weight_decay")
 
     else:
         # Standard optimizer: same LR for all parameters
         param_optimizer = list(model.named_parameters())
+        calibration_names = ('stat_scale', 'stat_shift', 'local_stat_scale', 'local_stat_shift')
+
+        calibration_params = []
+        other_params_decay = []
+        other_params_no_decay = []
+        for n, p in param_optimizer:
+            if any(cn in n for cn in calibration_names):
+                calibration_params.append(p)
+            elif any(nd in n for nd in no_decay):
+                other_params_no_decay.append(p)
+            else:
+                other_params_decay.append(p)
 
         optimizer_grouped_parameters = [
-            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-             'weight_decay': 0.01},
-            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
-             'weight_decay': 0.0}
+            {'params': other_params_decay, 'weight_decay': 0.01},
+            {'params': other_params_no_decay, 'weight_decay': 0.0},
         ]
+        if calibration_params:
+            calibration_lr = args.learning_rate * 5
+            optimizer_grouped_parameters.append({
+                'params': calibration_params,
+                'lr': calibration_lr,
+                'weight_decay': 0.0
+            })
+            print(f"  Calibration params ({len(calibration_params)}): lr={calibration_lr:.2e}, no weight_decay")
 
     if args.optimizer in ["adamw"]:
         optimizer = str2optimizer[args.optimizer](
@@ -995,6 +1033,17 @@ def main():
                              "MUST match the pretrained model's configuration.")
     parser.add_argument("--itgca_window_size", type=int, default=16,
                         help="Sliding window size for ITGCA local entropy.")
+
+    # ITGCA component-level ablation flags — MUST match the pretrained checkpoint config.
+    # Defaults: all False = full ITGCA.
+    parser.add_argument("--ablate_r_stat", action="store_true",
+                        help="Disable r_stat prior. Must match the pretrained checkpoint.")
+    parser.add_argument("--ablate_r_learned", action="store_true",
+                        help="Disable r_learned bilinear. Must match the pretrained checkpoint.")
+    parser.add_argument("--ablate_g_token", action="store_true",
+                        help="Disable token-level gate. Must match the pretrained checkpoint.")
+    parser.add_argument("--ablate_source_bias", action="store_true",
+                        help="Disable source-side attention bias. Must match the pretrained checkpoint.")
 
     # Sequence lengths
     parser.add_argument("--seq_length_raw", type=int, default=512)
