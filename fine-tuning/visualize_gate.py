@@ -49,7 +49,7 @@ from uer.models.multimodal_model import compute_flow_reliability_raw, compute_lo
 # ============================================================
 
 class GateCollector:
-    """Collect gate_info from BidirectionalFusionLayer via forward hooks."""
+    """Collect gate_info + cross-attention probs from BidirectionalFusionLayer."""
 
     def __init__(self, model):
         self.records = []
@@ -60,39 +60,79 @@ class GateCollector:
     def _register(self, model):
         fusion = model.module.fusion if hasattr(model, 'module') else model.fusion
         for i, layer in enumerate(fusion.fusion_layers):
-            hook = layer.register_forward_hook(self._make_hook(i))
-            self._hooks.append(hook)
+            # Hook 1: BidirectionalFusionLayer → gate_info (gate_size, r_mod_s2r)
+            h1 = layer.register_forward_hook(self._make_fusion_hook(i))
+            self._hooks.append(h1)
+            # Hook 2: cross_attn_size submodule → post-softmax attention probs
+            # cross_attn_size is the Size←Raw cross-attention; query=size, key=raw,
+            # so probs.shape = [B, n_heads, L_size, L_raw]
+            h2 = layer.cross_attn_size.register_forward_hook(self._make_attn_hook(i))
+            self._hooks.append(h2)
 
-    def _make_hook(self, layer_idx):
+    def _make_fusion_hook(self, layer_idx):
         def hook_fn(module, input, output):
             _, _, gate_info = output
             if gate_info is not None:
-                self._current[layer_idx] = {
-                    'gate_size': gate_info['gate_size'].detach().cpu(),
-                    'r_mod_s2r': gate_info['r_mod_s2r'].detach().cpu(),
-                }
+                self._current.setdefault(layer_idx, {})
+                self._current[layer_idx]['gate_size'] = gate_info['gate_size'].detach().cpu()
+                self._current[layer_idx]['r_mod_s2r'] = gate_info['r_mod_s2r'].detach().cpu()
+        return hook_fn
+
+    def _make_attn_hook(self, layer_idx):
+        def hook_fn(module, input, output):
+            # MultiHeadedAttention.forward returns (attn_output, probs)
+            # probs: [B, n_heads, L_q, L_k] = [B, n_heads, L_size, L_raw]
+            probs = output[1].detach().mean(dim=1).cpu()  # mean over heads → [B, L_size, L_raw]
+            self._current.setdefault(layer_idx, {})
+            self._current[layer_idx]['cross_attn_probs'] = probs
         return hook_fn
 
     def flush_batch(self, seq_lens_size, r_stat_batch,
                     seq_lens_raw=None, local_rel_raw_batch=None):
-        """Store per-sample gate values + r_stat (+ optional local raw reliability)."""
+        """Store per-sample gate values + r_stat + per-byte effective attention."""
         if not self._current:
             return
         B = self._current[0]['gate_size'].shape[0]
+        num_layers = len(self._current)
         for b in range(B):
-            L = seq_lens_size[b].item()
+            L_size = seq_lens_size[b].item()
+            L_raw = seq_lens_raw[b].item() if seq_lens_raw is not None else None
+
+            # Per-layer gate-weighted attention received by each raw byte:
+            #   eff_l[j] = sum_k(gate_size[l, k] * probs[l, k, j])
+            # Then average across the L fusion layers.
+            # NOTE: NO normalization by sum(g). Normalization would cancel out the
+            # absolute magnitude of gate_size and erase the dataset-level r_mod
+            # × g_token contrast (the very thing we want to visualize). The byte-level
+            # source_bias pattern survives anyway because it's encoded in p, not in g.
+            eff_per_layer = []
+            for layer_idx in range(num_layers):
+                g = self._current[layer_idx]['gate_size'][b, :L_size]            # [L_size]
+                if 'cross_attn_probs' not in self._current[layer_idx] or L_raw is None:
+                    continue
+                p = self._current[layer_idx]['cross_attn_probs'][b, :L_size, :L_raw]  # [L_size, L_raw]
+                weighted = (g.unsqueeze(-1) * p).sum(dim=0)                       # [L_raw]
+                eff_per_layer.append(weighted.numpy())
+            eff_attn = np.mean(eff_per_layer, axis=0) if eff_per_layer else None  # [L_raw] or None
+
+            r_mod_mean = float(np.mean([
+                self._current[l]['r_mod_s2r'][b].item() for l in range(num_layers)
+            ]))
+
             sample = {
-                'seq_len_size': L,
+                'seq_len_size': L_size,
                 'r_stat': r_stat_batch[b].item(),
+                'r_mod_mean': r_mod_mean,
                 'layers': {},
             }
+            if eff_attn is not None:
+                sample['eff_attn'] = eff_attn
             for layer_idx in self._current:
                 sample['layers'][layer_idx] = {
-                    'gate_size': self._current[layer_idx]['gate_size'][b, :L].numpy(),
+                    'gate_size': self._current[layer_idx]['gate_size'][b, :L_size].numpy(),
                     'r_mod_s2r': self._current[layer_idx]['r_mod_s2r'][b].item(),
                 }
             if local_rel_raw_batch is not None and seq_lens_raw is not None:
-                L_raw = seq_lens_raw[b].item()
                 sample['seq_len_raw'] = L_raw
                 sample['local_rel_raw'] = local_rel_raw_batch[b, :L_raw].numpy()
             self.records.append(sample)
@@ -341,9 +381,11 @@ def plot_local_entropy(records, output_path, title=None,
     Rows are sorted by flow-level r_stat descending (high-reliability flows on top).
     Flows shorter than first_k are NaN-padded; cells render as white background.
 
-    Visual narrative: structured regions (TLS handshake header, HTTP plaintext)
-    appear as warm vertical bands; encrypted payload regions stay cold.
-    Top-to-bottom should naturally show a high→low gradient.
+    Visual narrative: structurally low-entropy regions of the payload
+    (typically the leading bytes of each per-packet 64-byte block, where
+    application-layer framing such as protocol record / message headers sits)
+    appear as warm vertical bands; the remainder of encrypted payloads stays cold.
+    Top-to-bottom should naturally show a high→low gradient by flow-level r_stat.
     """
     recs = [r for r in records
             if 'local_rel_raw' in r and len(r['local_rel_raw']) > 0]
@@ -509,6 +551,122 @@ def plot_gate_per_flow(records, output_path, title=None, num_layers=6,
 
 
 # ============================================================
+# Plot: Effective Attention (gate side, byte axis)
+# ============================================================
+
+def plot_effective_attention(records, output_path, title=None,
+                             first_k=256, max_flows=80, vmax=None):
+    """
+    Per-flow effective gated cross-attention on the raw byte axis.
+
+    Each row = one flow, sorted by r_stat descending (matches plot_local_entropy).
+    Each column = byte position 0..first_k-1 (matches plot_local_entropy x-axis).
+    Cell value = mean_l( sum_k(gate_size[l, k] * cross_attn_probs[l, k, j]) ).
+
+    No post-hoc normalization or r_mod multiplication: gate_size already carries
+    r_mod * g_token, so its absolute magnitude propagates naturally to row brightness
+    and to dataset-level contrast. The byte-level source_bias pattern survives
+    because it's encoded in the attention weights p, independent of g.
+
+    Visualizes both:
+      - flow-level r_stat effect: top rows brighter via r_mod * g_token magnitude
+      - byte-level local_ent effect: warm columns at structurally reliable bytes,
+        because source_bias inside the softmax skews attention toward those bytes
+
+    Designed to be column-aligned with plot_local_entropy so the data side and
+    model side can be compared cell-by-cell.
+    """
+    recs = [r for r in records
+            if 'eff_attn' in r and r['eff_attn'] is not None]
+    if not recs:
+        print("ERROR: no eff_attn in records (cross_attn hooks may have failed)")
+        return
+
+    # Sort by flow-level r_stat descending (highest at top), matches local_ent
+    recs = sorted(recs, key=lambda r: r['r_stat'], reverse=True)
+
+    if len(recs) > max_flows:
+        idx = np.linspace(0, len(recs) - 1, max_flows).astype(int)
+        recs = [recs[i] for i in idx]
+
+    n = len(recs)
+    matrix = np.full((n, first_k), np.nan)
+    for i, rec in enumerate(recs):
+        eff = rec['eff_attn'][:first_k]
+        matrix[i, :len(eff)] = eff
+
+    masked = np.ma.array(matrix, mask=np.isnan(matrix))
+
+    if vmax is None:
+        # Adaptive vmax: 99th percentile, with a small floor for very-cool datasets
+        vmax = max(float(np.nanpercentile(matrix, 99)), 1e-4)
+
+    # Auto-scale figure height to row count (same formula as plot_local_entropy)
+    fig_h = max(2.5, min(6.5, 0.06 * n + 1.5))
+    fig, ax = plt.subplots(figsize=(6.5, fig_h))
+
+    cmap = plt.cm.RdYlBu_r.copy()
+    cmap.set_bad('white')
+
+    im = ax.imshow(masked, aspect='auto', cmap=cmap,
+                   vmin=0.0, vmax=vmax,
+                   interpolation='nearest', origin='upper')
+
+    if n >= 4:
+        split = n // 2
+        ax.axhline(y=split - 0.5, color='black', linewidth=0.8,
+                   linestyle='--', alpha=0.6)
+
+    if title:
+        ax.set_title(title, fontsize=10, fontweight='bold')
+    ax.set_xlabel('Byte Position', fontsize=9)
+    ax.set_ylabel('Flow (sorted by r_stat ↓)', fontsize=9)
+    ax.tick_params(labelsize=8)
+
+    r_stats = np.array([r['r_stat'] for r in recs])
+    ax.text(0.02, 0.98,
+            f'n = {n}\nr_stat: [{r_stats.min():.3f}, {r_stats.max():.3f}]',
+            transform=ax.transAxes, fontsize=7, va='top',
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85))
+
+    cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cb.set_label('Effective gated attention (per byte)', fontsize=8)
+    cb.ax.tick_params(labelsize=7)
+
+    plt.tight_layout()
+    _save_fig(fig, output_path)
+
+    top_half = matrix[:n // 2]
+    bot_half = matrix[n // 2:]
+    print(f"  Effective attention: {n} flows × {first_k} bytes")
+    print(f"    top half mean: {np.nanmean(top_half):.6f}  (high r_stat)")
+    print(f"    bot half mean: {np.nanmean(bot_half):.6f}  (low  r_stat)")
+    print(f"    delta: {np.nanmean(top_half) - np.nanmean(bot_half):+.6f}")
+    if r_stats.std() > 1e-6:
+        # Pearson correlation between row r_stat and row mean eff_attn
+        row_means = np.nanmean(matrix, axis=1)
+        corr = np.corrcoef(r_stats, row_means)[0, 1]
+        print(f"    pearson(r_stat, row mean eff_attn): {corr:+.4f}")
+
+    # ===== Diagnostics: r_mod distribution and per-byte concentration =====
+    # These tell us whether the flow-level gate (r_mod) is doing meaningful work
+    # or whether the byte-level source_bias is the dominant mechanism.
+    r_mods = np.array([r['r_mod_mean'] for r in recs])
+    print(f"  r_mod distribution across {n} sampled flows:")
+    print(f"    min={r_mods.min():.4f}  mean={r_mods.mean():.4f}  max={r_mods.max():.4f}  std={r_mods.std():.4f}")
+    print(f"    pearson(r_stat, r_mod): {np.corrcoef(r_stats, r_mods)[0, 1]:+.4f}")
+    # Per-byte concentration ratio: max byte / mean byte (per row, then averaged).
+    # Large value → strong byte-level concentration via source_bias.
+    # We use the raw matrix (no r_mod division) since matrix already has r_mod baked in
+    # uniformly across each row, so dividing it out wouldn't change the ratio.
+    row_max = np.nanmax(matrix, axis=1)
+    row_mean = np.nanmean(matrix, axis=1)
+    concentration = np.nanmean(row_max / np.where(row_mean > 1e-12, row_mean, 1.0))
+    print(f"  byte-level concentration ratio (max/mean per row, averaged): {concentration:.2f}x")
+    print(f"    (>3x means source_bias steers attention strongly toward specific bytes)")
+
+
+# ============================================================
 # Plot: Bar (per-layer mean gate)
 # ============================================================
 
@@ -582,12 +740,13 @@ def main():
 
     parser.add_argument("--plot_type",
                         choices=["scatter", "heatmap", "heatmap_compare",
-                                 "local_ent", "gate_per_flow", "bar"],
+                                 "local_ent", "gate_per_flow", "effective_attn", "bar"],
                         default="scatter",
                         help="scatter: r_stat vs gate; heatmap: averaged per-position; "
                              "heatmap_compare: low vs high r_stat side-by-side; "
                              "local_ent: per-flow local raw reliability stack; "
                              "gate_per_flow: per-flow gate stack (gate-side analog of local_ent); "
+                             "effective_attn: per-byte gated cross-attention (gate side, byte axis); "
                              "bar: per-layer")
 
     model_opts(parser)
@@ -679,6 +838,20 @@ def main():
     if not args.use_itgca:
         print("ERROR: --use_itgca not set.")
         return
+
+    # ---- Diagnostic: print learned ITGCA calibration parameters per layer ----
+    fusion = model.module.fusion if hasattr(model, 'module') else model.fusion
+    print(f"\nLearned ITGCA calibration parameters (per fusion layer):")
+    print(f"  {'L':>3}  {'stat_scale':>11}  {'stat_shift':>11}  {'local_scale':>11}  {'local_shift':>11}  {'alpha_mod':>10}")
+    for i, layer in enumerate(fusion.fusion_layers):
+        gate = layer.gate_size  # Size←Raw branch (the one with stat prior)
+        stat_scale = float(gate.stat_scale.detach()) if hasattr(gate, 'stat_scale') else float('nan')
+        stat_shift = float(gate.stat_shift.detach()) if hasattr(gate, 'stat_shift') else float('nan')
+        alpha_mod = float(gate.alpha_modality.detach()) if hasattr(gate, 'alpha_modality') else float('nan')
+        local_scale = float(layer.local_stat_scale.detach()) if hasattr(layer, 'local_stat_scale') else float('nan')
+        local_shift = float(layer.local_stat_shift.detach()) if hasattr(layer, 'local_stat_shift') else float('nan')
+        print(f"  L{i+1:<2}  {stat_scale:>11.4f}  {stat_shift:>11.4f}  {local_scale:>11.4f}  {local_shift:>11.4f}  {alpha_mod:>10.4f}")
+    print("  (init values: stat_scale=5.0, stat_shift=-0.5, local_scale=5.0, local_shift=-0.5, alpha_mod=-2.0)")
 
     # ---- Load data ----
     print(f"\nProcessing: {args.data_path}")
@@ -784,6 +957,9 @@ def main():
         plot_gate_per_flow(records, args.output_path, title=args.title,
                            num_layers=args.num_fusion_layers,
                            max_flows=80, vmax=args.vmax)
+    elif args.plot_type == 'effective_attn':
+        plot_effective_attention(records, args.output_path, title=args.title,
+                                 first_k=256, max_flows=80, vmax=args.vmax)
     elif args.plot_type == 'bar':
         plot_bar(records, args.output_path, title=args.title,
                  num_layers=args.num_fusion_layers)

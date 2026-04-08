@@ -172,11 +172,9 @@ class MultiModalModel(nn.Module):
         self.use_itgca = getattr(args, 'use_itgca', False)
         if self.use_itgca:
             self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
-            self.lambda_l2_beta = getattr(args, 'lambda_l2_beta', 0.01)
             self.vocab_size_raw = embedding_raw.token_embedding.num_embeddings
             # Component-level ablation flags
             self.ablate_r_stat = getattr(args, 'ablate_r_stat', False)
-            self.ablate_r_learned = getattr(args, 'ablate_r_learned', False)
             self.ablate_g_token = getattr(args, 'ablate_g_token', False)
             self.ablate_source_bias = getattr(args, 'ablate_source_bias', False)
 
@@ -304,29 +302,6 @@ class MultiModalModel(nn.Module):
             'r_stat_raw': r_stat_raw,
             'local_ent_raw': local_ent_raw,
         }
-
-    def _compute_itgca_losses(self):
-        """
-        Compute ITGCA auxiliary loss: L2 on β = sigmoid(alpha_modality).
-
-        Prevents β from growing too large, which would completely override
-        the statistical prior r_stat in the modality gate.
-
-        Only applies to Size←Raw gates (has_modality_prior=True).
-
-        Returns:
-            l2_beta_loss: scalar
-        """
-        l2_beta = torch.tensor(0.0, device=next(self.fusion.parameters()).device)
-        count = 0
-        for layer in self.fusion.fusion_layers:
-            if hasattr(layer, 'gate_size') and hasattr(layer.gate_size, 'alpha_modality'):
-                beta = torch.sigmoid(layer.gate_size.alpha_modality)
-                l2_beta = l2_beta + beta ** 2
-                count += 1
-        if count > 0:
-            l2_beta = l2_beta / count
-        return l2_beta
 
     def forward(self, raw_src, raw_packet_ids, raw_directions,
                 size_src_clean, iat_src_clean,
@@ -494,12 +469,6 @@ class MultiModalModel(nn.Module):
             size_fused_masked, tgt_mlm_size, tgt_mlm_temporal
         )
 
-        # ===== ITGCA Auxiliary Loss =====
-        if self.use_itgca:
-            l2_beta_loss = self._compute_itgca_losses()
-        else:
-            l2_beta_loss = torch.tensor(0.0, device=raw_src.device)
-
         # ===== Return all losses =====
         loss_dict = {
             'itc_loss': itc_loss,
@@ -512,7 +481,6 @@ class MultiModalModel(nn.Module):
             'recon_temporal_correct_exact': recon_results['temporal_correct_exact'],
             'recon_temporal_correct_range': recon_results['temporal_correct_range'],
             'recon_temporal_denom': recon_results['temporal_denom'],
-            'l2_beta_loss': l2_beta_loss,
         }
 
         return loss_dict

@@ -1038,8 +1038,6 @@ def main():
     # Defaults: all False = full ITGCA.
     parser.add_argument("--ablate_r_stat", action="store_true",
                         help="Disable r_stat prior. Must match the pretrained checkpoint.")
-    parser.add_argument("--ablate_r_learned", action="store_true",
-                        help="Disable r_learned bilinear. Must match the pretrained checkpoint.")
     parser.add_argument("--ablate_g_token", action="store_true",
                         help="Disable token-level gate. Must match the pretrained checkpoint.")
     parser.add_argument("--ablate_source_bias", action="store_true",
