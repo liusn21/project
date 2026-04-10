@@ -1043,6 +1043,12 @@ def main():
     parser.add_argument("--ablate_source_bias", action="store_true",
                         help="Disable source-side attention bias. Must match the pretrained checkpoint.")
 
+    # ITGCA initialization values — MUST match the pretrained checkpoint config.
+    parser.add_argument("--alpha_init", type=float, default=-2.0,
+                        help="Initial value for alpha_modality. Must match pretrained checkpoint.")
+    parser.add_argument("--token_gate_bias_init", type=float, default=2.0,
+                        help="Initial value for token_gate_bias. Must match pretrained checkpoint.")
+
     # Sequence lengths
     parser.add_argument("--seq_length_raw", type=int, default=512)
     parser.add_argument("--seq_length_size", type=int, default=256)

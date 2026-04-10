@@ -157,6 +157,16 @@ def main():
                         help="Disable the source-side attention bias b_j computed from "
                              "sliding-window local entropy. Affects Size←Raw direction only.")
 
+    # ITGCA initialization values (for §5.3.4 sensitivity-to-initialization experiments)
+    parser.add_argument("--alpha_init", type=float, default=-2.0,
+                        help="Initial value for alpha_modality (gated residual mixing). "
+                             "sigmoid(alpha_init) controls initial blend between r_stat and r_learned. "
+                             "Default -2.0 → sigmoid ≈ 0.12 (heavy prior reliance).")
+    parser.add_argument("--token_gate_bias_init", type=float, default=2.0,
+                        help="Initial value for token_gate_bias. "
+                             "sigmoid(token_gate_bias_init) controls default gate openness. "
+                             "Default 2.0 → sigmoid ≈ 0.88 (default-open).")
+
     # Temperature parameters
     parser.add_argument("--itc_temperature", type=float, default=0.07,
                         help="Temperature for ITC contrastive loss.")

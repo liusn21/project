@@ -414,9 +414,9 @@ def plot_local_entropy(records, output_path, title=None,
     if vmax is None:
         vmax = max(float(np.nanpercentile(matrix, 99)), 0.05)
 
-    # Auto-scale figure height to row count
-    fig_h = max(2.5, min(6.5, 0.06 * n + 1.5))
-    fig, ax = plt.subplots(figsize=(6.5, fig_h))
+    # Auto-scale figure height to row count (compact version)
+    fig_h = max(2.0, min(4.0, 0.04 * n + 1.0))
+    fig, ax = plt.subplots(figsize=(4.0, fig_h))
 
     cmap = plt.cm.RdYlBu_r.copy()
     cmap.set_bad('white')
@@ -433,20 +433,20 @@ def plot_local_entropy(records, output_path, title=None,
                    linestyle='--', alpha=0.6)
 
     if title:
-        ax.set_title(title, fontsize=10, fontweight='bold')
-    ax.set_xlabel('Byte Position', fontsize=9)
-    ax.set_ylabel('Flow (sorted by r_stat ↓)', fontsize=9)
-    ax.tick_params(labelsize=8)
+        ax.set_title(title, fontsize=8, fontweight='bold')
+    ax.set_xlabel('Byte Position', fontsize=7)
+    ax.set_ylabel('Flow (sorted by r_stat ↓)', fontsize=7)
+    ax.tick_params(labelsize=6)
 
     r_stats = np.array([r['r_stat'] for r in recs])
     ax.text(0.02, 0.98,
             f'n = {n}\nr_stat: [{r_stats.min():.3f}, {r_stats.max():.3f}]',
-            transform=ax.transAxes, fontsize=7, va='top',
+            transform=ax.transAxes, fontsize=6, va='top',
             bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85))
 
     cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-    cb.set_label('Local Reliability (1 - H/log n, w=16)', fontsize=8)
-    cb.ax.tick_params(labelsize=7)
+    cb.set_label('Local Reliability (1 - H/log n, w=16)', fontsize=6)
+    cb.ax.tick_params(labelsize=6)
 
     plt.tight_layout()
     _save_fig(fig, output_path)
@@ -601,9 +601,9 @@ def plot_effective_attention(records, output_path, title=None,
         # Adaptive vmax: 99th percentile, with a small floor for very-cool datasets
         vmax = max(float(np.nanpercentile(matrix, 99)), 1e-4)
 
-    # Auto-scale figure height to row count (same formula as plot_local_entropy)
-    fig_h = max(2.5, min(6.5, 0.06 * n + 1.5))
-    fig, ax = plt.subplots(figsize=(6.5, fig_h))
+    # Auto-scale figure height to row count (compact version)
+    fig_h = max(2.0, min(4.0, 0.04 * n + 1.0))
+    fig, ax = plt.subplots(figsize=(4.0, fig_h))
 
     cmap = plt.cm.RdYlBu_r.copy()
     cmap.set_bad('white')
@@ -618,20 +618,20 @@ def plot_effective_attention(records, output_path, title=None,
                    linestyle='--', alpha=0.6)
 
     if title:
-        ax.set_title(title, fontsize=10, fontweight='bold')
-    ax.set_xlabel('Byte Position', fontsize=9)
-    ax.set_ylabel('Flow (sorted by r_stat ↓)', fontsize=9)
-    ax.tick_params(labelsize=8)
+        ax.set_title(title, fontsize=8, fontweight='bold')
+    ax.set_xlabel('Byte Position', fontsize=7)
+    ax.set_ylabel('Flow (sorted by r_stat ↓)', fontsize=7)
+    ax.tick_params(labelsize=6)
 
     r_stats = np.array([r['r_stat'] for r in recs])
     ax.text(0.02, 0.98,
             f'n = {n}\nr_stat: [{r_stats.min():.3f}, {r_stats.max():.3f}]',
-            transform=ax.transAxes, fontsize=7, va='top',
+            transform=ax.transAxes, fontsize=6, va='top',
             bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.85))
 
     cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-    cb.set_label('Effective gated attention (per byte)', fontsize=8)
-    cb.ax.tick_params(labelsize=7)
+    cb.set_label('Effective gated attention (per byte)', fontsize=6)
+    cb.ax.tick_params(labelsize=6)
 
     plt.tight_layout()
     _save_fig(fig, output_path)

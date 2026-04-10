@@ -49,7 +49,8 @@ class ITGCrossAttentionGate(nn.Module):
     """
 
     def __init__(self, hidden_size, dropout=0.1, has_modality_prior=False,
-                 ablate_r_stat=False, ablate_g_token=False):
+                 ablate_r_stat=False, ablate_g_token=False,
+                 alpha_init=-2.0, token_gate_bias_init=2.0):
         super(ITGCrossAttentionGate, self).__init__()
 
         self.hidden_size = hidden_size
@@ -68,12 +69,13 @@ class ITGCrossAttentionGate(nn.Module):
         self.bilinear_bias = nn.Parameter(torch.zeros(1))
         nn.init.xavier_uniform_(self.bilinear_W, gain=0.1)
 
-        # alpha_1: gated residual mixing. sigmoid(-2.0) ≈ 0.12
+        # alpha_1: gated residual mixing. sigmoid(alpha_init) controls initial blend.
+        # Default -2.0 → sigmoid ≈ 0.12 (heavy r_stat reliance, curriculum learning).
         # r_stat calibration: sigmoid(scale * r_stat + shift) maps entropy prior
         # from its natural range to gate-useful range, preserving ordering.
         # Both only exist when r_stat is alive on this branch.
         if self.uses_r_stat:
-            self.alpha_modality = nn.Parameter(torch.tensor(-2.0))
+            self.alpha_modality = nn.Parameter(torch.tensor(float(alpha_init)))
             self.stat_scale = nn.Parameter(torch.tensor(5.0))
             self.stat_shift = nn.Parameter(torch.tensor(-0.5))
 
@@ -82,8 +84,8 @@ class ITGCrossAttentionGate(nn.Module):
         if not self.ablate_g_token:
             self.W_k = nn.Linear(hidden_size, bottleneck, bias=False)
             self.W_v = nn.Linear(hidden_size, bottleneck, bias=False)
-            # Bias +2.0 → sigmoid ≈ 0.88: default-open, let r_mod control suppression
-            self.token_gate_bias = nn.Parameter(torch.tensor(2.0))
+            # Default +2.0 → sigmoid ≈ 0.88: default-open, let r_mod control suppression
+            self.token_gate_bias = nn.Parameter(torch.tensor(float(token_gate_bias_init)))
 
     def forward(self, query_feat, sa_delta, encoder_cls_q, encoder_cls_k,
                 r_stat):
@@ -154,7 +156,8 @@ class BidirectionalFusionLayer(nn.Module):
 
     def __init__(self, hidden_size, heads_num, feedforward_size, hidden_act, dropout,
                  use_itgca=False,
-                 ablate_r_stat=False, ablate_g_token=False, ablate_source_bias=False):
+                 ablate_r_stat=False, ablate_g_token=False, ablate_source_bias=False,
+                 alpha_init=-2.0, token_gate_bias_init=2.0):
         super(BidirectionalFusionLayer, self).__init__()
 
         self.use_itgca = use_itgca
@@ -234,12 +237,16 @@ class BidirectionalFusionLayer(nn.Module):
                 hidden_size, dropout, has_modality_prior=False,
                 ablate_r_stat=ablate_r_stat,
                 ablate_g_token=ablate_g_token,
+                alpha_init=alpha_init,
+                token_gate_bias_init=token_gate_bias_init,
             )
             # Size←Raw: has modality prior (Raw source may degrade)
             self.gate_size = ITGCrossAttentionGate(
                 hidden_size, dropout, has_modality_prior=True,
                 ablate_r_stat=ablate_r_stat,
                 ablate_g_token=ablate_g_token,
+                alpha_init=alpha_init,
+                token_gate_bias_init=token_gate_bias_init,
             )
             # local_ent calibration for source-side attention reweighting
             # Only created when source bias is alive (ablate_source_bias=False)
@@ -381,6 +388,10 @@ class MultiModalFusionEncoder(nn.Module):
         ablate_g_token = getattr(args, 'ablate_g_token', False)
         ablate_source_bias = getattr(args, 'ablate_source_bias', False)
 
+        # ITGCA initialization values (for sensitivity experiments)
+        alpha_init = getattr(args, 'alpha_init', -2.0)
+        token_gate_bias_init = getattr(args, 'token_gate_bias_init', 2.0)
+
         self.fusion_layers = nn.ModuleList([
             BidirectionalFusionLayer(
                 hidden_size=args.hidden_size,
@@ -392,6 +403,8 @@ class MultiModalFusionEncoder(nn.Module):
                 ablate_r_stat=ablate_r_stat,
                 ablate_g_token=ablate_g_token,
                 ablate_source_bias=ablate_source_bias,
+                alpha_init=alpha_init,
+                token_gate_bias_init=token_gate_bias_init,
             )
             for _ in range(num_layers)
         ])
