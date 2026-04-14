@@ -4,7 +4,7 @@ sys.path.append(os.getcwd())
 import argparse
 import torch
 import uer.trainer as trainer
-from uer.utils.config import load_hyperparam
+from uer.utils.config import load_hyperparam, apply_modality_configs
 from uer.opts import *
 
 
@@ -28,8 +28,15 @@ def main():
                         help="Path of the pretrained model.")
     parser.add_argument("--output_model_path", type=str, required=True,
                         help="Path of the output model.")
-    parser.add_argument("--config_path", type=str, default="models/bert/base_config.json", #define the model 
+    parser.add_argument("--config_path", type=str, default="models/bert/base_config.json", #define the model
                         help="Config file of model hyper-parameters.")
+    parser.add_argument("--config_path_raw", type=str, default=None,
+                        help="Optional per-modality config for the Raw (content) encoder. "
+                             "Only 'layers_num' is applied; shared dims (hidden_size/heads_num/emb_size) "
+                             "must match --config_path. Falls back to --config_path if unset.")
+    parser.add_argument("--config_path_size", type=str, default=None,
+                        help="Optional per-modality config for the Size (behavior) encoder. "
+                             "Same rules as --config_path_raw.")
 
     # Training and saving options. 
     parser.add_argument("--total_steps", type=int, default=100000,
@@ -200,9 +207,10 @@ def main():
     if args.target == "cls":
         assert args.labels_num is not None, "Cls target needs the denotation of the number of labels."
 
-    # Load hyper-parameters from config file. 
+    # Load hyper-parameters from config file.
     if args.config_path:
         load_hyperparam(args)
+    apply_modality_configs(args)
 
     ranks_num = len(args.gpu_ranks)
 

@@ -58,7 +58,7 @@ from run_classifier_stage2 import (
     Stage2Classifier, load_dataset, pre_tensorize, batch_loader
 )
 from uer.utils.vocab import Vocab
-from uer.utils.config import load_hyperparam
+from uer.utils.config import load_hyperparam, apply_modality_configs
 from uer.utils.seed import set_seed
 from uer.opts import model_opts
 
@@ -80,14 +80,19 @@ def build_args():
                         help="Path to test set pickle file")
     parser.add_argument("--label2id_path", type=str, required=True,
                         help="Path to label2id mapping (pickle)")
-    parser.add_argument("--vocab_path_raw", type=str, required=True,
+    parser.add_argument("--vocab_path_raw", type=str, default="./test/vocab_raw.txt",
                         help="Path to raw modality vocabulary")
-    parser.add_argument("--vocab_path_size", type=str, required=True,
+    parser.add_argument("--vocab_path_size", type=str, default="./test/vocab_size.txt",
                         help="Path to size modality vocabulary")
-    parser.add_argument("--vocab_path_temporal", type=str, required=True,
+    parser.add_argument("--vocab_path_temporal", type=str, default="./test/vocab_temporal.txt",
                         help="Path to temporal (IAT) modality vocabulary")
     parser.add_argument("--config_path", default="models/bert/base_config.json",
                         type=str, help="Path to model config JSON")
+    parser.add_argument("--config_path_raw", type=str, default=None,
+                        help="[Stage 2] Optional per-modality config for the Raw encoder; "
+                             "layers_num-only override, shared dims must match --config_path.")
+    parser.add_argument("--config_path_size", type=str, default=None,
+                        help="[Stage 2] Optional per-modality config for the Size encoder.")
 
     # ---- Model architecture (must match training) ----
     model_opts(parser)
@@ -103,6 +108,15 @@ def build_args():
                         help="[Stage 2] Enable ITGCA (must match training config)")
     parser.add_argument("--itgca_window_size", type=int, default=16,
                         help="[Stage 2] ITGCA sliding window size")
+
+    # ITGCA component-level ablation flags — MUST match the pretrained checkpoint config.
+    parser.add_argument("--ablate_r_stat", action="store_true",
+                        help="[Stage 2] Disable r_stat prior. Must match the pretrained checkpoint.")
+    parser.add_argument("--ablate_g_token", action="store_true",
+                        help="[Stage 2] Disable token-level gate. Must match the pretrained checkpoint.")
+    parser.add_argument("--ablate_source_bias", action="store_true",
+                        help="[Stage 2] Disable source-side attention bias. Must match the pretrained checkpoint.")
+
     parser.add_argument("--simple_classifier", action="store_true",
                         help="[Stage 2] Use simple CLS-only classifier (must match training)")
     parser.add_argument("--use_attn_pooling", action="store_true",
@@ -141,6 +155,7 @@ def build_args():
     # Load hyperparameters from config JSON
     if args.config_path:
         args = load_hyperparam(args)
+    args = apply_modality_configs(args)
 
     args.max_seq_length = max(args.seq_length_raw, args.seq_length_size)
 
@@ -385,16 +400,95 @@ def main():
     print(f"Loading checkpoint: {args.load_model_path}")
     state_dict = torch.load(args.load_model_path, map_location='cpu')
 
-    # Filter out training-only keys not needed for inference
-    training_only_prefixes = ('scl_projection',)
-    filtered = {k: v for k, v in state_dict.items()
-                if not any(k.startswith(p) for p in training_only_prefixes)}
-    skipped = len(state_dict) - len(filtered)
-    if skipped:
-        print(f"  Skipped {skipped} training-only keys (scl_projection)")
+    # Compare model keys vs checkpoint keys to detect mismatches.
+    model_keys = set(model.state_dict().keys())
+    ckpt_keys = set(state_dict.keys())
+    common = model_keys & ckpt_keys
+    unexpected = sorted(ckpt_keys - model_keys)   # in checkpoint, not in model
+    missing = sorted(model_keys - ckpt_keys)       # in model, not in checkpoint
 
+    print(f"  Model keys: {len(model_keys)}, Checkpoint keys: {len(ckpt_keys)}, "
+          f"Common: {len(common)}")
+
+    # Classify unexpected keys: which are safe to skip?
+    safe_to_skip = set()
+
+    # 1) scl_projection — training-only (use_scl=False in inference)
+    safe_to_skip |= {k for k in unexpected if 'scl_projection' in k}
+
+    # 2) Inference-time ablation: checkpoint has components the model intentionally omits
+    if getattr(args, 'ablate_g_token', False):
+        safe_to_skip |= {k for k in unexpected
+                         if any(f in k for f in ['.W_k.', '.W_v.', '.token_gate_bias'])}
+    if getattr(args, 'ablate_r_stat', False):
+        safe_to_skip |= {k for k in unexpected
+                         if any(f in k for f in ['.alpha_modality',
+                                                 '.gate_size.stat_scale',
+                                                 '.gate_size.stat_shift'])}
+    if getattr(args, 'ablate_source_bias', False):
+        safe_to_skip |= {k for k in unexpected
+                         if any(f in k for f in ['.local_stat_scale', '.local_stat_shift'])}
+
+    unsafe_unexpected = sorted(set(unexpected) - safe_to_skip)
+
+    if safe_to_skip:
+        print(f"  Skipping {len(safe_to_skip)} training-only / ablated keys:")
+        for k in sorted(safe_to_skip)[:8]:
+            print(f"    - {k}")
+        if len(safe_to_skip) > 8:
+            print(f"    ... +{len(safe_to_skip)-8} more")
+
+    # Diagnose unresolvable mismatches with actionable hints
+    has_error = False
+
+    if unsafe_unexpected:
+        has_error = True
+        print(f"\n  ERROR: {len(unsafe_unexpected)} unexpected keys in checkpoint "
+              f"(no matching model parameter):")
+        for k in unsafe_unexpected:
+            print(f"    - {k}")
+        if any('gate_raw' in k or 'gate_size' in k or 'local_stat_' in k
+               for k in unsafe_unexpected):
+            print(f"\n  HINT: Checkpoint contains ITGCA gate weights. "
+                  f"Add --use_itgca to match.")
+        if any('attn_pool' in k for k in unsafe_unexpected):
+            print(f"\n  HINT: Checkpoint contains attention pooling weights. "
+                  f"Add --use_attn_pooling to match.")
+
+    if missing:
+        has_error = True
+        print(f"\n  ERROR: {len(missing)} missing keys (model expects, checkpoint lacks).")
+        print(f"  These would be RANDOMLY INITIALIZED — catastrophic for inference!")
+        for k in missing:
+            print(f"    - {k}")
+        if any('gate_raw' in k or 'gate_size' in k or 'local_stat_' in k
+               for k in missing):
+            print(f"\n  HINT: Model defines ITGCA parameters not in checkpoint.")
+            print(f"        If checkpoint was trained WITHOUT ITGCA → remove --use_itgca.")
+            print(f"        If checkpoint was trained WITH ablation → add matching "
+                  f"--ablate_r_stat / --ablate_g_token / --ablate_source_bias.")
+        if any('attn_pool' in k for k in missing):
+            print(f"\n  HINT: Model defines attention pooling not in checkpoint. "
+                  f"Remove --use_attn_pooling.")
+        if any('classifier' in k for k in missing):
+            print(f"\n  HINT: Classifier shape mismatch. Check --simple_classifier "
+                  f"and --labels_num.")
+
+    if has_error:
+        print(f"\n  Current inference flags:")
+        print(f"    --use_itgca={getattr(args, 'use_itgca', False)}")
+        print(f"    --ablate_r_stat={getattr(args, 'ablate_r_stat', False)}")
+        print(f"    --ablate_g_token={getattr(args, 'ablate_g_token', False)}")
+        print(f"    --ablate_source_bias={getattr(args, 'ablate_source_bias', False)}")
+        print(f"    --use_attn_pooling={getattr(args, 'use_attn_pooling', False)}")
+        print(f"    --simple_classifier={getattr(args, 'simple_classifier', False)}")
+        print(f"    --num_fusion_layers={getattr(args, 'num_fusion_layers', 6)}")
+        sys.exit(1)
+
+    # Filter and load with strict=True
+    filtered = {k: v for k, v in state_dict.items() if k not in safe_to_skip}
     model.load_state_dict(filtered, strict=True)
-    print("  Checkpoint loaded successfully.")
+    print(f"  Loaded successfully (strict=True, skipped {len(safe_to_skip)}).")
 
     # ---- Setup device ----
     setup_device(args)

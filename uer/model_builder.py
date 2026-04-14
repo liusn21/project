@@ -23,13 +23,24 @@ def build_model(args):
         # Get temporal vocab size
         vocab_size_temporal = len(args.vocab_temporal) if hasattr(args, 'vocab_temporal') else len(args.vocab_size)
 
+        # Per-modality encoder depth (falls back to args.layers_num if not set
+        # by apply_modality_configs).
+        base_layers = args.layers_num
+        layers_num_raw = getattr(args, 'layers_num_raw', base_layers) or base_layers
+        layers_num_size = getattr(args, 'layers_num_size', base_layers) or base_layers
+
         # Build Raw Packet encoder
         embedding_raw = RawPacketEmbedding(args, len(args.vocab_raw))
+        args.layers_num = layers_num_raw
         encoder_raw = str2encoder[args.encoder](args)
 
         # Build Packet Size encoder (with temporal embedding support)
         embedding_size = PacketSizeEmbedding(args, len(args.vocab_size), vocab_size_temporal)
+        args.layers_num = layers_num_size
         encoder_size = str2encoder[args.encoder](args)
+
+        # Restore; fusion and other modules should not be affected by the swap.
+        args.layers_num = base_layers
 
         # Build fusion module (6-layer bidirectional cross-attention)
         from uer.layers.multimodal_fusion import MultiModalFusionEncoder
@@ -110,6 +121,7 @@ def build_model(args):
                     print(f"    Missing encoder: {enc_result.missing_keys[:5]}...")
 
         print(f"  Vocab sizes: Raw={len(args.vocab_raw)}, Size={len(args.vocab_size)}, Temporal={vocab_size_temporal}")
+        print(f"  Encoder layers: raw={layers_num_raw}, size={layers_num_size}")
         print(f"  Fusion layers: {num_fusion_layers}")
         print(f"  ITGCA: {use_itgca}")
         if use_itgca:

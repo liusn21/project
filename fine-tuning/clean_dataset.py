@@ -32,6 +32,7 @@ Usage:
 import argparse
 import csv
 import pickle
+import random
 import sys
 
 
@@ -146,9 +147,21 @@ def main():
     mode.add_argument("--conf_threshold", type=float, default=None,
                       help="Remove all errors with confidence > this value")
 
+    # Correct-sample removal mode
+    parser.add_argument("--remove_correct", action="store_true",
+                        help="Remove ALL misclassified samples + randomly remove a portion "
+                             "of correct samples. Only supports --top_n / --top_pct.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for --remove_correct sampling")
+
     args = parser.parse_args()
 
     # Validate
+    if args.remove_correct and args.conf_threshold is not None:
+        print("ERROR: --conf_threshold is not supported with --remove_correct "
+              "(no confidence info for correct samples). Use --top_n or --top_pct.",
+              file=sys.stderr)
+        sys.exit(1)
     if args.top_pct is not None and not (0.0 < args.top_pct <= 1.0):
         print("ERROR: --top_pct must be in (0, 1]", file=sys.stderr)
         sys.exit(1)
@@ -160,6 +173,36 @@ def main():
     print(f"Loading errors from: {args.errors_csv}")
     errors = load_errors(args.errors_csv)
     print(f"  Total misclassified samples: {len(errors)}")
+
+    if args.remove_correct:
+        # Mode: keep ALL errors + randomly keep a portion of correct samples
+        random.seed(args.seed)
+        error_indices = {e['sample_index'] for e in errors}
+
+        with open(args.input, 'rb') as f:
+            total = len(pickle.load(f))
+        correct_indices = sorted(set(range(total)) - error_indices)
+        print(f"  Total samples: {total}, Correct: {len(correct_indices)}")
+
+        if args.top_n is not None:
+            n_keep = min(args.top_n, len(correct_indices))
+            print(f"Mode: remove_correct + top_n = {args.top_n}")
+        else:  # top_pct
+            n_keep = max(1, int(len(correct_indices) * args.top_pct))
+            n_keep = min(n_keep, len(correct_indices))
+            print(f"Mode: remove_correct + top_pct = {args.top_pct:.1%}")
+
+        kept_correct = set(random.sample(correct_indices, n_keep))
+        keep_indices = error_indices | kept_correct
+        remove_indices = set(range(total)) - keep_indices
+        print(f"  Correct samples kept:    {n_keep}/{len(correct_indices)}")
+        print(f"  Error samples kept:      {len(error_indices)} (all)")
+        print(f"  Total kept:              {len(keep_indices)}")
+        print(f"  Total removed:           {len(remove_indices)}")
+
+        print(f"\nCleaning: {args.input}")
+        clean_pkl(args.input, args.output, remove_indices)
+        return
 
     if not errors:
         print("No errors found. Nothing to remove.")

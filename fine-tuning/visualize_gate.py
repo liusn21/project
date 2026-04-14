@@ -37,7 +37,7 @@ from matplotlib.colors import Normalize
 
 from run_classifier_stage2 import Stage2Classifier
 from uer.utils.vocab import Vocab
-from uer.utils.config import load_hyperparam
+from uer.utils.config import load_hyperparam, apply_modality_configs
 from uer.utils.seed import set_seed
 from uer.opts import model_opts
 from collections import defaultdict
@@ -735,6 +735,10 @@ def main():
     parser.add_argument("--vocab_path_size", type=str, default="./test/vocab_size.txt")
     parser.add_argument("--vocab_path_temporal", type=str, default="./test/vocab_temporal.txt")
     parser.add_argument("--config_path", type=str, default="models/bert/base_config.json")
+    parser.add_argument("--config_path_raw", type=str, default=None,
+                        help="Optional per-modality config for the Raw encoder (layers_num override).")
+    parser.add_argument("--config_path_size", type=str, default=None,
+                        help="Optional per-modality config for the Size encoder (layers_num override).")
     parser.add_argument("--output_path", type=str, default="results/gate.pdf")
     parser.add_argument("--title", type=str, default=None)
 
@@ -795,6 +799,7 @@ def main():
 
     if args.config_path:
         args = load_hyperparam(args)
+    args = apply_modality_configs(args)
     args.max_seq_length = max(args.seq_length_raw, args.seq_length_size)
     args.num_dropouts = 1
     args.use_scl = False

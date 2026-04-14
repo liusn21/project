@@ -88,7 +88,7 @@ from uer.layers import RawPacketEmbedding, PacketSizeEmbedding
 from uer.layers.multimodal_fusion import MultiModalFusionEncoder
 from uer.encoders import str2encoder
 from uer.utils.vocab import Vocab
-from uer.utils.config import load_hyperparam
+from uer.utils.config import load_hyperparam, apply_modality_configs
 from uer.utils.seed import set_seed
 from uer.model_saver import save_model
 from uer.utils.constants import PAD_ID
@@ -318,13 +318,24 @@ class Stage2Classifier(nn.Module):
         self.ablate_r_stat = getattr(args, 'ablate_r_stat', False)
         self.ablate_source_bias = getattr(args, 'ablate_source_bias', False)
 
+        # Per-modality encoder depth (falls back to args.layers_num if not set
+        # by apply_modality_configs).
+        base_layers = args.layers_num
+        layers_num_raw = getattr(args, 'layers_num_raw', base_layers) or base_layers
+        layers_num_size = getattr(args, 'layers_num_size', base_layers) or base_layers
+
         # Raw modality encoder
         self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
+        args.layers_num = layers_num_raw
         self.encoder_raw = str2encoder[args.encoder](args)
 
         # Size modality encoder (with temporal/IAT support)
         self.embedding_size = PacketSizeEmbedding(args, vocab_size_size, vocab_size_temporal)
+        args.layers_num = layers_num_size
         self.encoder_size = str2encoder[args.encoder](args)
+
+        # Restore so fusion/classifier heads use the original base depth.
+        args.layers_num = base_layers
 
         # Fusion module
         num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
@@ -1007,6 +1018,13 @@ def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     finetune_opts(parser)
 
+    # Per-modality config overrides (asymmetric encoder depths)
+    parser.add_argument("--config_path_raw", type=str, default=None,
+                        help="Optional per-modality config for the Raw (content) encoder. "
+                             "Only 'layers_num' is applied; shared dims must match --config_path.")
+    parser.add_argument("--config_path_size", type=str, default=None,
+                        help="Optional per-modality config for the Size (behavior) encoder.")
+
     # Path options
     parser.add_argument("--label2id_path", type=str, required=True,
                         help="Path to label2id mapping (pickle)")
@@ -1042,12 +1060,6 @@ def main():
                         help="Disable token-level gate. Must match the pretrained checkpoint.")
     parser.add_argument("--ablate_source_bias", action="store_true",
                         help="Disable source-side attention bias. Must match the pretrained checkpoint.")
-
-    # ITGCA initialization values — MUST match the pretrained checkpoint config.
-    parser.add_argument("--alpha_init", type=float, default=-2.0,
-                        help="Initial value for alpha_modality. Must match pretrained checkpoint.")
-    parser.add_argument("--token_gate_bias_init", type=float, default=2.0,
-                        help="Initial value for token_gate_bias. Must match pretrained checkpoint.")
 
     # Sequence lengths
     parser.add_argument("--seq_length_raw", type=int, default=512)
@@ -1135,6 +1147,7 @@ def main():
     # Load hyperparameters from config
     if args.config_path:
         args = load_hyperparam(args)
+    args = apply_modality_configs(args)
 
     # Set max_seq_length for embedding layers
     args.max_seq_length = max(args.seq_length_raw, args.seq_length_size)
