@@ -34,6 +34,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
+from matplotlib.gridspec import GridSpec
 
 from run_classifier_stage2 import Stage2Classifier
 from uer.utils.vocab import Vocab
@@ -667,6 +668,301 @@ def plot_effective_attention(records, output_path, title=None,
 
 
 # ============================================================
+# Plot: Combined 2x2 Panel for §4.5.1 (the paper figure)
+# ============================================================
+
+def _draw_panel_cell(fig, gridspec_pos, mat, r_stats, vmax,
+                     cb_label, packet_size=64,
+                     show_xlabel=True, show_ylabel=True,
+                     median_split=False,
+                     strip_vmin=None, strip_vmax=None,
+                     top_value_text=None):
+    """Draw one panel cell: r_stat scale strip on the left + heatmap on the right.
+
+    The strip is a thin gray gradient that visually anchors the row sorting.
+    When ``strip_vmin`` / ``strip_vmax`` are provided, the strip is rendered on
+    a SHARED scale across panels (so cross-dataset r_stat magnitudes become
+    visually comparable — a uniformly bright strip means a globally-low-r_stat
+    dataset, not "this dataset has an internal range that fills [0,1]").
+    The actual numeric r_stat range for this panel is annotated as a second
+    line of the y-label so readers can map rows back to absolute values.
+    Returns (ax_main, ax_strip, im).
+    """
+    inner = gridspec_pos.subgridspec(1, 2, width_ratios=[0.035, 1.0], wspace=0.015)
+    ax_strip = fig.add_subplot(inner[0, 0])
+    ax_main = fig.add_subplot(inner[0, 1])
+
+    n = mat.shape[0]
+
+    # r_stat strip — shared cross-panel vmin/vmax preserves magnitude difference
+    s_vmin = float(r_stats.min()) if strip_vmin is None else float(strip_vmin)
+    s_vmax = float(r_stats.max()) if strip_vmax is None else float(strip_vmax)
+    if s_vmax <= s_vmin:
+        s_vmax = s_vmin + 1e-6
+    ax_strip.imshow(r_stats[:, None], aspect='auto', cmap='gray_r',
+                    vmin=s_vmin, vmax=s_vmax,
+                    interpolation='nearest', origin='upper')
+    ax_strip.set_xticks([])
+    ax_strip.set_yticks([])
+    if show_ylabel and n >= 2:
+        # Two-line ylabel: row semantics + actual numeric r_stat range
+        ax_strip.set_ylabel(
+            f'Flow (sorted by $r_{{\\mathrm{{stat}}}}$ $\\downarrow$)\n'
+            f'$r_{{\\mathrm{{stat}}}}\\in[{r_stats[-1]:.2f},\\;{r_stats[0]:.2f}]$',
+            fontsize=12
+        )
+
+    # Main heatmap
+    cmap = plt.cm.RdYlBu_r.copy()
+    cmap.set_bad('white')
+    masked = np.ma.array(mat, mask=np.isnan(mat))
+    im = ax_main.imshow(masked, aspect='auto', cmap=cmap,
+                        vmin=0.0, vmax=vmax,
+                        interpolation='nearest', origin='upper')
+
+    # Packet boundary lines on the byte axis: bytes 64, 128, 192, ...
+    # Lets the reader visually associate warm columns with header positions.
+    for k in range(packet_size, mat.shape[1], packet_size):
+        ax_main.axvline(x=k - 0.5, color='black', linewidth=0.35,
+                        alpha=0.30, linestyle=':')
+
+    ax_main.set_yticks([])
+    ax_main.tick_params(axis='x', labelsize=10)
+    ax_main.set_xlabel('Byte Position', fontsize=12)
+
+    cb = fig.colorbar(im, ax=ax_main, fraction=0.030, pad=0.020)
+    cb.set_label(cb_label, fontsize=12)
+    cb.ax.tick_params(labelsize=10)
+    cb.outline.set_linewidth(0.4)
+
+    # Optional bold callout above the colorbar so the cross-cell magnitude
+    # difference is readable at a glance (e.g. 0.595 vs 0.105 across the two
+    # encryption regimes — finding (ii) becomes self-evident from the figure).
+    if top_value_text is not None:
+        cb.ax.text(0.5, 1.015, top_value_text, transform=cb.ax.transAxes,
+                   fontsize=10, fontweight='bold',
+                   ha='center', va='bottom', color='black')
+
+    return ax_main, ax_strip, im
+
+
+def plot_gate_panel_2x2(records_a, records_b, label_a, label_b, output_path,
+                        first_k=256, max_flows=80, num_layers=6,
+                        packet_size=64):
+    """Combined 2x2 figure for §4.5.1 Gate Behavior Across the Encryption Spectrum.
+
+    Layout:
+        Row 1: dataset A — col (a) input local_ent | col (b) model effective_attn
+        Row 2: dataset B — col (a) input local_ent | col (b) model effective_attn
+        Row 3: small horizontal bar comparing 99th-percentile effective attention
+               between the two datasets — quantifies the cross-dataset attenuation.
+
+    Each cell uses its OWN vmax so byte-pattern contrast is preserved (no
+    "all-cold CSTNet" failure mode). The cross-dataset magnitude difference
+    that an absolute-vmax view would show is communicated by the bottom bar
+    instead, decoupling the two observations onto separate visual channels.
+    """
+
+    def build_matrices(records):
+        recs = sorted(records, key=lambda r: r['r_stat'], reverse=True)
+        if len(recs) > max_flows:
+            idx = np.linspace(0, len(recs) - 1, max_flows).astype(int)
+            recs = [recs[i] for i in idx]
+        n = len(recs)
+        le = np.full((n, first_k), np.nan)
+        ea = np.full((n, first_k), np.nan)
+        for i, rec in enumerate(recs):
+            local = rec.get('local_rel_raw')
+            if local is not None and len(local) > 0:
+                le[i, :min(len(local), first_k)] = local[:first_k]
+            eff = rec.get('eff_attn')
+            if eff is not None and len(eff) > 0:
+                ea[i, :min(len(eff), first_k)] = eff[:first_k]
+        rs = np.array([r['r_stat'] for r in recs])
+        rm = np.array([r['r_mod_mean'] for r in recs])
+        return le, ea, rs, rm, n
+
+    def _diag_stats(ea, le, rs, rm):
+        """Per-panel diagnostics tied to paper findings (i) and (iii).
+
+        - top/bot mean ratio + Pearson(r_stat, row mean eff_attn): finding (i)
+        - byte concentration (max/mean per row, averaged) +
+          Pearson(local_rel, eff_attn) per-row averaged: finding (iii)
+        - mean r_mod for cross-dataset reporting.
+        """
+        n = ea.shape[0]
+        half = max(1, n // 2)
+        top_mean = float(np.nanmean(ea[:half]))
+        bot_mean = float(np.nanmean(ea[half:]))
+        ratio_tb = top_mean / max(bot_mean, 1e-12)
+        row_means = np.nanmean(ea, axis=1)
+        valid = ~np.isnan(row_means)
+        if valid.sum() >= 2 and rs[valid].std() > 1e-6 and row_means[valid].std() > 1e-12:
+            pearson_eff = float(np.corrcoef(rs[valid], row_means[valid])[0, 1])
+        else:
+            pearson_eff = float('nan')
+        if rs.std() > 1e-6 and rm.std() > 1e-6:
+            pearson_rmod = float(np.corrcoef(rs, rm)[0, 1])
+        else:
+            pearson_rmod = float('nan')
+        row_max = np.nanmax(ea, axis=1)
+        safe_mean = np.where(row_means > 1e-12, row_means, 1.0)
+        concentration = float(np.nanmean(row_max / safe_mean))
+        corrs = []
+        for i in range(n):
+            le_row = le[i]
+            ea_row = ea[i]
+            m = ~(np.isnan(le_row) | np.isnan(ea_row))
+            if m.sum() >= 2 and le_row[m].std() > 1e-9 and ea_row[m].std() > 1e-9:
+                corrs.append(np.corrcoef(le_row[m], ea_row[m])[0, 1])
+        corr_local_eff = float(np.nanmean(corrs)) if corrs else float('nan')
+        return {
+            'top_mean': top_mean,
+            'bot_mean': bot_mean,
+            'ratio_tb': ratio_tb,
+            'pearson_eff': pearson_eff,
+            'pearson_rmod': pearson_rmod,
+            'concentration': concentration,
+            'corr_local_eff': corr_local_eff,
+            'rmod_mean': float(np.nanmean(rm)),
+        }
+
+    le_a, ea_a, rs_a, rm_a, n_a = build_matrices(records_a)
+    le_b, ea_b, rs_b, rm_b, n_b = build_matrices(records_b)
+    diag_a = _diag_stats(ea_a, le_a, rs_a, rm_a)
+    diag_b = _diag_stats(ea_b, le_b, rs_b, rm_b)
+
+    # Per-cell vmax: input panels stay at p95 (suppress hot-byte outliers so
+    # the bulk byte structure stays readable). Model panels use p99 so the
+    # colorbar top tick equals the same number quoted in the paper text
+    # (0.595 vs 0.105) — this turns finding (ii) into a one-glance read of
+    # the two colorbar tops.
+    le_vmax_a = max(float(np.nanpercentile(le_a, 95)), 0.05)
+    le_vmax_b = max(float(np.nanpercentile(le_b, 95)), 0.05)
+    ea_99_a = float(np.nanpercentile(ea_a, 99))
+    ea_99_b = float(np.nanpercentile(ea_b, 99))
+    ea_vmax_a = max(ea_99_a, 1e-4)
+    ea_vmax_b = max(ea_99_b, 1e-4)
+    if ea_99_a >= ea_99_b:
+        ratio = ea_99_a / max(ea_99_b, 1e-12)
+        ratio_label = f'{label_a} / {label_b}'
+    else:
+        ratio = ea_99_b / max(ea_99_a, 1e-12)
+        ratio_label = f'{label_b} / {label_a}'
+
+    # Shared strip scale across all 4 cells: anchored at 0, top = global max.
+    # This is what makes the two strips' brightness comparable, so a uniformly
+    # near-white strip immediately reads as "this dataset has globally-low r_stat".
+    strip_vmin = 0.0
+    strip_vmax = max(float(rs_a.max()), float(rs_b.max()))
+
+    # 2-row grid. Cross-dataset attenuation (finding ii) is already readable
+    # from the per-cell colorbar tick magnitudes — no separate footer needed.
+    fig = plt.figure(figsize=(9.0, 7.0))
+    outer = GridSpec(2, 2, figure=fig,
+                     hspace=0.24, wspace=0.30,
+                     left=0.075, right=0.97, top=0.93, bottom=0.08)
+
+    # Row labels (dataset names, vertical, outside the gridspec)
+    fig.text(0, 0.730, label_a, fontsize=14, fontweight='bold',
+             rotation=90, va='center', ha='center')
+    fig.text(0, 0.250, label_b, fontsize=14, fontweight='bold',
+             rotation=90, va='center', ha='center')
+
+    # Column labels (above row 1)
+    fig.text(0.250, 0.955, '(a) Input side: local reliability',
+             fontsize=14, fontweight='bold', ha='center')
+    fig.text(0.765, 0.955, '(b) Model side: gated attention',
+             fontsize=14, fontweight='bold', ha='center')
+
+    # Cells: row 1 = dataset A
+    _draw_panel_cell(fig, outer[0, 0], le_a, rs_a, le_vmax_a,
+                     'Local rel. ($1{-}H/\\log n$, $w{=}16$)',
+                     packet_size=packet_size,
+                     show_xlabel=False, show_ylabel=True,
+                     strip_vmin=strip_vmin, strip_vmax=strip_vmax)
+    ax_a_model, _, _ = _draw_panel_cell(
+        fig, outer[0, 1], ea_a, rs_a, ea_vmax_a,
+        'Effective gated attn (per byte)',
+        packet_size=packet_size,
+        show_xlabel=False, show_ylabel=False,
+        strip_vmin=strip_vmin, strip_vmax=strip_vmax,
+        top_value_text=f'{ea_99_a:.3f}')
+    # Cells: row 2 = dataset B
+    _draw_panel_cell(fig, outer[1, 0], le_b, rs_b, le_vmax_b,
+                     'Local rel. ($1{-}H/\\log n$, $w{=}16$)',
+                     packet_size=packet_size,
+                     show_xlabel=True, show_ylabel=True,
+                     strip_vmin=strip_vmin, strip_vmax=strip_vmax)
+    ax_b_model, _, _ = _draw_panel_cell(
+        fig, outer[1, 1], ea_b, rs_b, ea_vmax_b,
+        'Effective gated attn (per byte)',
+        packet_size=packet_size,
+        show_xlabel=True, show_ylabel=False,
+        strip_vmin=strip_vmin, strip_vmax=strip_vmax,
+        top_value_text=f'{ea_99_b:.3f}')
+
+    # Per-panel diagnostics overlaid on the model-side heatmaps.
+    # One line, two numbers: top/bot mean ratio (finding i — how much brighter
+    # the high-r_stat upper half of rows is than the low-r_stat lower half)
+    # and per-row mean Pearson(local_rel, eff_attn) (finding iii — spatial
+    # co-occurrence of input warmth with model warmth). Placed in the
+    # bottom-right corner where the heatmap is always cool (low r_stat × late
+    # bytes), so the box never occludes signal.
+    def _annotate_diag(ax, d):
+        text = (
+            f"top/bot ${d['ratio_tb']:.2f}\\times$"
+            f"     $\\rho(\\mathrm{{local}},\\!\\mathrm{{attn}}){{=}}{d['corr_local_eff']:+.2f}$"
+        )
+        ax.text(
+            0.985, 0.030, text, transform=ax.transAxes,
+            fontsize=11, va='bottom', ha='right',
+            bbox=dict(boxstyle='round,pad=0.30', facecolor='white',
+                      edgecolor='black', linewidth=0.5, alpha=0.92),
+        )
+
+    _annotate_diag(ax_a_model, diag_a)
+    _annotate_diag(ax_b_model, diag_b)
+
+    _save_fig(fig, output_path)
+
+    def _stats(m, name):
+        return (f"    {name:14s}: mean={np.nanmean(m):.4f}  "
+                f"p50={np.nanpercentile(m, 50):.4f}  "
+                f"p95={np.nanpercentile(m, 95):.4f}  "
+                f"p99={np.nanpercentile(m, 99):.4f}")
+    print(f"  Panel 2x2: {label_a}({n_a} flows)  |  {label_b}({n_b} flows)")
+    print(f"  -- {label_a} --")
+    print(_stats(le_a, 'local_ent'))
+    print(_stats(ea_a, 'eff_attn'))
+    print(f"  -- {label_b} --")
+    print(_stats(le_b, 'local_ent'))
+    print(_stats(ea_b, 'eff_attn'))
+    print(f"  cmap vmax: local_ent {label_a}={le_vmax_a:.4f}  "
+          f"{label_b}={le_vmax_b:.4f}  (95th pct, outlier-suppressed)")
+    print(f"  cmap vmax: eff_attn  {label_a}={ea_vmax_a:.4f}  "
+          f"{label_b}={ea_vmax_b:.4f}  (95th pct, outlier-suppressed)")
+    print(f"  caption number: 99th-pct eff_attn  {label_a}={ea_99_a:.4f}  "
+          f"{label_b}={ea_99_b:.4f}  ratio={ratio:.2f}x ({ratio_label})")
+    print(f"  -> add to caption: 'cross-dataset attenuation {ratio:.1f}x'")
+
+    def _diag_print(label, d):
+        print(f"  -- {label} per-panel diagnostics --")
+        print(f"    flow modulation (finding i):")
+        print(f"      top half mean eff_attn   : {d['top_mean']:.6f}")
+        print(f"      bot half mean eff_attn   : {d['bot_mean']:.6f}")
+        print(f"      top/bot ratio            : {d['ratio_tb']:.2f}x")
+        print(f"      pearson(r_stat, row mean): {d['pearson_eff']:+.4f}")
+        print(f"      pearson(r_stat, r_mod)   : {d['pearson_rmod']:+.4f}")
+        print(f"      mean r_mod               : {d['rmod_mean']:.4f}")
+        print(f"    byte focusing (finding iii):")
+        print(f"      byte concentration (max/mean per row, avg): {d['concentration']:.2f}x")
+        print(f"      pearson(local_rel, eff_attn) per-row mean : {d['corr_local_eff']:+.4f}")
+    _diag_print(label_a, diag_a)
+    _diag_print(label_b, diag_b)
+
+
+# ============================================================
 # Plot: Bar (per-layer mean gate)
 # ============================================================
 
@@ -719,6 +1015,201 @@ def _save_fig(fig, output_path):
     plt.close(fig)
 
 
+def plot_gate_panel_1x4(records_a, records_b, label_a, label_b, output_path,
+                        first_k=256, max_flows=80, num_layers=6,
+                        packet_size=64):
+    """Compact 1x4 horizontal layout for figure* with minimal vertical footprint.
+
+    Layout (left to right):
+        [ A-input ][ A-model ][ B-input ][ B-model ]
+    Designed to save vertical space relative to the 2x2 panel: same information
+    width-wise, ~2.5" tall instead of ~5.5" when set to \\textwidth.
+    """
+    def build_matrices(records):
+        recs = sorted(records, key=lambda r: r['r_stat'], reverse=True)
+        if len(recs) > max_flows:
+            idx = np.linspace(0, len(recs) - 1, max_flows).astype(int)
+            recs = [recs[i] for i in idx]
+        n = len(recs)
+        le = np.full((n, first_k), np.nan)
+        ea = np.full((n, first_k), np.nan)
+        for i, rec in enumerate(recs):
+            local = rec.get('local_rel_raw')
+            if local is not None and len(local) > 0:
+                le[i, :min(len(local), first_k)] = local[:first_k]
+            eff = rec.get('eff_attn')
+            if eff is not None and len(eff) > 0:
+                ea[i, :min(len(eff), first_k)] = eff[:first_k]
+        rs = np.array([r['r_stat'] for r in recs])
+        return le, ea, rs, n
+
+    le_a, ea_a, rs_a, n_a = build_matrices(records_a)
+    le_b, ea_b, rs_b, n_b = build_matrices(records_b)
+
+    le_vmax_a = max(float(np.nanpercentile(le_a, 95)), 0.05)
+    le_vmax_b = max(float(np.nanpercentile(le_b, 95)), 0.05)
+    ea_vmax_a = max(float(np.nanpercentile(ea_a, 95)), 1e-4)
+    ea_vmax_b = max(float(np.nanpercentile(ea_b, 95)), 1e-4)
+    ea_99_a = float(np.nanpercentile(ea_a, 99))
+    ea_99_b = float(np.nanpercentile(ea_b, 99))
+    if ea_99_a >= ea_99_b:
+        ratio = ea_99_a / max(ea_99_b, 1e-12)
+        ratio_label = f'{label_a} / {label_b}'
+    else:
+        ratio = ea_99_b / max(ea_99_a, 1e-12)
+        ratio_label = f'{label_b} / {label_a}'
+
+    strip_vmin = 0.0
+    strip_vmax = max(float(rs_a.max()), float(rs_b.max()))
+
+    fig = plt.figure(figsize=(11.0, 3.2))
+    outer = GridSpec(1, 4, figure=fig,
+                     wspace=0.50,
+                     left=0.05, right=0.985, top=0.80, bottom=0.20)
+
+    # Group titles (dataset names) over each pair of panels
+    fig.text(0.265, 0.92, label_a, fontsize=10, fontweight='bold', ha='center')
+    fig.text(0.755, 0.92, label_b, fontsize=10, fontweight='bold', ha='center')
+    # A vertical separator between the two dataset groups
+    fig.add_artist(plt.Line2D([0.510, 0.510], [0.20, 0.85],
+                              transform=fig.transFigure,
+                              color='black', linewidth=0.5, alpha=0.4))
+
+    # Per-cell sub-letter labels above each panel
+    fig.text(0.140, 0.855, '(a) Input',  fontsize=9, ha='center')
+    fig.text(0.385, 0.855, '(b) Model',  fontsize=9, ha='center')
+    fig.text(0.635, 0.855, '(c) Input',  fontsize=9, ha='center')
+    fig.text(0.880, 0.855, '(d) Model',  fontsize=9, ha='center')
+
+    _draw_panel_cell(fig, outer[0, 0], le_a, rs_a, le_vmax_a,
+                     'Local rel.',
+                     packet_size=packet_size,
+                     show_xlabel=True, show_ylabel=True,
+                     strip_vmin=strip_vmin, strip_vmax=strip_vmax)
+    _draw_panel_cell(fig, outer[0, 1], ea_a, rs_a, ea_vmax_a,
+                     'Eff. gated attn',
+                     packet_size=packet_size,
+                     show_xlabel=True, show_ylabel=False,
+                     strip_vmin=strip_vmin, strip_vmax=strip_vmax)
+    _draw_panel_cell(fig, outer[0, 2], le_b, rs_b, le_vmax_b,
+                     'Local rel.',
+                     packet_size=packet_size,
+                     show_xlabel=True, show_ylabel=True,
+                     strip_vmin=strip_vmin, strip_vmax=strip_vmax)
+    _draw_panel_cell(fig, outer[0, 3], ea_b, rs_b, ea_vmax_b,
+                     'Eff. gated attn',
+                     packet_size=packet_size,
+                     show_xlabel=True, show_ylabel=False,
+                     strip_vmin=strip_vmin, strip_vmax=strip_vmax)
+
+    _save_fig(fig, output_path)
+
+    print(f"  Panel 1x4: {label_a}({n_a}) | {label_b}({n_b})")
+    print(f"  cmap vmax: local_ent A={le_vmax_a:.4f}  B={le_vmax_b:.4f}  "
+          f"eff_attn A={ea_vmax_a:.4f}  B={ea_vmax_b:.4f}")
+    print(f"  caption: 99th-pct eff_attn  {label_a}={ea_99_a:.4f}  "
+          f"{label_b}={ea_99_b:.4f}  -> {ratio:.1f}x ({ratio_label})")
+
+
+# ============================================================
+# Helper for panel_2x2: load model + data and collect records
+# ============================================================
+
+def _collect_for_dataset(args, model_path, data_path, vocab_raw, vocab_size,
+                         vocab_temporal, device, label2id_path=None,
+                         label_rule=None, flow_rule=None, flow_top_k=None):
+    """Load a fine-tuned Stage2Classifier checkpoint, run inference on the
+    given pickle, and return the list of per-flow gate records.
+
+    Class-level (label_rule) and flow-level (flow_rule, flow_top_k) filtering
+    are applied per-dataset. When not explicitly provided, falls back to
+    args.label_rule / args.flow_rule / args.flow_top_k so single-dataset usage
+    keeps the original behavior.
+    """
+    # Per-dataset overrides (None → use shared args defaults)
+    label_rule = label_rule if label_rule is not None else args.label_rule
+    flow_rule = flow_rule if flow_rule is not None else args.flow_rule
+    flow_top_k = flow_top_k if flow_top_k is not None else args.flow_top_k
+    print(f"\n[Collect] model = {model_path}")
+    print(f"[Collect] data  = {data_path}")
+
+    state_dict = torch.load(model_path, map_location='cpu')
+    if 'classifier.3.weight' in state_dict:
+        labels_num = state_dict['classifier.3.weight'].shape[0]
+    elif 'classifier.weight' in state_dict:
+        labels_num = state_dict['classifier.weight'].shape[0]
+    else:
+        labels_num = 10
+    print(f"  labels_num: {labels_num}")
+
+    model = Stage2Classifier(args, len(vocab_raw), len(vocab_size),
+                             len(vocab_temporal), labels_num)
+    model.load_state_dict(state_dict, strict=False)
+    model = model.to(device)
+    model.eval()
+
+    with open(data_path, 'rb') as f:
+        data = pickle.load(f)
+    print(f"  loaded {len(data)} samples")
+
+    # ---- Class-level selection (--label_rule) ----
+    id2label = None
+    if label2id_path:
+        with open(label2id_path, 'rb') as f:
+            label2id = pickle.load(f)
+        id2label = {v: k for k, v in label2id.items()}
+
+    if data and 'label' in data[0] and label_rule != 'all':
+        label_groups = defaultdict(list)
+        for idx, sample in enumerate(data):
+            label_groups[sample['label']].append(idx)
+        class_stats = {}
+        for label, indices in label_groups.items():
+            sample_indices = indices[:50]
+            batch = torch.LongTensor([data[i]['raw_src'] for i in sample_indices])
+            r = compute_flow_reliability_raw(batch, vocab_size=len(vocab_raw))
+            class_stats[label] = r.mean().item()
+        if label_rule == 'low':
+            selected = min(class_stats, key=class_stats.get)
+        else:
+            selected = max(class_stats, key=class_stats.get)
+        lname = id2label[selected] if id2label and selected in id2label else str(selected)
+        print(f"  class filter [{label_rule}]: {lname} "
+              f"(r_stat={class_stats[selected]:.4f})")
+        data = [data[i] for i in label_groups[selected]]
+        print(f"  -> {len(data)} samples after class filter")
+
+    # ---- Flow-level selection (flow_rule, flow_top_k) ----
+    if flow_rule != 'all' and flow_top_k > 0 and len(data) > 0:
+        all_raw = torch.LongTensor([s['raw_src'] for s in data])
+        all_r = compute_flow_reliability_raw(all_raw, vocab_size=len(vocab_raw))
+        k = min(flow_top_k, len(data))
+        largest = (flow_rule == 'high')
+        topk_idx = torch.topk(all_r, k=k, largest=largest).indices.tolist()
+        sel_r = all_r[topk_idx]
+        print(f"  flow filter [{flow_rule}, top-{k}]: "
+              f"r_stat range [{sel_r.min().item():.4f}, {sel_r.max().item():.4f}], "
+              f"mean {sel_r.mean().item():.4f}")
+        data = [data[i] for i in topk_idx]
+
+    collector = GateCollector(model)
+    collect_gate_values(model, data, collector, device,
+                        vocab_size_raw=len(vocab_raw),
+                        max_samples=args.max_samples,
+                        batch_size=args.batch_size,
+                        window_size=args.itgca_window_size)
+    records = collector.records
+    collector.remove_hooks()
+    print(f"  collected {len(records)} records")
+
+    # Free GPU memory before loading the next checkpoint
+    del model, state_dict
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return records
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -744,14 +1235,41 @@ def main():
 
     parser.add_argument("--plot_type",
                         choices=["scatter", "heatmap", "heatmap_compare",
-                                 "local_ent", "gate_per_flow", "effective_attn", "bar"],
+                                 "local_ent", "gate_per_flow", "effective_attn",
+                                 "panel_2x2", "panel_1x4", "bar"],
                         default="scatter",
                         help="scatter: r_stat vs gate; heatmap: averaged per-position; "
                              "heatmap_compare: low vs high r_stat side-by-side; "
                              "local_ent: per-flow local raw reliability stack; "
                              "gate_per_flow: per-flow gate stack (gate-side analog of local_ent); "
                              "effective_attn: per-byte gated cross-attention (gate side, byte axis); "
+                             "panel_2x2: combined §4.5.1 figure (2 datasets × {input,model}, "
+                             "requires --model_path_b/--data_path_b); "
                              "bar: per-layer")
+
+    # ---- panel_2x2 second-dataset args ----
+    parser.add_argument("--model_path_b", type=str, default=None,
+                        help="Second fine-tuned checkpoint (panel_2x2 only)")
+    parser.add_argument("--data_path_b", type=str, default=None,
+                        help="Second dataset pickle (panel_2x2 only)")
+    parser.add_argument("--label_a", type=str, default=None,
+                        help="Display name for dataset A in panel_2x2")
+    parser.add_argument("--label_b", type=str, default=None,
+                        help="Display name for dataset B in panel_2x2")
+    parser.add_argument("--label2id_path_b", type=str, default=None,
+                        help="label2id.pkl for dataset B (panel_2x2 only). "
+                             "Dataset A reuses --label2id_path.")
+    parser.add_argument("--label_rule_b", choices=["all", "low", "high"],
+                        default=None,
+                        help="Per-dataset class rule for B (panel_2x2 only). "
+                             "Defaults to --label_rule when unset.")
+    parser.add_argument("--flow_rule_b", choices=["all", "low", "high"],
+                        default=None,
+                        help="Per-dataset flow rule for B (panel_2x2 only). "
+                             "Defaults to --flow_rule when unset.")
+    parser.add_argument("--flow_top_k_b", type=int, default=None,
+                        help="Per-dataset flow top-K for B (panel_2x2 only). "
+                             "Defaults to --flow_top_k when unset.")
 
     model_opts(parser)
     parser.add_argument("--num_fusion_layers", type=int, default=6)
@@ -817,6 +1335,43 @@ def main():
     vocab_temporal = Vocab()
     vocab_temporal.load(args.vocab_path_temporal)
     print(f"  Raw: {len(vocab_raw)}, Size: {len(vocab_size)}, Temporal: {len(vocab_temporal)}")
+
+    # ---- panel_2x2 / panel_1x4: self-contained dispatch ----
+    if args.plot_type in ('panel_2x2', 'panel_1x4'):
+        if not args.use_itgca:
+            print("ERROR: --use_itgca required for panel_2x2.")
+            return
+        if not args.model_path_b or not args.data_path_b:
+            print("ERROR: panel_2x2 requires --model_path_b and --data_path_b.")
+            return
+        device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+        records_a = _collect_for_dataset(
+            args, args.model_path, args.data_path,
+            vocab_raw, vocab_size, vocab_temporal, device,
+            label2id_path=args.label2id_path,
+            label_rule=args.label_rule,
+            flow_rule=args.flow_rule,
+            flow_top_k=args.flow_top_k,
+        )
+        records_b = _collect_for_dataset(
+            args, args.model_path_b, args.data_path_b,
+            vocab_raw, vocab_size, vocab_temporal, device,
+            label2id_path=args.label2id_path_b,
+            label_rule=args.label_rule_b if args.label_rule_b is not None else args.label_rule,
+            flow_rule=args.flow_rule_b if args.flow_rule_b is not None else args.flow_rule,
+            flow_top_k=args.flow_top_k_b if args.flow_top_k_b is not None else args.flow_top_k,
+        )
+        print(f"\nGenerating {args.plot_type} plot...")
+        plot_fn = plot_gate_panel_1x4 if args.plot_type == 'panel_1x4' else plot_gate_panel_2x2
+        plot_fn(
+            records_a, records_b,
+            label_a=args.label_a or os.path.splitext(os.path.basename(args.data_path))[0],
+            label_b=args.label_b or os.path.splitext(os.path.basename(args.data_path_b))[0],
+            output_path=args.output_path,
+            num_layers=args.num_fusion_layers,
+        )
+        print("\nDone.")
+        return
 
     # ---- Model ----
     print(f"Loading checkpoint: {args.model_path}")
@@ -973,4 +1528,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
