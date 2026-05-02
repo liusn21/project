@@ -1,112 +1,306 @@
-## Pretrain Corpus Generation
-The codes are in data_generation/pretrain_data_gen.py
-### pretrain_dataset_generation (from pcap to burst)
-```
-pretrain_dataset_generation(pcap_path,pcap_output_path,output_split_path,select_packet_len=64,
-                             corpora_path=multi_corpora_path, start_index=28, enhance_factor = 1, is_multi=True)
-```
-pretrain_dataset_generation includes the following steps:
-1. convert pcapng to pcap
-2. split pcap by flow
-3. generate burst dataset
+# MM-TrafficBERT
 
-In the burst dataset, each line is a burst part. || means that the current stream is new, and an empty line is used to split two neighboring bursts in one stream. An example of burst dataset is:
-```
-||4500003c529740004006a3c50a080006035a36f8e82901bbfed134790000
-0000a002ffff7fd400000204054e0402080a001366ee0000000001030308
+**MM-TrafficBERT: Multimodal Pre-training with Deep Reliability-Aware Fusion for Network Traffic Analysis**
 
-45000034529840004006a3cc0a080006035a36f8e82901bbfed1347a8829471f80100157f46300000101080a001366f90aa8de74450000fe5299
-40004006a3010a080006035a36f8e82901bbfed1347a8829471f80180157990f00000101080a001366f90aa8de7416030100c5010000c1030308
+This repository hosts the open-science release of MM-TrafficBERT: source code, vocabularies, and configs for reproducing the two-stage pre-training and downstream fine-tuning reported in the paper.
 
-...
+---
 
-||...
-```
-If there are multiple datasets, `merge_txts()`
-
-
-### from burst dataset to bigram type dataset
-```
-corpora_to_bigram(corpora_path,corpora_bigram_path)
-```
-An example of bigram type is:
-```
-||4500 0000 003c 3cce ced4 d440 4000 0040 4006 0649 49f4 f40a 0a2a 2a00 00d3 d317 1742 42ff ffb4 b4bf bfbd bd00 0050 5067 671d 1d9b 9b03 0300 0000 
-0000 00a0 a002 02ff ffff ff0e 0e08 0800 0000 0002 0204 0405 05b4 b404 0402 0208 080a 0a00 0000 0055 55d7 d700 0000 0000 0000 0001 0103 0303 0306 
-
-4500 0000 003c 3c00 0000 0040 4000 0033 3306 0625 25c9 c917 1742 42ff ffb4 b40a 0a2a 2a00 00d3 d300 0050 50bf bfbd bdd5 d527 2794 944b 4b67 671d 
-9b04 04a0 a012 1271 7120 200d 0db9 b900 0000 0002 0204 0405 05b4 b404 0402 0208 080a 0a1a 1aad ad0a 0afe fe00 0000 0055 55d7 d701 0103 0303 0305 
-
-...
-
-||...
-```
-### Generate vocab
-```
-build_BPE(corpora_path)
-build_vocab(vocab_path)
-```
-
-## Model Pretrain
-Pretrain Input Generation
-```
-python3 pre-training/preprocess.py --corpus_path corpus.txt \
-                          --vocab_path models/encryptd_vocab.txt --seq_length 512 \
-                          --dataset_path dataset.pt --processes_num 80 --target bertflow
-```
-Model Pretrain
-```
- CUDA_VISIBLE_DEVICES=2,3,4 python3 pre-training/pretrain.py --dataset_path dataset.pt \
-                     --vocab_path models/encryptd_vocab.txt \
-                     --output_model_path model.bin \
-                     --world_size 3 --gpu_ranks 0 1 2 --master_ip tcp://localhost:12345 \
-                     --total_steps 90000 --save_checkpoint_steps 10000 --batch_size 64 \
-                     --embedding word_pos_seg --encoder transformer --mask fully_visible --target bertflow
-```
-Pretrain model: https://drive.google.com/file/d/1pR6ZaWE7MWFDQWiF4LDzSyjSq0Gj3kV7/view?usp=sharing
-## Finetuning Data Generation
-The codes are in data_generation/finetuning_data_gen.py
-
-### Split Pcap
-In the pcap_path, each pacp is one class. 
-```
-convert_splitcap(pcapng_path, pcap_path, pcap_split_path)
-```
-In the pcap_path, each dir is one class. In each dir, each pcap includes multiple flows. 
-```
-convert_splitcap(pcapng_path, pcap_path, pcap_split_path,is_pcap_label=True)
-```
-Finally, in the pcap_split_path, each dir is one class. In each dir, each pcap is one flow. 
-
-### Generate Data
-From pcap to dataset.json, the generated dataset.json is a dict, the key is the class, the value is the list of flows grouped by features.
-```
-generation_multiP(pcap_split_path+"splitcap" + "/", samples * _category,
-         dataset_save_path=dataset_save_path,start_index=28)
+## 1. Repository layout
 
 ```
+.
+├── data_generation/
+│   ├── pcap_process.cpp          C++ flow splitter (raw pcap → per-flow pcap)
+│   ├── Makefile                  build pcap_process
+│   └── multimodal_data_gen.py    flow pcap → (corpus_raw.txt, corpus_size.txt)
+├── pre-training/
+│   ├── preprocess.py             text corpus → .pt dataset (Stage 1 / Stage 2)
+│   └── pretrain.py               Stage 1 unimodal MLM / Stage 2 multimodal
+├── fine-tuning/
+│   ├── multimodal_data_utils.py  per-flow pcap → train/val/test pickles
+│   ├── run_classifier_stage2.py  Stage 2 fine-tune (full multimodal + ITGCA)
+│   ├── run_classifier_stage1.py  Stage 1 fine-tune (single-modality baseline)
+│   └── run_inference.py          held-out test inference
+├── uer/                       trimmed UER-py / ET-BERT backbone
+├── models/bert/
+│   ├── base_config.json           12-layer config (content encoder)
+│   ├── behavior_6_config.json     6-layer  config (behavior encoder)
+│   ├── vocab_raw.txt              byte vocab  (256 + 5 special)
+│   ├── vocab_size.txt             size vocab  (3001 + 5 special)
+│   └── vocab_temporal.txt         IAT  vocab  (1000 + 5 special)
+└── requirements.txt
+```
 
-From dataset.json to train_dataset.tsv,valid_dataset.tsv,test_dataset.tsv
+The three vocabularies under `models/bert/` are deterministic and shipped with the release; you do **not** need to regenerate them.
+
+---
+
+## 2. Setup
+
+Hardware used in the paper: 4 × NVIDIA A100 80 GB. Software: PyTorch 2.9.1 + CUDA 13.0.
+
+```bash
+pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130
+pip install -r requirements.txt
+# Build the C++ flow splitter (requires libpcap-dev)
+cd data_generation && make && cd ..
 ```
-dataset_extract(dataset_save_path,
-                     pcap_path,
-                     features=['datagram',"length","time","direction","message_type"],dataset_level="flow")
-```
-### Data Augmentation
-```
-enhance_based_tsv(dataset_save_path+"dataset/","train_dataset.tsv","train_enhance5",enhance_factor=5)
-```
-## Model Finetuning
+
+`pcap_process` outputs one `.pcap` per (TCP|UDP) 5-tuple flow under the file-name format
+`{TCP|UDP}_{src_ip}_{src_port}_{dst_ip}_{dst_port}.pcap`,
+and discards flows with fewer than 5 payload-bearing packets (consistent with the paper's filter).
+
+---
+
+## 3. Pre-training
+
+End-to-end pipeline:
 
 ```
-CUDA_VISIBLE_DEVICES=2 python3 fine-tuning/run_classifier.py --vocab_path models/encryptd_vocab.txt \
-                                   --train_path train_dataset.tsv \
-                                   --dev_path valid_dataset.tsv \
-                                   --test_path test_dataset.tsv \
-                                   --pretrained_model_path pretrain_model.bin \
-                                   --output_model_path models/finetuned_model.bin\
-                                   --epochs_num 4 --earlystop 4 --batch_size 128 --embedding word_pos_seg \
-                                   --encoder transformer --mask fully_visible \
-                                   --seq_length 320 --learning_rate 6e-5
+raw pcap dir  ──► [pcap_process]  ──►  per-flow pcap dir
+              ──► [multimodal_data_gen.py]  ──►  corpus_raw.txt + corpus_size.txt
+              ──► [preprocess.py]  ──►  Stage 1 dataset.pt   ──► [pretrain.py --target raw_packet ]  ──► raw_encoder.bin
+                                        Stage 1 dataset.pt   ──► [pretrain.py --target packet_size]  ──► size_encoder.bin
+                                        Stage 2 dataset.pt   ──► [pretrain.py --target multimodal ]  ──► mm_trafficbert.bin
 ```
-Note: this code is based on [ET_BERT](https://github.com/linwhitehat/ET-BERT) and [UER-py](https://github.com/dbiir/UER-py). Many thanks to the authors.
+
+### 3.1 Split pcaps into per-flow pcaps
+
+Put **all** raw pcaps anywhere under one directory tree (subdirectories OK — `pcap_process` recursively scans). For pre-training use the **default mode** (no `-l`), which writes one output sub-directory per input pcap:
+
+```bash
+./data_generation/pcap_process /path/to/pretrain_pcaps/ /path/to/pretrain_flows/
+```
+
+### 3.2 Build the text corpora
+
+```bash
+python3 data_generation/multimodal_data_gen.py \
+    --pcap_dir         /path/to/pretrain_flows/ \
+    --output_raw       data/corpus_raw.txt \
+    --output_size      data/corpus_size.txt \
+    --num_workers      32
+```
+
+### 3.3 Preprocess into `.pt`
+
+```bash
+# Stage 1 — content (raw bytes, 12-layer encoder)
+python3 pre-training/preprocess.py \
+    --target raw_packet \
+    --corpus_path  data/corpus_raw.txt \
+    --vocab_path   models/bert/vocab_raw.txt \
+    --dataset_path data/raw_dataset.pt \
+    --seq_length   512 \
+    --processes_num 32 \
+    --dynamic_masking
+
+# Stage 1 — behavior (size + IAT, 6-layer encoder)
+python3 pre-training/preprocess.py \
+    --target packet_size \
+    --corpus_path         data/corpus_size.txt \
+    --vocab_path          models/bert/vocab_size.txt \
+    --vocab_path_temporal models/bert/vocab_temporal.txt \
+    --dataset_path        data/size_dataset.pt \
+    --seq_length          256 \
+    --processes_num       32 \
+    --dynamic_masking
+
+# Stage 2 — paired multimodal
+python3 pre-training/preprocess.py \
+    --target multimodal \
+    --corpus_path_raw     data/corpus_raw.txt \
+    --corpus_path_size    data/corpus_size.txt \
+    --vocab_path_raw      models/bert/vocab_raw.txt \
+    --vocab_path_size     models/bert/vocab_size.txt \
+    --vocab_path_temporal models/bert/vocab_temporal.txt \
+    --dataset_path        data/mm_dataset.pt \
+    --seq_length_raw      512 \
+    --seq_length_size     256 \
+    --processes_num       32 \
+    --dynamic_masking
+```
+
+### 3.4 Stage 1 — unimodal pre-training
+
+```bash
+# Content encoder (12 layers)
+python3 pre-training/pretrain.py \
+    --target raw_packet \
+    --dataset_path       data/raw_dataset.pt \
+    --vocab_path         models/bert/vocab_raw.txt \
+    --output_model_path  models/raw_encoder.bin \
+    --config_path        models/bert/base_config.json \
+    --total_steps        100000 \
+    --batch_size         64 \
+    --learning_rate      5e-5 \
+    --world_size 4 --gpu_ranks 0 1 2 3 \
+    --master_ip tcp://localhost:12345
+
+# Behavior encoder (6 layers; uses DualMlm with size CE + IAT soft-label KL, σ=10)
+python3 pre-training/pretrain.py \
+    --target packet_size \
+    --dataset_path        data/size_dataset.pt \
+    --vocab_path          models/bert/vocab_size.txt \
+    --vocab_path_temporal models/bert/vocab_temporal.txt \
+    --output_model_path   models/size_encoder.bin \
+    --config_path         models/bert/behavior_6_config.json \
+    --total_steps         100000 \
+    --batch_size          64 \
+    --learning_rate       5e-5 \
+    --world_size 4 --gpu_ranks 0 1 2 3 \
+    --master_ip tcp://localhost:12345
+```
+
+### 3.5 Stage 2 — multimodal pre-training
+
+```bash
+python3 pre-training/pretrain.py \
+    --target multimodal \
+    --dataset_path        data/mm_dataset.pt \
+    --vocab_path_raw      models/bert/vocab_raw.txt \
+    --vocab_path_size     models/bert/vocab_size.txt \
+    --vocab_path_temporal models/bert/vocab_temporal.txt \
+    --pretrained_raw_path  models/raw_encoder.bin \
+    --pretrained_size_path models/size_encoder.bin \
+    --output_model_path    models/mm_trafficbert.bin \
+    --config_path          models/bert/base_config.json \
+    --config_path_size     models/bert/behavior_6_config.json \
+    --use_itgca  \
+    --num_fusion_layers 6  \
+    --total_steps        100000 \
+    --batch_size         64 \
+    --learning_rate      5e-5 \
+    --encoder_lr_ratio   0.3 \
+    --seq_length_raw 512 --seq_length_size 256 \
+    --world_size 4 --gpu_ranks 0 1 2 3 \
+    --master_ip tcp://localhost:12345
+```
+
+### 3.6 OOM mitigation: gradient accumulation
+
+Stage 2 is the most memory-hungry step (two encoders + 6-layer fusion + momentum encoders + 4096-entry queue + ITM hard negatives that triple the fused-CLS forward pass). On smaller GPUs, reduce `--batch_size` and compensate with `--accumulation_steps` to keep the effective batch fixed:
+
+| Effective batch | Per-GPU batch | `--accumulation_steps` (4 GPUs) |
+|-----------------|---------------|---------------------------------|
+| 256 (paper)     | 64            | 1                               |
+| 256             | 32            | 2                               |
+| 256             | 16            | 4                               |
+| 256             |  8            | 8                               |
+
+The same trick applies to Stage 1 if needed.
+
+### Component-level ablation flags
+
+Disable individual ITGCA components to reproduce the per-component decomposition (Table 5):
+
+| Flag                  | Disables                                                  |
+|-----------------------|-----------------------------------------------------------|
+| `--ablate_r_stat`     | Flow-level Shannon-entropy prior (Eq. 5)                  |
+| `--ablate_g_token`    | Per-position learned token gate (Eq. 8)                   |
+| `--ablate_source_bias`| Source-side attention reweighting (Eq. 10)                |
+
+These flags must be passed identically at fine-tune time so that loaded checkpoint geometry matches.
+
+---
+
+## 4. Fine-tuning
+
+End-to-end pipeline:
+
+```
+labelled pcap dir  ──► [pcap_process -l]  ──►  per-label flow pcap dir
+                  ──► [multimodal_data_utils.py]  ──►  train.pkl, val.pkl, test.pkl, label2id.pkl
+                  ──► [run_classifier_stage2.py]   ──►  finetuned classifier
+```
+
+### 4.1 Split pcaps, preserving label directories
+
+The fine-tuning input is a directory whose immediate sub-directories are class names:
+
+```
+finetune_input/
+├── label_a/  *.pcap
+├── label_b/  *.pcap
+└── label_c/  *.pcap
+```
+
+Use **label mode** so that the output preserves the same class layout:
+
+```bash
+./data_generation/pcap_process -l /path/to/finetune_input/ /path/to/finetune_flows/
+```
+
+### 4.2 Build train/val/test pickles
+
+```bash
+python3 fine-tuning/multimodal_data_utils.py \
+    --pcap_dir            /path/to/finetune_flows/ \
+    --vocab_path_raw      models/bert/vocab_raw.txt \
+    --vocab_path_size     models/bert/vocab_size.txt \
+    --vocab_path_temporal models/bert/vocab_temporal.txt \
+    --output_dir          data/finetune/<task>/processed/ \
+    --max_samples_per_class 500 \
+    --seed 42 \
+    --num_workers 32 
+```
+
+Outputs four files in `--output_dir`: `train.pkl`, `val.pkl`, `test.pkl`, `label2id.pkl`. The split is per-class stratified at the flow level so that all packets of the same flow stay in one split.
+
+### 4.3 Stage 2 multimodal fine-tuning
+
+The paper uses two-phase training: **Phase 1** (5 epochs) freezes the backbone and warms up the classifier head; **Phase 2** (10 epochs) unfreezes everything with layer-wise LR decay (encoder 0.3 ×, fusion 0.7 ×, classifier 1 ×). Base LR 5e-5, AdamW.
+
+```bash
+python3 fine-tuning/run_classifier_stage2.py \
+    --train_path      data/finetune/<task>/processed/train.pkl \
+    --dev_path        data/finetune/<task>/processed/val.pkl \
+    --test_path       data/finetune/<task>/processed/test.pkl \
+    --label2id_path   data/finetune/<task>/processed/label2id.pkl \
+    --vocab_path_raw      models/bert/vocab_raw.txt \
+    --vocab_path_size     models/bert/vocab_size.txt \
+    --vocab_path_temporal models/bert/vocab_temporal.txt \
+    --pretrained_model_path models/mm_trafficbert.bin \
+    --output_model_path     models/<task>_classifier.bin \
+    --config_path           models/bert/base_config.json \
+    --config_path_size      models/bert/behavior_6_config.json \
+    --use_itgca  \
+    --batch_size 32 --learning_rate 5e-5 \
+    --phase1_epochs 5 --phase1_lr 1e-3 \
+    --epochs_num 10 \
+    --llrd_encoder_ratio 0.3 --llrd_fusion_ratio 0.7 \
+    --label_smoothing 0.1 --max_grad_norm 1.0 \
+    --seed 42 --gpu_ranks 0
+```
+
+Important: every `--use_itgca / --ablate_*` / `--num_fusion_layers` / `--itgca_window_size` flag here **must match the value used at Stage 2 pre-training** — otherwise the gate parameters in the checkpoint cannot be loaded. The classifier prints a warning if it detects a mismatch.
+
+### 4.4 Few-shot fine-tuning
+
+Pass `--few_shot 0.1` (or 0.4 / 0.7) to use a stratified sub-sample of the training set, matching Section 5.3 of the paper. Validation and test sets are not affected.
+
+---
+
+## 5. Inference and analysis
+
+```bash
+# Standard inference on a held-out test pickle
+python3 fine-tuning/run_inference.py \
+    --load_model_path  models/<task>_classifier.bin \
+    --test_path        data/finetune/<task>/processed/test.pkl \
+    --label2id_path    data/finetune/<task>/processed/label2id.pkl \
+    --vocab_path_raw      models/bert/vocab_raw.txt \
+    --vocab_path_size     models/bert/vocab_size.txt \
+    --vocab_path_temporal models/bert/vocab_temporal.txt \
+    --config_path         models/bert/base_config.json \
+    --config_path_size    models/bert/behavior_6_config.json \
+    --use_itgca --num_fusion_layers 6
+```
+
+---
+
+
+## 6. Acknowledgement
+
+This codebase is built on top of [UER-py](https://github.com/dbiir/UER-py) . We thank the authors for releasing high-quality reference implementations.

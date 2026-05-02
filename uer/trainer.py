@@ -65,29 +65,9 @@ def train_and_validate(args):
         args.vocab = vocab_raw.w2i
         args.tokenizer = args.tokenizer_raw
 
-    elif args.spm_model_path:
-        try:
-            import sentencepiece as spm
-        except ImportError:
-            raise ImportError("You need to install SentencePiece to use XLNetTokenizer: https://github.com/google/sentencepiece"
-                              "pip install sentencepiece")
-        sp_model = spm.SentencePieceProcessor()
-        sp_model.Load(args.spm_model_path)
-        args.vocab = {sp_model.IdToPiece(i): i for i
-                      in range(sp_model.GetPieceSize())}
-        args.tokenizer = str2tokenizer[args.tokenizer](args)
-        if args.target == "seq2seq":
-            tgt_sp_model = spm.SentencePieceProcessor()
-            tgt_sp_model.Load(args.tgt_spm_model_path)
-            args.tgt_vocab = {tgt_sp_model.IdToPiece(i): i for i
-                              in range(tgt_sp_model.GetPieceSize())}
     else:
         args.tokenizer = str2tokenizer[args.tokenizer](args)
         args.vocab = args.tokenizer.vocab
-        if args.target == "seq2seq":
-            tgt_vocab = Vocab()
-            tgt_vocab.load(args.tgt_vocab_path)
-            args.tgt_vocab = tgt_vocab.w2i
         # Load temporal vocabulary for packet_size target (if provided)
         if args.target == "packet_size" and hasattr(args, 'vocab_path_temporal') and args.vocab_path_temporal:
             # Temporarily change vocab_path to load temporal vocab
@@ -219,76 +199,6 @@ class Trainer(object):
 
             self.current_step += 1
 
-
-class BertTrainer(Trainer):
-    def __init__(self, args):
-        super(BertTrainer, self).__init__(args)
-        self.total_loss_sp = 0.0
-        self.total_correct_sp = 0.0
-        self.total_instances = 0.0
-
-        self.total_loss_mlm = 0.0
-        self.total_correct_mlm = 0.0
-        self.total_denominator = 0.0
-        self.load_balance_alpha = args.moebert_load_balance
-        self.is_moe = args.is_moe
-
-    def forward_propagation(self, batch, model):
-        debug_mode = False
-        if debug_mode:
-            print("In function forward_propagation(self, batch, model):")
-            print("type of batch:",type(batch))
-            print("type of the content of batch:",[type(elem) for elem in batch])
-        if len(batch)==5:
-            src, tgt_mlm, tgt_sp, seg, proto = batch
-            loss_info = model(src, (tgt_mlm, tgt_sp), seg, proto)
-        else:
-            src, tgt_mlm, tgt_sp, seg = batch
-            loss_info = model(src, (tgt_mlm, tgt_sp), seg)
-        
-        if self.is_moe:
-            loss_mlm, loss_sp, correct_mlm, correct_sp, denominator, gate_loss = loss_info
-        else:
-            loss_mlm, loss_sp, correct_mlm, correct_sp, denominator = loss_info
-            gate_loss = 0.0
-        loss = loss_mlm/10 + loss_sp + self.load_balance_alpha * gate_loss
-        self.total_loss += loss.item()
-        self.total_loss_mlm += loss_mlm.item()
-        self.total_loss_sp += loss_sp.item()
-        self.total_correct_mlm += correct_mlm.item()
-        self.total_correct_sp += correct_sp.item()
-        self.total_denominator += denominator.item()
-        self.total_instances += src.size(0)
-        loss = loss / self.accumulation_steps
-
-        return loss
-
-    def report_and_reset_stats(self):
-        done_tokens = self.batch_size * self.seq_length * self.report_steps
-        if self.dist_train:
-            done_tokens *= self.world_size
-
-        print("| {:8d}/{:8d} steps"
-              "| {:3.3f} s"
-              "| {:8.2f} tokens/s"
-              "| loss {:7.2f}"
-              "| loss_mlm: {:3.3f}"
-              "| loss_sp: {:3.3f}"
-              "| acc_mlm: {:3.3f}"
-              "| acc_sp: {:3.3f}".format(
-            self.current_step,
-            self.total_steps,
-            (time.time() - self.start_time),
-            done_tokens / (time.time() - self.start_time),
-            self.total_loss / self.report_steps,
-            self.total_loss_mlm / self.report_steps,
-            self.total_loss_sp / self.report_steps,
-            self.total_correct_mlm / self.total_denominator,
-            self.total_correct_sp / self.total_instances))
-
-        self.total_loss, self.total_loss_mlm, self.total_loss_sp = 0.0, 0.0, 0.0
-        self.total_correct_mlm, self.total_denominator = 0.0, 0.0
-        self.total_correct_sp, self.total_instances = 0.0, 0.0
 
 
 class RawPacketMlmTrainer(Trainer):
@@ -591,7 +501,6 @@ class MultiModalTrainer(Trainer):
 
 
 str2trainer = {
-    "bertflow": BertTrainer,
     "raw_packet": RawPacketMlmTrainer,
     "packet_size": PacketSizeMlmTrainer,
     "multimodal": MultiModalTrainer
@@ -701,19 +610,10 @@ def worker(proc_id, gpu_ranks, args, model):
             {"params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], "weight_decay": 0.0}
         ]
 
-    if args.optimizer in ["adamw"]:
-        optimizer = str2optimizer[args.optimizer](optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False)
-    else:
-        optimizer = str2optimizer[args.optimizer](optimizer_grouped_parameters, lr=args.learning_rate,
-                                                  scale_parameter=False, relative_step=False)
+    optimizer = str2optimizer[args.optimizer](optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False)
 
     # Create scheduler (same for both phases)
-    if args.scheduler in ["constant"]:
-        scheduler = str2scheduler[args.scheduler](optimizer)
-    elif args.scheduler in ["constant_with_warmup"]:
-        scheduler = str2scheduler[args.scheduler](optimizer, args.total_steps*args.warmup)
-    else:
-        scheduler = str2scheduler[args.scheduler](optimizer, args.total_steps*args.warmup, args.total_steps)
+    scheduler = str2scheduler[args.scheduler](optimizer, args.total_steps*args.warmup, args.total_steps)
 
     debug = True
     if args.dist_train:

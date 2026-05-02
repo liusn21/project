@@ -117,11 +117,6 @@ def build_args():
     parser.add_argument("--ablate_source_bias", action="store_true",
                         help="[Stage 2] Disable source-side attention bias. Must match the pretrained checkpoint.")
 
-    parser.add_argument("--simple_classifier", action="store_true",
-                        help="[Stage 2] Use simple CLS-only classifier (must match training)")
-    parser.add_argument("--use_attn_pooling", action="store_true",
-                        help="[Stage 2] Use attention pooling (must match training)")
-
     parser.add_argument("--seq_length_raw", type=int, default=512)
     parser.add_argument("--seq_length_size", type=int, default=256)
 
@@ -141,15 +136,6 @@ def build_args():
                         help="Save detailed results (misclassified samples) to CSV "
                              "(only used with --detailed)")
 
-    # MoE placeholders (for compatibility with config loading)
-    parser.add_argument("--is_moe", action="store_true")
-    parser.add_argument("--vocab_size", type=int, required=False)
-    parser.add_argument("--moebert_expert_dim", type=int, default=3072)
-    parser.add_argument("--moebert_expert_num", type=int, required=False)
-    parser.add_argument("--moebert_route_method", default="hash-random", type=str)
-    parser.add_argument("--moebert_route_hash_list", default=None, type=str)
-    parser.add_argument("--moebert_load_balance", type=float, default=0.0)
-
     args = parser.parse_args()
 
     # Load hyperparameters from config JSON
@@ -158,12 +144,7 @@ def build_args():
     args = apply_modality_configs(args)
 
     args.max_seq_length = max(args.seq_length_raw, args.seq_length_size)
-
-    # Defaults referenced by classifiers but not needed for inference
-    args.num_dropouts = 1
-    args.use_scl = False
     args.dropout = getattr(args, 'dropout', 0.1)
-
     return args
 
 
@@ -413,10 +394,7 @@ def main():
     # Classify unexpected keys: which are safe to skip?
     safe_to_skip = set()
 
-    # 1) scl_projection — training-only (use_scl=False in inference)
-    safe_to_skip |= {k for k in unexpected if 'scl_projection' in k}
-
-    # 2) Inference-time ablation: checkpoint has components the model intentionally omits
+    # Inference-time ablation: checkpoint has components the model intentionally omits.
     if getattr(args, 'ablate_g_token', False):
         safe_to_skip |= {k for k in unexpected
                          if any(f in k for f in ['.W_k.', '.W_v.', '.token_gate_bias'])}
@@ -451,9 +429,6 @@ def main():
                for k in unsafe_unexpected):
             print(f"\n  HINT: Checkpoint contains ITGCA gate weights. "
                   f"Add --use_itgca to match.")
-        if any('attn_pool' in k for k in unsafe_unexpected):
-            print(f"\n  HINT: Checkpoint contains attention pooling weights. "
-                  f"Add --use_attn_pooling to match.")
 
     if missing:
         has_error = True
@@ -467,12 +442,8 @@ def main():
             print(f"        If checkpoint was trained WITHOUT ITGCA → remove --use_itgca.")
             print(f"        If checkpoint was trained WITH ablation → add matching "
                   f"--ablate_r_stat / --ablate_g_token / --ablate_source_bias.")
-        if any('attn_pool' in k for k in missing):
-            print(f"\n  HINT: Model defines attention pooling not in checkpoint. "
-                  f"Remove --use_attn_pooling.")
         if any('classifier' in k for k in missing):
-            print(f"\n  HINT: Classifier shape mismatch. Check --simple_classifier "
-                  f"and --labels_num.")
+            print(f"\n  HINT: Classifier shape mismatch. Check --labels_num.")
 
     if has_error:
         print(f"\n  Current inference flags:")
@@ -480,8 +451,6 @@ def main():
         print(f"    --ablate_r_stat={getattr(args, 'ablate_r_stat', False)}")
         print(f"    --ablate_g_token={getattr(args, 'ablate_g_token', False)}")
         print(f"    --ablate_source_bias={getattr(args, 'ablate_source_bias', False)}")
-        print(f"    --use_attn_pooling={getattr(args, 'use_attn_pooling', False)}")
-        print(f"    --simple_classifier={getattr(args, 'simple_classifier', False)}")
         print(f"    --num_fusion_layers={getattr(args, 'num_fusion_layers', 6)}")
         sys.exit(1)
 

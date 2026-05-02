@@ -46,12 +46,6 @@ def main():
                              "For multimodal target, use --corpus_path_raw and --corpus_path_size instead.")
     parser.add_argument("--vocab_path", default=None, type=str,
                         help="Path of the vocabulary file.")
-    parser.add_argument("--spm_model_path", default=None, type=str,
-                        help="Path of the sentence piece model.")
-    parser.add_argument("--tgt_vocab_path", default=None, type=str,
-                        help="Path of the target vocabulary file.")
-    parser.add_argument("--tgt_spm_model_path", default=None, type=str,
-                        help="Path of the target sentence piece model.")
     parser.add_argument("--vocab_path_temporal", default=None, type=str,
                         help="Path of the temporal vocabulary file (for IAT tokens in packet_size/multimodal target).")
     parser.add_argument("--dataset_path", type=str, default="dataset.pt",
@@ -72,34 +66,22 @@ def main():
                         help="Sequence length for packet sizes (for multimodal target).")
 
     # Preprocess options.
-    parser.add_argument("--tokenizer", choices=["bert", "char", "space"], default="bert",
-                        help="Specify the tokenizer."
-                             "Original Google BERT uses bert tokenizer on Chinese corpus."
-                             "Char tokenizer segments sentences into characters."
-                             "Space tokenizer segments sentences into words according to space."
-                             )
-    parser.add_argument("--tgt_tokenizer", choices=["bert", "char", "space"], default="bert",
+    parser.add_argument("--tokenizer", choices=["bert"], default="bert",
                         help="Specify the tokenizer.")
     parser.add_argument("--processes_num", type=int, default=1,
                         help="Split the whole dataset into `processes_num` parts, "
                              "and each part is fed to a single process in training step.")
-    parser.add_argument("--target", choices=["bert", "bertflow","lm", "mlm", "bilm", "albert", "seq2seq", "t5", "cls", "prefixlm","raw_packet","packet_size","multimodal"], default="bert",
+    parser.add_argument("--target", choices=["raw_packet", "packet_size", "multimodal"], default="multimodal",
                         help="The training dataset target.")
     parser.add_argument("--docs_buffer_size", type=int, default=100000,
                         help="The buffer size of documents in memory, specific to targets that require negative sampling.")
     parser.add_argument("--seq_length", type=int, default=128, help="Sequence length of instances.")
-    parser.add_argument("--tgt_seq_length", type=int, default=128, help="Target sequence length of instances.")
     parser.add_argument("--dup_factor", type=int, default=5,
                         help="Duplicate instances multiple times.")
-    parser.add_argument("--short_seq_prob", type=float, default=0.1,
-                        help="Probability of truncating sequence."
-                             "The larger value, the higher probability of using short (truncated) sequence.")
-    parser.add_argument("--full_sentences", action="store_true", help="Full sentences.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
 
     # Masking options.
     parser.add_argument("--dynamic_masking", action="store_true", help="Dynamic masking.")
-    parser.add_argument("--whole_word_masking", action="store_true", help="Whole word masking.")
     parser.add_argument("--span_masking", action="store_true", help="Span masking.")
     parser.add_argument("--span_geo_prob", type=float, default=0.2,
                         help="Hyperparameter of geometric distribution for span masking.")
@@ -120,8 +102,6 @@ def main():
 
     # Build tokenizer.
     tokenizer = str2tokenizer[args.tokenizer](args)
-    if args.target == "seq2seq":
-        args.tgt_tokenizer = str2tokenizer[args.tgt_tokenizer](args, False)
 
     # Build temporal tokenizer for packet_size target (if vocab_path_temporal is provided)
     tokenizer_temporal = None

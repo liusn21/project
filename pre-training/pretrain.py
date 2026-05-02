@@ -16,12 +16,6 @@ def main():
                         help="Path of the preprocessed dataset.")
     parser.add_argument("--vocab_path", default=None, type=str,
                         help="Path of the vocabulary file.")
-    parser.add_argument("--spm_model_path", default=None, type=str,
-                        help="Path of the sentence piece model.")
-    parser.add_argument("--tgt_vocab_path", default=None, type=str,
-                        help="Path of the target vocabulary file.")
-    parser.add_argument("--tgt_spm_model_path", default=None, type=str,
-                        help="Path of the target sentence piece model.")
     parser.add_argument("--vocab_path_temporal", default=None, type=str,
                         help="Path of the temporal vocabulary file (for IAT tokens in packet_size target).")
     parser.add_argument("--pretrained_model_path", type=str, default=None,
@@ -51,45 +45,19 @@ def main():
                         help="Training batch size. The actual batch_size is [batch_size x world_size x accumulation_steps].")
     parser.add_argument("--instances_buffer_size", type=int, default=25600,
                         help="The buffer size of instances in memory.")
-    parser.add_argument("--labels_num", type=int, required=False,
-                        help="Number of prediction labels.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout value.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
 
     # Preprocess options.
-    parser.add_argument("--tokenizer", choices=["bert", "char", "space"], default="bert",
-                        help="Specify the tokenizer."
-                             "Original Google BERT uses bert tokenizer on Chinese corpus."
-                             "Char tokenizer segments sentences into characters."
-                             "Space tokenizer segments sentences into words according to space."
-                        )
+    parser.add_argument("--tokenizer", choices=["bert"], default="bert",
+                        help="Specify the tokenizer.")
 
     # Model options.
     model_opts(parser)
-    parser.add_argument("--tgt_embedding", choices=["word", "word_pos", "word_pos_seg", "word_sinusoidalpos"], default="word_pos_seg",
-                        help="Target embedding type.")
-    parser.add_argument("--decoder", choices=["transformer"], default="transformer", help="Decoder type.")
-    parser.add_argument("--pooling", choices=["mean", "max", "first", "last"], default="first",
-                        help="Pooling type.")
-    parser.add_argument("--target", choices=["bert","bertflow","lm", "mlm", "bilm", "albert", "seq2seq", "t5", "cls", "prefixlm", "raw_packet", "packet_size", "multimodal"], default="bert",
+    parser.add_argument("--target", choices=["raw_packet", "packet_size", "multimodal"], default="multimodal",
                         help="The training target of the pretraining model.")
-    parser.add_argument("--tie_weights", action="store_true",
-                        help="Tie the word embedding and softmax weights.")
-    parser.add_argument("--has_lmtarget_bias", action="store_true",
-                        help="Add bias on output_layer for lm target.")
-    
-    #MOE Model Options
-    parser.add_argument("--is_moe", action="store_true", help="adopt moe layer.")
-    parser.add_argument("--vocab_size", type=int, required=False, help="Number of vocab.")
-    parser.add_argument("--moebert_expert_dim", type=int, required=False, default=3072, help="Dim of expert,default is ffn.")
-    parser.add_argument("--moebert_expert_num", type=int, required=False, help="Number of expert.")
-    parser.add_argument("--moebert_route_method", choices=["gate-token", "gate-sentence", "hash-random", "hash-balance","proto"], default="hash-random",
-                        help="moebert route method.")
-    parser.add_argument("--moebert_route_hash_list", default=None, type=str, help="Path of moebert hash list file.")
-    parser.add_argument("--moebert_load_balance", type=float, default=0.0, help="gate loss weight.")
-    
+
     # Masking options.
-    parser.add_argument("--whole_word_masking", action="store_true", help="Whole word masking.")
     parser.add_argument("--span_masking", action="store_true", help="Span masking.")
     parser.add_argument("--span_geo_prob", type=float, default=0.2,
                         help="Hyperparameter of geometric distribution for span masking.")
@@ -150,7 +118,7 @@ def main():
                              "Raw←Size: pure learned gate (no prior).")
     parser.add_argument("--itgca_window_size", type=int, default=16,
                         help="Sliding window size for local entropy computation in ITGCA token gate. "
-                             "Recommended range: 16-32 for bigram token sequences.")
+                             "Recommended range: 16-32 for byte-level token sequences.")
 
     # ITGCA component-level ablation flags (for §5.5.2 component decomposition)
     # Defaults: all False = full ITGCA. Each flag disables one sub-component cleanly.
@@ -203,9 +171,6 @@ def main():
     print("Training arguments:")
     print(f"Learning rate: {args.learning_rate}")
     print(f"Encoder learning rate ratio: {args.encoder_lr_ratio}")
-
-    if args.target == "cls":
-        assert args.labels_num is not None, "Cls target needs the denotation of the number of labels."
 
     # Load hyper-parameters from config file.
     if args.config_path:

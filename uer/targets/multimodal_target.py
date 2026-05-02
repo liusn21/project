@@ -1,15 +1,15 @@
 """
 Multi-Modal Target for Stage 2 Pretraining (ALBEF-style) with Temporal Information
 
-包含三个预训练任务:
-1. ITC (Image-Text Contrastive): 对比学习对齐Raw和Size的表示空间
-2. ITM (Image-Text Matching): 跨模态匹配二分类任务，使用hard negative mining
-3. Masked Reconstruction: 利用Fusion后的特征重建被mask的Size和IAT tokens
+Three pretraining tasks:
+1. ITC (Image-Text Contrastive): contrastive alignment of Raw and Size representations
+2. ITM (Image-Text Matching): cross-modal binary matching with hard negative mining
+3. Masked Reconstruction: reconstruct masked Size and IAT tokens from fused features
 
-NEW Design:
+Design:
 - Raw modality is NOT masked (provides context for reconstruction)
 - Size + IAT are synchronously masked and reconstructed
-- Temporal reconstruction uses soft-label KL divergence loss (like Stage 1)
+- Temporal reconstruction uses soft-label KL divergence loss (same as Stage 1)
 """
 
 import torch
@@ -126,21 +126,21 @@ class MultiModalTarget(nn.Module):
         """
         ITC (Image-Text Contrastive) Loss
 
-        使用Momentum特征和Queue扩大负样本数量
+        Uses momentum features plus a feature queue to enlarge the negative pool.
 
         Args:
-            raw_cls: [batch, hidden] - 当前batch的Raw CLS特征
-            size_cls: [batch, hidden] - 当前batch的Size CLS特征
-            raw_cls_m: [batch, hidden] - Momentum encoder的Raw CLS特征
-            size_cls_m: [batch, hidden] - Momentum encoder的Size CLS特征
-            raw_queue: [queue_size, hidden] - Raw特征队列
-            size_queue: [queue_size, hidden] - Size特征队列
-            temperature: 温度参数
+            raw_cls: [batch, hidden] - current batch Raw CLS features
+            size_cls: [batch, hidden] - current batch Size CLS features
+            raw_cls_m: [batch, hidden] - momentum encoder Raw CLS features
+            size_cls_m: [batch, hidden] - momentum encoder Size CLS features
+            raw_queue: [queue_size, hidden] - Raw feature queue
+            size_queue: [queue_size, hidden] - Size feature queue
+            temperature: contrastive temperature
 
         Returns:
             itc_loss: ITC loss
-            sim_r2s: [batch, batch+queue] 相似度矩阵 (用于ITM hard negative mining)
-            sim_s2r: [batch, batch+queue] 相似度矩阵
+            sim_r2s: [batch, batch+queue] similarity matrix (reused by ITM hard-negative mining)
+            sim_s2r: [batch, batch+queue] similarity matrix
         """
         batch_size = raw_cls.size(0)
 
@@ -175,8 +175,8 @@ class MultiModalTarget(nn.Module):
         Sample hard negative indices based on ITC similarity
 
         Args:
-            sim_r2s: [batch, batch+queue] - Raw到Size的相似度矩阵 (already scaled by temperature)
-            sim_s2r: [batch, batch+queue] - Size到Raw的相似度矩阵 (already scaled by temperature)
+            sim_r2s: [batch, batch+queue] - Raw-to-Size similarity matrix (already scaled by temperature)
+            sim_s2r: [batch, batch+queue] - Size-to-Raw similarity matrix (already scaled by temperature)
             batch_size: batch size
 
         Returns:
@@ -184,7 +184,7 @@ class MultiModalTarget(nn.Module):
             neg_raw_idx: [batch] - hard negative raw indices for each size
         """
         with torch.no_grad():
-            # 只使用batch内的相似度 (取前batch_size列)
+            # Use only the in-batch similarities (the first batch_size columns).
             sim_r2s_batch = sim_r2s[:, :batch_size].clone()
             sim_s2r_batch = sim_s2r[:, :batch_size].clone()
 
@@ -208,15 +208,15 @@ class MultiModalTarget(nn.Module):
         """
         ITM (Image-Text Matching) Loss - ALBEF style
 
-        所有输入都是经过Fusion后的CLS特征
+        All inputs are post-fusion CLS features.
 
         Args:
-            pos_raw_cls: [batch, hidden] - 正样本raw经过Fusion后的CLS
-            pos_size_cls: [batch, hidden] - 正样本size经过Fusion后的CLS
-            neg1_raw_cls: [batch, hidden] - 负样本1的raw经过Fusion后的CLS (raw_i with size_neg)
-            neg1_size_cls: [batch, hidden] - 负样本1的size经过Fusion后的CLS
-            neg2_raw_cls: [batch, hidden] - 负样本2的raw经过Fusion后的CLS (raw_neg with size_i)
-            neg2_size_cls: [batch, hidden] - 负样本2的size经过Fusion后的CLS
+            pos_raw_cls: [batch, hidden] - positive raw post-fusion CLS
+            pos_size_cls: [batch, hidden] - positive size post-fusion CLS
+            neg1_raw_cls: [batch, hidden] - negative-type-1 raw post-fusion CLS (raw_i with size_neg)
+            neg1_size_cls: [batch, hidden] - negative-type-1 size post-fusion CLS
+            neg2_raw_cls: [batch, hidden] - negative-type-2 raw post-fusion CLS (raw_neg with size_i)
+            neg2_size_cls: [batch, hidden] - negative-type-2 size post-fusion CLS
 
         Returns:
             itm_loss: ITM loss

@@ -2,7 +2,6 @@ import torch
 from uer.layers import *
 from uer.encoders import *
 from uer.targets import *
-from uer.models.model import Model
 from uer.models.raw_packet_model import RawPacketModel
 from uer.models.packet_size_model import PacketSizeModel
 from uer.models.multimodal_model import MultiModalModel
@@ -160,9 +159,7 @@ def build_model(args):
             print(f"  Packet Size (legacy mode without temporal)")
 
     else:
-        embedding = str2embedding[args.embedding](args, len(args.vocab))
-        encoder = str2encoder[args.encoder](args)
-        target = str2target[args.target](args, len(args.vocab))
-        model = Model(args, embedding, encoder, target)
+        raise ValueError(f"Unsupported target: {args.target}. "
+                         f"Choose from: raw_packet, packet_size, multimodal.")
 
     return model

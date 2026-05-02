@@ -1,20 +1,20 @@
 """
-Multi-Modal Traffic Data Extractor V3 (uer框架兼容版 + IAT Temporal Information)
+Multi-Modal Traffic Data Extractor (UER-compatible) with IAT temporal information.
 
-输出文本格式，兼容uer的preprocess.py：
-- Raw packet: bigram文本（hex，空格分隔）
-- Packet size: 整数文本（空格分隔）
-- Direction: 编码在size中，或单独输出
-- IAT (Inter-Arrival Time): 时序信息（归一化后离散化到0-999）
+Output text format compatible with uer/preprocess.py:
+- Raw packet: byte-level hex tokens (one byte per token, space-separated)
+- Packet size: integer tokens (space-separated)
+- Direction: encoded into the size token, or written separately for raw
+- IAT (Inter-Arrival Time): temporal tokens normalized and discretized to [0, 999]
 
-输出格式：
-- corpus_raw.txt: raw packet bigrams
+Files produced:
+- corpus_raw.txt:  raw packet bytes
 - corpus_size.txt: packet sizes + IAT temporal tokens
 
-支持流式处理：
-- 使用 PcapReader 流式读取单个 PCAP（不一次性加载整个文件）
-- 处理结果立即写入磁盘，不在内存中累积
-- 适用于超大 pcap_dir，不会 OOM
+Streaming processing:
+- Uses scapy.PcapReader to stream packets from each PCAP (no full-file load)
+- Each flow is written to disk immediately (no in-memory accumulation)
+- Suitable for very large pcap directories without OOM
 """
 
 import os
@@ -26,16 +26,15 @@ from multiprocessing import Pool, cpu_count
 import argparse
 
 
-class MultiModalExtractorV3:
+class MultiModalExtractor:
 
-    def __init__(self, bytes_per_packet=64, max_raw_packets=8, raw_token_type='bigram'):
+    def __init__(self, bytes_per_packet=64, max_raw_packets=8):
         self.bytes_per_packet = bytes_per_packet
         self.max_raw_packets = max_raw_packets
-        self.raw_token_type = raw_token_type
 
     def extract_pcap(self, pcap_path):
-        """从PCAP提取特征，使用 PcapReader 流式读取避免 OOM"""
-        # 从文件名解析5元组
+        """Extract features from a PCAP, streaming with PcapReader to avoid OOM."""
+        # Parse the 5-tuple from the filename.
         tuple_info = self.parse_filename_5tuple(pcap_path)
         if tuple_info is None:
             return None
@@ -43,7 +42,7 @@ class MultiModalExtractorV3:
         protocol, src_ip, src_port, dst_ip, dst_port = tuple_info
         flow_src = (src_ip, src_port)
 
-        raw_bigrams = []  # List[List[str]] - hex bigrams per packet
+        raw_bytes_per_pkt = []  # List[List[str]] - byte-level hex tokens per packet
         raw_directions = []
         packet_sizes = []  # List[int]
         size_directions = []
@@ -60,13 +59,13 @@ class MultiModalExtractorV3:
                     direction = self._get_direction(packet, protocol, flow_src)
                     timestamp = float(packet.time)
 
-                    # Raw modality: hex tokens (first max_raw_packets)
-                    if len(raw_bigrams) < self.max_raw_packets:
-                        bigram_hex_list = self._bytes_to_hex_tokens(payload[:self.bytes_per_packet])
-                        raw_bigrams.append(bigram_hex_list)
+                    # Raw modality: byte-level hex tokens (first max_raw_packets only).
+                    if len(raw_bytes_per_pkt) < self.max_raw_packets:
+                        byte_hex_list = self._bytes_to_hex_tokens(payload[:self.bytes_per_packet])
+                        raw_bytes_per_pkt.append(byte_hex_list)
                         raw_directions.append(direction)
 
-                    # Size modality
+                    # Size modality.
                     packet_sizes.append(payload_len)
                     size_directions.append(direction)
                     timestamps.append(timestamp)
@@ -76,51 +75,37 @@ class MultiModalExtractorV3:
         if len(packet_sizes) == 0:
             return None
 
-        # Compute IAT tokens (normalized and discretized)
+        # Compute IAT tokens (normalized and discretized).
         iat_tokens = self._compute_iat_tokens(timestamps)
 
         return {
             'protocol': protocol,
             'protocol_name': 'TCP' if protocol == 6 else 'UDP',
-            'raw_bigrams': raw_bigrams,  # List[List[str]]
-            'raw_directions': raw_directions, # [1,-1,1,-1...]
+            'raw_bytes_per_pkt': raw_bytes_per_pkt,  # List[List[str]]
+            'raw_directions': raw_directions,        # [1, -1, 1, -1, ...]
             'packet_sizes': packet_sizes,
-            'size_directions': size_directions, #[1,-1,1,-1...]
-            'iat_tokens': iat_tokens  # List[int] - IAT temporal tokens (0-999)
+            'size_directions': size_directions,      # [1, -1, 1, -1, ...]
+            'iat_tokens': iat_tokens                 # List[int] - IAT tokens (0-999)
         }
 
     def _bytes_to_hex_tokens(self, payload_bytes):
-        """
-        将bytes转换为hex token列表
-
-        bigram mode: ["4500", "0006", ...] (滑窗bigram, N bytes → N-1 tokens)
-        byte mode:   ["45", "00", "06", ...] (单字节, N bytes → N tokens)
-        """
-        if self.raw_token_type == 'byte':
-            return [f"{b:02x}" for b in payload_bytes]
-        else:
-            bigrams = []
-            for i in range(len(payload_bytes) - 1):
-                byte1 = payload_bytes[i]
-                byte2 = payload_bytes[i + 1]
-                bigram_hex = f"{byte1:02x}{byte2:02x}"
-                bigrams.append(bigram_hex)
-            return bigrams
+        """Byte-level tokenization: N bytes -> N tokens, e.g. ["45", "00", "06", ...]"""
+        return [f"{b:02x}" for b in payload_bytes]
 
     def _compute_iat_tokens(self, timestamps):
         """
-        计算IAT（Inter-Arrival Time）tokens
+        Compute IAT (Inter-Arrival Time) tokens.
 
-        参考PTU论文的方法：
-        1. 计算相邻包时间差（秒）
-        2. 归一化：sigmoid(log10(IAT + epsilon))
-        3. 离散化到1000个bins（0-999）
+        Steps:
+        1. Compute the time delta between consecutive packets (seconds).
+        2. Normalize: sigmoid(log10(IAT + epsilon)).
+        3. Discretize into 1000 bins (0..999).
 
         Args:
-            timestamps: List[float] - 数据包时间戳（秒）
+            timestamps: List[float] - packet timestamps (seconds).
 
         Returns:
-            List[int]: IAT tokens (0-999)
+            List[int]: IAT tokens (0..999).
         """
         if len(timestamps) == 0:
             return []
@@ -132,25 +117,22 @@ class MultiModalExtractorV3:
             if i == 0:
                 iat = epsilon
             else:
-                # 计算与前一个包的时间差
-                iat = timestamps[i] - timestamps[i-1]
-                iat = max(iat, epsilon)  # 确保非负且非零
+                iat = timestamps[i] - timestamps[i - 1]
+                iat = max(iat, epsilon)  # Ensure non-negative and non-zero.
 
-            # normalization: sigmoid(log10(IAT))
-            # sigmoid(x) = 1 / (1 + exp(-x))
+            # Normalization: sigmoid(log10(IAT)).
             log_iat = math.log10(iat)
             normalized = 1.0 / (1.0 + math.exp(-log_iat))
 
-            # 离散化到 [0, 999]
+            # Discretize into [0, 999].
             token = int(normalized * 1000)
-            token = min(max(token, 0), 999)  # Clip to [0, 999]
-
+            token = min(max(token, 0), 999)
             iat_tokens.append(token)
 
         return iat_tokens
 
     def parse_filename_5tuple(self, pcap_path):
-        """从文件名解析5元组"""
+        """Parse the 5-tuple from the filename."""
         try:
             filename = os.path.basename(pcap_path)
             filename = filename.replace('.pcap', '').replace('.pcapng', '')
@@ -174,7 +156,7 @@ class MultiModalExtractorV3:
             return None
 
     def _get_direction(self, packet, protocol, flow_src):
-        """判断包方向"""
+        """Determine packet direction (+1 upstream, -1 downstream)."""
         if IP not in packet:
             return 1
 
@@ -190,12 +172,12 @@ class MultiModalExtractorV3:
         src_port = transport_layer.sport
 
         if (src_ip, src_port) == flow_src:
-            return 1  # 上行
+            return 1   # upstream
         else:
-            return -1  # 下行
+            return -1  # downstream
 
     def _extract_payload(self, packet, protocol):
-        """提取transport layer payload"""
+        """Extract the transport-layer payload."""
         try:
             if IP not in packet:
                 return None
@@ -221,69 +203,64 @@ class MultiModalExtractorV3:
 
 def write_flow(flow, f_raw, f_size):
     """
-    将单个 flow 写入输出文件（流式写入，不累积内存）
-
-    格式与原 save_to_text_format 完全一致。
+    Stream a single flow to the output files (no in-memory accumulation).
     """
     protocol = flow['protocol']
 
-    # Raw packet corpus
+    # Raw packet corpus.
     f_raw.write("||\n")
     f_raw.write(str(protocol))
     f_raw.write("\n")
-    for i in range(len(flow['raw_bigrams'])):
+    for i in range(len(flow['raw_bytes_per_pkt'])):
         f_raw.write(f"{flow['raw_directions'][i]} ")
-        f_raw.write(" ".join(flow['raw_bigrams'][i]))
+        f_raw.write(" ".join(flow['raw_bytes_per_pkt'][i]))
         f_raw.write("\n")
 
-    # Size corpus (with IAT temporal information)
+    # Size corpus (with IAT temporal information).
     f_size.write("||\n")
     f_size.write(str(protocol))
     f_size.write("\n")
-    # Line 1: size tokens (direction encoded: size_token = size * direction + 1500)
+    # Line 1: size tokens (direction encoded: size_token = size * direction + 1500).
     size_tokens = []
     for size, direction in zip(flow['packet_sizes'], flow['size_directions']):
         size_token = size * direction + 1500
         size_tokens.append(str(size_token))
     f_size.write(" ".join(size_tokens))
     f_size.write("\n")
-    # Line 2: IAT temporal tokens (0-999)
+    # Line 2: IAT temporal tokens (0..999).
     iat_token_strs = [str(token) for token in flow['iat_tokens']]
     f_size.write(" ".join(iat_token_strs))
     f_size.write("\n")
 
 
 def process_single_pcap(args_tuple):
-    """单个PCAP文件处理函数，用于多进程"""
-    pcap_path, bytes_per_packet, max_raw_packets, raw_token_type = args_tuple
-    extractor = MultiModalExtractorV3(
+    """Worker function for processing a single PCAP (multiprocessing entry point)."""
+    pcap_path, bytes_per_packet, max_raw_packets = args_tuple
+    extractor = MultiModalExtractor(
         bytes_per_packet=bytes_per_packet,
         max_raw_packets=max_raw_packets,
-        raw_token_type=raw_token_type
     )
     return extractor.extract_pcap(pcap_path)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Multi-Modal Data Extractor V3 (uer compatible)')
+    parser = argparse.ArgumentParser(description='Multi-Modal Data Extractor (UER-compatible)')
 
     parser.add_argument('--pcap_dir', type=str, required=True)
     parser.add_argument('--output_raw', type=str, required=True,
-                       help='Output raw packet corpus (text)')
+                        help='Output raw packet corpus (text)')
     parser.add_argument('--output_size', type=str, required=True,
-                       help='Output packet size corpus (text)')
+                        help='Output packet size corpus (text)')
     parser.add_argument('--bytes_per_packet', type=int, default=64)
     parser.add_argument('--max_raw_packets', type=int, default=8)
-    parser.add_argument('--raw_token_type', type=str, choices=['bigram', 'byte'], default='bigram',
-                       help='Raw tokenization: bigram (65K vocab, default) or byte (256 vocab)')
     parser.add_argument('--num_workers', type=int, default=None,
-                       help='Number of worker processes (default: CPU count)')
+                        help='Number of worker processes (default: CPU count)')
 
     args = parser.parse_args()
 
     print(f"Extracting from: {args.pcap_dir}")
 
-    # 收集PCAP文件路径（只存路径字符串，不占内存）
+    # Collect PCAP file paths (paths only; do not open them yet).
     pcap_files = []
     for root, dirs, files in os.walk(args.pcap_dir):
         for file in files:
@@ -292,20 +269,20 @@ def main():
 
     print(f"Found {len(pcap_files)} PCAP files")
 
-    # 设置进程数
+    # Worker count.
     num_workers = args.num_workers if args.num_workers else cpu_count()
     print(f"Using {num_workers} worker processes")
 
-    # 准备多进程参数
-    task_args = [(pcap_file, args.bytes_per_packet, args.max_raw_packets, args.raw_token_type)
+    # Multiprocessing arguments.
+    task_args = [(pcap_file, args.bytes_per_packet, args.max_raw_packets)
                  for pcap_file in pcap_files]
 
-    # 确保输出目录存在
+    # Ensure output directories exist.
     for path in [args.output_raw, args.output_size]:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
-    # 流式处理：imap_unordered 逐个返回结果，立即写入磁盘
-    # 内存中同时只有 ~num_workers 个 flow 结果（进程池缓冲区）
+    # Streaming: imap_unordered yields one result at a time and we flush to disk
+    # immediately, so memory usage is bounded by the worker pool buffer.
     total_flows = 0
     failed = 0
 

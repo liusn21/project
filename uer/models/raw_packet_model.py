@@ -18,10 +18,6 @@ class RawPacketModel(nn.Module):
         self.encoder = encoder
         self.target = target
 
-        # Tie weights between token embedding and output layer if specified
-        if args.tie_weights:
-            self.target.mlm_linear_2.weight = self.embedding.token_embedding.weight
-
 
     def forward(self, src, tgt, packet_ids, directions):
         """

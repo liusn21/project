@@ -48,7 +48,7 @@ def compute_flow_reliability_raw(raw_src, pad_id=0, vocab_size=None):
     Compute flow-level reliability for raw modality (GPU-vectorized).
     r_stat = 1 - H(flow) / H_max
 
-    Encrypted payload has near-uniform bigram distribution → high entropy → low reliability.
+    Encrypted payload has near-uniform byte distribution → high entropy → low reliability.
     Plaintext has repeated patterns (HTTP headers, HTML) → low entropy → high reliability.
 
     Uses scatter_add for GPU-side bincount — no CPU transfer or Python loops.

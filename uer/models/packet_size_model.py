@@ -18,10 +18,6 @@ class PacketSizeModel(nn.Module):
         self.encoder = encoder
         self.target = target
 
-        # Tie weights between size token embedding and size output layer if specified
-        if args.tie_weights:
-            self.target.mlm_size_linear_2.weight = self.embedding.token_embedding.weight
-
 
     def forward(self, src, iat_tokens, tgt_mlm_size, tgt_mlm_temporal):
         """

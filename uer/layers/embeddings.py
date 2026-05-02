@@ -3,43 +3,12 @@ import math
 import torch.nn as nn
 from uer.layers.layer_norm import LayerNorm
 
-class WordPosSegEmbedding(nn.Module):
-    """
-    BERT embedding consists of three parts:
-    word embedding, position embedding, and segment embedding.
-    """
-    def __init__(self, args, vocab_size):
-        super(WordPosSegEmbedding, self).__init__()
-        self.remove_embedding_layernorm = args.remove_embedding_layernorm
-        self.dropout = nn.Dropout(args.dropout)
-        self.max_seq_length = args.max_seq_length
-        self.word_embedding = nn.Embedding(vocab_size, args.emb_size)
-        self.position_embedding = nn.Embedding(self.max_seq_length, args.emb_size)
-        self.segment_embedding = nn.Embedding(3, args.emb_size)
-        if not self.remove_embedding_layernorm:
-            self.layer_norm = LayerNorm(args.emb_size)
-
-    def forward(self, src, seg):
-        word_emb = self.word_embedding(src)
-        pos_emb = self.position_embedding(
-            torch.arange(0, word_emb.size(1), device=word_emb.device, dtype=torch.long)
-            .unsqueeze(0)
-            .repeat(word_emb.size(0), 1)
-        )
-        seg_emb = self.segment_embedding(seg)
-
-        emb = word_emb + pos_emb + seg_emb
-        if not self.remove_embedding_layernorm:
-            emb = self.layer_norm(emb)
-        emb = self.dropout(emb)
-        return emb
-
 class RawPacketEmbedding(nn.Module):
     """
     NEW Embedding for Raw Packet modality
 
     Components:
-    - Token embedding: bigram tokens (vocab_size from vocab file)
+    - Token embedding: byte tokens (vocab_size from vocab file)
     - Position embedding: sequence position
     - Packet embedding: which packet (0-7 for up to 8 packets, 8 for special tokens/padding)
     - Direction embedding: packet direction (0=downlink/-1, 1=neutral/padding, 2=uplink/1)

@@ -2,9 +2,9 @@
 Multi-Modal Fusion Module for Stage 2 Pretraining (ALBEF-style)
 
 Architecture:
-- 6层双向Cross-Attention Fusion
-- 每层包含: Self-Attention + Cross-Attention (双向) + FFN
-- 参考LXMERT的双向设计
+- 6-layer bidirectional cross-attention fusion stack
+- Each layer: Self-Attention + Cross-Attention (bidirectional) + FFN
+- Bidirectional design follows LXMERT.
 
 Gate mechanism - ITGCA (Information-Theoretic Gated Cross-Attention) — Asymmetric:
 - Size←Raw (Raw source, may degrade):
@@ -145,11 +145,11 @@ class ITGCrossAttentionGate(nn.Module):
 
 class BidirectionalFusionLayer(nn.Module):
     """
-    单层双向Cross-Attention Fusion
+    Single bidirectional cross-attention fusion layer.
 
-    结构:
-        Raw Branch:  Self-Attn → Cross-Attn(Q=raw, KV=size) → FFN
-        Size Branch: Self-Attn → Cross-Attn(Q=size, KV=raw) → FFN
+    Structure:
+        Raw Branch:  Self-Attn -> Cross-Attn(Q=raw, KV=size) -> FFN
+        Size Branch: Self-Attn -> Cross-Attn(Q=size, KV=raw) -> FFN
 
     Gate: ITGCA (use_itgca=True) provides information-theoretic per-position gating.
     """
@@ -371,9 +371,10 @@ class BidirectionalFusionLayer(nn.Module):
 
 class MultiModalFusionEncoder(nn.Module):
     """
-    多层双向Cross-Attention Fusion Encoder
+    Stacked bidirectional cross-attention fusion encoder.
 
-    包含多层BidirectionalFusionLayer，支持可选的ITGCA门控机制
+    Contains multiple BidirectionalFusionLayer modules and supports the
+    optional ITGCA gating mechanism.
     """
 
     def __init__(self, args, num_layers=6, use_itgca=False):

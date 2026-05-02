@@ -131,7 +131,7 @@ class Stage1Classifier(nn.Module):
 
         if tgt is not None:
             loss = nn.NLLLoss()(nn.LogSoftmax(dim=-1)(logits), tgt)
-            return loss.unsqueeze(0), logits  # 保持维度，避免 DataParallel 警告
+            return loss.unsqueeze(0), logits  # Keep 1-D shape to avoid DataParallel warnings.
         else:
             return None, logits
 
@@ -166,12 +166,12 @@ def load_pretrained_encoder(model, pretrained_path, encoder_type='raw'):
         emb_result = model.embedding_size.load_state_dict(embedding_state, strict=False)
         enc_result = model.encoder_size.load_state_dict(encoder_state, strict=False)
 
-    # 打印详细的加载信息
+    # Print detailed checkpoint-loading info.
     print(f"  Checkpoint keys: {len(state_dict)}")
     print(f"  Embedding params to load: {len(embedding_state)}")
     print(f"  Encoder params to load: {len(encoder_state)}")
 
-    # 检查是否全部加载成功
+    # Check whether all parameters were loaded successfully.
     emb_success = len(emb_result.missing_keys) == 0 and len(emb_result.unexpected_keys) == 0
     enc_success = len(enc_result.missing_keys) == 0 and len(enc_result.unexpected_keys) == 0
 
@@ -277,7 +277,7 @@ def evaluate(args, model, eval_data, print_confusion=False):
             pred = torch.argmax(logits, dim=-1)
 
             for p, g in zip(pred.cpu().tolist(), tgt.cpu().tolist()):
-                confusion[g, p] += 1  # [ground_truth, predicted] - 标准惯例
+                confusion[g, p] += 1  # [ground_truth, predicted] - standard convention
                 y_pred.append(p)
                 y_true.append(g)
 
@@ -309,11 +309,11 @@ def evaluate(args, model, eval_data, print_confusion=False):
         print("\nPer-class metrics:")
         eps = 1e-9
         for i in range(args.labels_num):
-            # confusion[g, p]: 行=ground_truth, 列=predicted
-            # Precision = TP / (TP + FP) = 预测为i的中有多少是对的
-            # Recall = TP / (TP + FN) = 真实为i的中有多少被预测对了
-            p = confusion[i, i].item() / (confusion[:, i].sum().item() + eps)  # 列和
-            r = confusion[i, i].item() / (confusion[i, :].sum().item() + eps)  # 行和
+            # confusion[g, p]: row=ground_truth, col=predicted
+            # Precision = TP / (TP + FP) = correct fraction among items predicted as i
+            # Recall    = TP / (TP + FN) = correct fraction among items truly i
+            p = confusion[i, i].item() / (confusion[:, i].sum().item() + eps)  # column sum
+            r = confusion[i, i].item() / (confusion[i, :].sum().item() + eps)  # row sum
             f1 = 2 * p * r / (p + r + eps)
             print(f"  Label {i}: P={p:.3f}, R={r:.3f}, F1={f1:.3f}")
 
@@ -332,24 +332,13 @@ def build_optimizer(args, model):
          'weight_decay': 0.0}
     ]
 
-    if args.optimizer in ["adamw"]:
-        optimizer = str2optimizer[args.optimizer](
-            optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False
-        )
-    else:
-        optimizer = str2optimizer[args.optimizer](
-            optimizer_grouped_parameters, lr=args.learning_rate,
-            scale_parameter=False, relative_step=False
-        )
+    optimizer = str2optimizer[args.optimizer](
+        optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False
+    )
 
-    if args.scheduler in ["constant"]:
-        scheduler = str2scheduler[args.scheduler](optimizer)
-    elif args.scheduler in ["constant_with_warmup"]:
-        scheduler = str2scheduler[args.scheduler](optimizer, args.train_steps * args.warmup)
-    else:
-        scheduler = str2scheduler[args.scheduler](
-            optimizer, args.train_steps * args.warmup, args.train_steps
-        )
+    scheduler = str2scheduler[args.scheduler](
+        optimizer, args.train_steps * args.warmup, args.train_steps
+    )
 
     return optimizer, scheduler
 
@@ -389,15 +378,6 @@ def main():
                         help="Total number of processes (GPUs) for training.")
     parser.add_argument("--gpu_ranks", default=[], nargs='+', type=int,
                         help="List of GPU ranks to use. E.g., --gpu_ranks 2 3 to use GPU 2 and 3.")
-
-    parser.add_argument("--is_moe", action="store_true", help="adopt moe layer.")
-    parser.add_argument("--vocab_size", type=int, required=False, help="Number of vocab.")
-    parser.add_argument("--moebert_expert_dim", type=int, required=False, default=3072, help="Dim of expert,default is ffn.")
-    parser.add_argument("--moebert_expert_num", type=int, required=False, help="Number of expert.")
-    parser.add_argument("--moebert_route_method", choices=["gate-token", "gate-sentence", "hash-random", "hash-balance","proto"], default="hash-random",
-                        help="moebert route method.")
-    parser.add_argument("--moebert_route_hash_list", default=None, type=str, help="Path of moebert hash list file.")
-    parser.add_argument("--moebert_load_balance", type=float, default=0.0, help="gate loss weight.")
 
     args = parser.parse_args()
 
@@ -497,7 +477,7 @@ def main():
 
     best_f1 = 0.0
     best_epoch = 0
-    patience_counter = 0  # 连续没有改进的 epoch 数
+    patience_counter = 0  # Number of consecutive epochs without improvement.
 
     for epoch in range(1, args.epochs_num + 1):
         print(f"\nEpoch {epoch}/{args.epochs_num}")

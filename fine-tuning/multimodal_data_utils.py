@@ -2,7 +2,7 @@
 Multi-Modal Fine-tuning Data Utilities
 
 PCAP processing and dataset creation for multi-modal traffic classification.
-Extracts both Raw Packet (bigram) and Packet Size features from pcap files.
+Extracts both Raw Packet (byte-level) and Packet Size features from pcap files.
 
 Input format: datasets/label_name/flow_file.pcap
   - Each pcap file represents one bidirectional flow
@@ -29,19 +29,17 @@ from uer.utils.vocab import Vocab
 from uer.utils.tokenizers import BertTokenizer
 from uer.utils.constants import CLS_TOKEN, SEP_TOKEN, PAD_ID
 
-# Pre-computed hex lookup tables (module-level constants)
-_BIGRAM_TABLE = [f"{i:02x}{j:02x}" for i in range(256) for j in range(256)]
+# Pre-computed hex lookup table (module-level constant)
 _BYTE_TABLE = [f"{i:02x}" for i in range(256)]
 
 
 class MultiModalFlowExtractor:
     """Extract multi-modal features from a single PCAP file"""
 
-    def __init__(self, bytes_per_packet=64, max_raw_packets=8, max_size_packets=256, raw_token_type='bigram'):
+    def __init__(self, bytes_per_packet=64, max_raw_packets=8, max_size_packets=256):
         self.bytes_per_packet = bytes_per_packet
         self.max_raw_packets = max_raw_packets
         self.max_size_packets = max_size_packets
-        self.raw_token_type = raw_token_type
         self.epsilon = 1e-6
 
     def extract_pcap(self, pcap_path):
@@ -49,7 +47,7 @@ class MultiModalFlowExtractor:
         Extract features from a PCAP file (streaming mode for efficiency)
 
         Returns:
-            dict with raw_bigrams, raw_directions, raw_packet_ids,
+            dict with raw_bytes_per_pkt, raw_directions, raw_packet_ids,
                  packet_sizes, size_directions, iat_tokens
             or None if extraction fails
         """
@@ -60,7 +58,7 @@ class MultiModalFlowExtractor:
         protocol, src_ip, src_port, dst_ip, dst_port = tuple_info
         flow_src = (src_ip, src_port)
 
-        raw_bigrams = []
+        raw_bytes_per_pkt = []
         raw_directions = []
         raw_packet_ids = []
         packet_sizes = []
@@ -84,8 +82,8 @@ class MultiModalFlowExtractor:
                     timestamp = float(packet.time)
 
                     if raw_packet_count < self.max_raw_packets:
-                        bigram_hex_list = self._bytes_to_hex_tokens(payload[:self.bytes_per_packet])
-                        raw_bigrams.append(bigram_hex_list)
+                        byte_hex_list = self._bytes_to_hex_tokens(payload[:self.bytes_per_packet])
+                        raw_bytes_per_pkt.append(byte_hex_list)
                         raw_directions.append(direction)
                         raw_packet_ids.append(raw_packet_count)
                         raw_packet_count += 1
@@ -104,7 +102,7 @@ class MultiModalFlowExtractor:
 
         return {
             'protocol': protocol,
-            'raw_bigrams': raw_bigrams,
+            'raw_bytes_per_pkt': raw_bytes_per_pkt,
             'raw_directions': raw_directions,
             'raw_packet_ids': raw_packet_ids,
             'packet_sizes': packet_sizes,
@@ -182,12 +180,8 @@ class MultiModalFlowExtractor:
             return None
 
     def _bytes_to_hex_tokens(self, payload_bytes):
-        """Convert bytes to hex token list using pre-computed lookup table."""
-        if self.raw_token_type == 'byte':
-            return [_BYTE_TABLE[b] for b in payload_bytes]
-        else:
-            return [_BIGRAM_TABLE[payload_bytes[i] * 256 + payload_bytes[i + 1]]
-                    for i in range(len(payload_bytes) - 1)]
+        """Convert bytes to byte-level hex tokens using a pre-computed lookup table."""
+        return [_BYTE_TABLE[b] for b in payload_bytes]
 
     def _compute_iat_tokens(self, timestamps):
         """Compute IAT tokens using numpy vectorization."""
@@ -211,7 +205,6 @@ def create_tokenizer(vocab_path):
     class Args:
         def __init__(self, vocab_path):
             self.vocab_path = vocab_path
-            self.spm_model_path = None
 
     args = Args(vocab_path)
     tokenizer = BertTokenizer(args, is_src=True, do_lower_case=True)
@@ -236,15 +229,11 @@ def _build_token_cache(tokenizer, token_strings):
     return cache
 
 
-def build_all_caches(tokenizer_raw, tokenizer_size, tokenizer_temporal, raw_token_type='bigram'):
+def build_all_caches(tokenizer_raw, tokenizer_size, tokenizer_temporal):
     """Build lookup caches for all three tokenizers (one-time cost)."""
     print("Building token caches...")
 
-    if raw_token_type == 'bigram':
-        raw_tokens = _BIGRAM_TABLE
-    else:
-        raw_tokens = _BYTE_TABLE
-    raw_cache = _build_token_cache(tokenizer_raw, raw_tokens)
+    raw_cache = _build_token_cache(tokenizer_raw, _BYTE_TABLE)
     print(f"  Raw cache: {len(raw_cache)} entries")
 
     size_cache = _build_token_cache(tokenizer_size, [str(v) for v in range(3001)])
@@ -267,14 +256,14 @@ def _tokenize_raw_cached(flow_data, raw_cache, seq_length_raw,
     token_packet_ids = []
     token_directions = []
 
-    for pkt_idx, (bigrams, direction) in enumerate(
-            zip(flow_data['raw_bigrams'], flow_data['raw_directions'])):
+    for pkt_idx, (byte_tokens, direction) in enumerate(
+            zip(flow_data['raw_bytes_per_pkt'], flow_data['raw_directions'])):
         if pkt_idx >= 8:
             break
 
         dir_idx = 0 if direction == -1 else 2
-        for bigram in bigrams:
-            ids = raw_cache.get(bigram)
+        for byte_tok in byte_tokens:
+            ids = raw_cache.get(byte_tok)
             if ids is None:
                 continue
             for token_id in ids:
@@ -450,12 +439,12 @@ def tokenize_raw_flow(flow_data, tokenizer_raw, seq_length_raw):
     token_packet_ids = []
     token_directions = []
 
-    for pkt_idx, (bigrams, direction) in enumerate(zip(flow_data['raw_bigrams'], flow_data['raw_directions'])):
+    for pkt_idx, (byte_tokens, direction) in enumerate(zip(flow_data['raw_bytes_per_pkt'], flow_data['raw_directions'])):
         if pkt_idx >= 8:
             break
 
-        bigram_str = ' '.join(bigrams)
-        pkt_tokens = tokenizer_raw.tokenize(bigram_str)
+        byte_str = ' '.join(byte_tokens)
+        pkt_tokens = tokenizer_raw.tokenize(byte_str)
         pkt_token_ids = tokenizer_raw.convert_tokens_to_ids(pkt_tokens)
 
         dir_idx = 0 if direction == -1 else 2
@@ -565,7 +554,7 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
                     bytes_per_packet=64, max_raw_packets=8, max_size_packets=256,
                     min_samples_per_class=10, max_samples_per_class=500,
                     train_ratio=0.8, val_ratio=0.1, test_ratio=0.1,
-                    seed=42, test_dir=None, raw_token_type='bigram',
+                    seed=42, test_dir=None,
                     num_workers=None):
     """
     Process all PCAP files in dataset directory with parallel processing.
@@ -587,7 +576,6 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
         test_ratio: Ratio of test data (ignored when test_dir is specified)
         seed: Random seed
         test_dir: Separate test directory
-        raw_token_type: 'bigram' or 'byte'
         num_workers: Number of parallel workers (default: cpu_count - 1)
 
     Returns:
@@ -599,14 +587,13 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
 
     # Build token caches (one-time cost, eliminates tokenizer overhead)
     raw_cache, size_cache, iat_cache = build_all_caches(
-        tokenizer_raw, tokenizer_size, tokenizer_temporal, raw_token_type
+        tokenizer_raw, tokenizer_size, tokenizer_temporal
     )
 
     extractor_params = {
         'bytes_per_packet': bytes_per_packet,
         'max_raw_packets': max_raw_packets,
         'max_size_packets': max_size_packets,
-        'raw_token_type': raw_token_type
     }
 
     vocab_raw = tokenizer_raw.vocab
@@ -794,8 +781,6 @@ def main():
     parser.add_argument('--bytes_per_packet', type=int, default=64)
     parser.add_argument('--max_raw_packets', type=int, default=8)
     parser.add_argument('--max_size_packets', type=int, default=256)
-    parser.add_argument('--raw_token_type', type=str, choices=['bigram', 'byte'], default='bigram',
-                        help='Raw tokenization: bigram (65K vocab, default) or byte (256 vocab)')
 
     # Dataset filtering
     parser.add_argument('--min_samples_per_class', type=int, default=10)
@@ -842,7 +827,6 @@ def main():
         test_ratio=args.test_ratio,
         seed=args.seed,
         test_dir=args.test_dir,
-        raw_token_type=args.raw_token_type,
         num_workers=args.num_workers
     )
 
