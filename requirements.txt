@@ -1,9 +1,5 @@
-jieba==0.42.1
-matplotlib==3.10.7
 numpy==2.4.4
 packaging==25.0
 scapy==2.6.1
 scikit_learn==1.7.2
-sentencepiece==0.2.1
-six==1.17.0
 tqdm==4.67.1 

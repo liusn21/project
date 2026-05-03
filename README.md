@@ -36,7 +36,40 @@ The three vocabularies under `models/bert/` are deterministic and shipped with t
 
 ---
 
-## 2. Setup
+## 2. Released artifacts (Zenodo)
+
+The Stage 2 multimodal pretrained checkpoint and the per-dataset fine-tuning splits used in the paper are hosted on Zenodo, because anonymous.4open.science enforces a per-file size limit too small for these artifacts. Anonymous deposit:
+
+    https://doi.org/10.5281/zenodo.19992866
+
+Layout of the deposit:
+
+```
+zenodo_release/
+├── pretrain.bin                       Stage 2 multimodal pretrained checkpoint
+└── datasets/
+    ├── AnonProxy/                     train.pkl, val.pkl, test.pkl, label2id.pkl
+    ├── Appsniffer/                      (same four files in each subdirectory)
+    ├── cstnet-tls/
+    ├── datacon2021-p2/
+    ├── browser/
+    └── ITC-Net-Blend/
+```
+
+To follow the commands in §5 / §6 verbatim, unpack the deposit so that:
+
+```
+project/models/mm_trafficbert.bin                                    ← from pretrain.bin
+project/data/finetune/<task>/processed/{train,val,test,label2id}.pkl ← from datasets/<dataset_name>/
+```
+
+Equivalently, leave the layout flat and pass absolute paths to the scripts.
+
+The pickles are pre-tokenized with the byte / size / temporal vocabularies under `models/bert/`. Reviewers who want to verify downstream numbers without redoing pre-training (§4) can start directly from §5 (fine-tuning) using these artifacts.
+
+---
+
+## 3. Setup
 
 Hardware used in the paper: 4 × NVIDIA A100 80 GB. Software: PyTorch 2.9.1 + CUDA 13.0.
 
@@ -53,7 +86,7 @@ and discards flows with fewer than 5 payload-bearing packets (consistent with th
 
 ---
 
-## 3. Pre-training
+## 4. Pre-training
 
 End-to-end pipeline:
 
@@ -65,7 +98,7 @@ raw pcap dir  ──► [pcap_process]  ──►  per-flow pcap dir
                                         Stage 2 dataset.pt   ──► [pretrain.py --target multimodal ]  ──► mm_trafficbert.bin
 ```
 
-### 3.1 Split pcaps into per-flow pcaps
+### 4.1 Split pcaps into per-flow pcaps
 
 Put **all** raw pcaps anywhere under one directory tree (subdirectories OK — `pcap_process` recursively scans). For pre-training use the **default mode** (no `-l`), which writes one output sub-directory per input pcap:
 
@@ -73,7 +106,7 @@ Put **all** raw pcaps anywhere under one directory tree (subdirectories OK — `
 ./data_generation/pcap_process /path/to/pretrain_pcaps/ /path/to/pretrain_flows/
 ```
 
-### 3.2 Build the text corpora
+### 4.2 Build the text corpora
 
 ```bash
 python3 data_generation/multimodal_data_gen.py \
@@ -83,7 +116,7 @@ python3 data_generation/multimodal_data_gen.py \
     --num_workers      32
 ```
 
-### 3.3 Preprocess into `.pt`
+### 4.3 Preprocess into `.pt`
 
 ```bash
 # Stage 1 — content (raw bytes, 12-layer encoder)
@@ -122,7 +155,7 @@ python3 pre-training/preprocess.py \
     --dynamic_masking
 ```
 
-### 3.4 Stage 1 — unimodal pre-training
+### 4.4 Stage 1 — unimodal pre-training
 
 ```bash
 # Content encoder (12 layers)
@@ -153,7 +186,7 @@ python3 pre-training/pretrain.py \
     --master_ip tcp://localhost:12345
 ```
 
-### 3.5 Stage 2 — multimodal pre-training
+### 4.5 Stage 2 — multimodal pre-training
 
 ```bash
 python3 pre-training/pretrain.py \
@@ -178,7 +211,7 @@ python3 pre-training/pretrain.py \
     --master_ip tcp://localhost:12345
 ```
 
-### 3.6 OOM mitigation: gradient accumulation
+### 4.6 OOM mitigation: gradient accumulation
 
 Stage 2 is the most memory-hungry step (two encoders + 6-layer fusion + momentum encoders + 4096-entry queue + ITM hard negatives that triple the fused-CLS forward pass). On smaller GPUs, reduce `--batch_size` and compensate with `--accumulation_steps` to keep the effective batch fixed:
 
@@ -205,7 +238,7 @@ These flags must be passed identically at fine-tune time so that loaded checkpoi
 
 ---
 
-## 4. Fine-tuning
+## 5. Fine-tuning
 
 End-to-end pipeline:
 
@@ -215,7 +248,7 @@ labelled pcap dir  ──► [pcap_process -l]  ──►  per-label flow pcap d
                   ──► [run_classifier_stage2.py]   ──►  finetuned classifier
 ```
 
-### 4.1 Split pcaps, preserving label directories
+### 5.1 Split pcaps, preserving label directories
 
 The fine-tuning input is a directory whose immediate sub-directories are class names:
 
@@ -232,7 +265,7 @@ Use **label mode** so that the output preserves the same class layout:
 ./data_generation/pcap_process -l /path/to/finetune_input/ /path/to/finetune_flows/
 ```
 
-### 4.2 Build train/val/test pickles
+### 5.2 Build train/val/test pickles
 
 ```bash
 python3 fine-tuning/multimodal_data_utils.py \
@@ -248,7 +281,7 @@ python3 fine-tuning/multimodal_data_utils.py \
 
 Outputs four files in `--output_dir`: `train.pkl`, `val.pkl`, `test.pkl`, `label2id.pkl`. The split is per-class stratified at the flow level so that all packets of the same flow stay in one split.
 
-### 4.3 Stage 2 multimodal fine-tuning
+### 5.3 Stage 2 multimodal fine-tuning
 
 The paper uses two-phase training: **Phase 1** (5 epochs) freezes the backbone and warms up the classifier head; **Phase 2** (10 epochs) unfreezes everything with layer-wise LR decay (encoder 0.3 ×, fusion 0.7 ×, classifier 1 ×). Base LR 5e-5, AdamW.
 
@@ -276,13 +309,13 @@ python3 fine-tuning/run_classifier_stage2.py \
 
 Important: every `--use_itgca / --ablate_*` / `--num_fusion_layers` / `--itgca_window_size` flag here **must match the value used at Stage 2 pre-training** — otherwise the gate parameters in the checkpoint cannot be loaded. The classifier prints a warning if it detects a mismatch.
 
-### 4.4 Few-shot fine-tuning
+### 5.4 Few-shot fine-tuning
 
 Pass `--few_shot 0.1` (or 0.4 / 0.7) to use a stratified sub-sample of the training set, matching Section 5.3 of the paper. Validation and test sets are not affected.
 
 ---
 
-## 5. Inference and analysis
+## 6. Inference and analysis
 
 ```bash
 # Standard inference on a held-out test pickle
@@ -301,6 +334,6 @@ python3 fine-tuning/run_inference.py \
 ---
 
 
-## 6. Acknowledgement
+## 7. Acknowledgement
 
 This codebase is built on top of [UER-py](https://github.com/dbiir/UER-py) . We thank the authors for releasing high-quality reference implementations.
