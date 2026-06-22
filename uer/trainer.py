@@ -1,4 +1,5 @@
 import time
+import contextlib
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -110,6 +111,13 @@ def train_and_validate(args):
                     if any(ip in n for ip in itgca_param_names):
                         continue  # Preserve ITGCA-specific initialization
                     p.data.normal_(0, 0.02)
+        # Hard-sync momentum encoders/projections from their online counterparts
+        # AFTER the blanket re-init above. The ITC projection heads are deep-copied
+        # at model construction, but their online versions are re-initialized in the
+        # loop above — without this re-sync the momentum (teacher) projections would
+        # start desynced from the online (student) ones, corrupting the ITC target
+        # space for the first thousands of steps.
+        model.init_momentum_encoders()
     else:
         # Initialize with normal distribution.
         for n, p in list(model.named_parameters()):
@@ -147,7 +155,7 @@ class Trainer(object):
         self.batch_size = args.batch_size
         self.world_size = args.world_size
 
-    def forward_propagation(self, batch, model):
+    def forward_propagation(self, batch, model, update_momentum=True):
         raise NotImplementedError
 
     def report_and_reset_stats(self):
@@ -165,28 +173,48 @@ class Trainer(object):
         while True:
             if self.current_step == self.total_steps + 1:
                 break
-            batch = list(next(loader_iter))
-            self.seq_length = batch[0].size(1)
-            if gpu_id is not None:
-                for i in range(len(batch)):
-                    batch[i] = batch[i].cuda(gpu_id)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                loss = self.forward_propagation(batch, model)
+            # ----- Gradient accumulation over `accumulation_steps` micro-batches -----
+            # current_step counts OPTIMIZER steps; each consumes accumulation_steps
+            # micro-batches. total_steps / LR schedule / warmup / report / save are all
+            # in optimizer-step units, so accumulation_steps=k with a 1/k batch is truly
+            # equivalent to one large batch: same #updates, full LR decay (no truncated
+            # tail), no silent under-training.
+            for micro in range(self.accumulation_steps):
+                batch = list(next(loader_iter))
+                self.seq_length = batch[0].size(1)
+                if gpu_id is not None:
+                    for i in range(len(batch)):
+                        batch[i] = batch[i].cuda(gpu_id)
 
-            scaler.scale(loss).backward()
+                is_last_micro = (micro == self.accumulation_steps - 1)
 
-            if self.current_step % self.accumulation_steps == 0:
-                if hasattr(args, 'clip_grad_norm') and args.clip_grad_norm > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), args.clip_grad_norm
-                    )
+                # Under DDP, all-reduce gradients only on the LAST micro-batch of the
+                # group; earlier ones accumulate locally via no_sync() to avoid wasting
+                # accumulation_steps× the inter-GPU communication.
+                if self.dist_train and not is_last_micro:
+                    sync_context = model.no_sync()
+                else:
+                    sync_context = contextlib.nullcontext()
 
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                model.zero_grad()
+                with sync_context:
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        # Momentum (ALBEF teacher) encoders are EMA-updated once per
+                        # optimizer step → only on the last micro-batch of the group.
+                        loss = self.forward_propagation(batch, model,
+                                                        update_momentum=is_last_micro)
+                    scaler.scale(loss).backward()
+
+            if hasattr(args, 'clip_grad_norm') and args.clip_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.clip_grad_norm
+                )
+
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            model.zero_grad()
 
             if self.current_step % self.report_steps == 0 and \
                     (not self.dist_train or (self.dist_train and rank == 0)):
@@ -210,7 +238,9 @@ class RawPacketMlmTrainer(Trainer):
         self.total_correct_mlm = 0.0
         self.total_denominator = 0.0
 
-    def forward_propagation(self, batch, model):
+    def forward_propagation(self, batch, model, update_momentum=True):
+        # update_momentum is unused here (Stage 1 has no momentum encoder); accepted
+        # for a uniform Trainer.train() calling convention.
         src, tgt_mlm, packet_ids, directions = batch
         loss_mlm, correct_mlm, denominator = model(src, tgt_mlm, packet_ids, directions)
 
@@ -223,7 +253,7 @@ class RawPacketMlmTrainer(Trainer):
         return loss
 
     def report_and_reset_stats(self):
-        done_tokens = self.batch_size * self.seq_length * self.report_steps
+        done_tokens = self.batch_size * self.seq_length * self.report_steps * self.accumulation_steps
         if self.dist_train:
             done_tokens *= self.world_size
 
@@ -236,7 +266,7 @@ class RawPacketMlmTrainer(Trainer):
             self.total_steps,
             (time.time() - self.start_time),
             done_tokens / (time.time() - self.start_time),
-            self.total_loss_mlm / self.report_steps,
+            self.total_loss_mlm / (self.report_steps * self.accumulation_steps),
             self.total_correct_mlm / self.total_denominator))
 
         self.total_loss = 0.0
@@ -269,7 +299,8 @@ class PacketSizeMlmTrainer(Trainer):
         self.lambda_mlm_size = getattr(args, 'lambda_mlm_size', 1.0)
         self.lambda_mlm_temporal = getattr(args, 'lambda_mlm_temporal', 1.0)
 
-    def forward_propagation(self, batch, model):
+    def forward_propagation(self, batch, model, update_momentum=True):
+        # update_momentum is unused here (Stage 1 has no momentum encoder).
         # Check if batch has temporal info (4 tensors) or legacy format (2 tensors)
         if len(batch) == 4:
             # New format with temporal: (src_size, src_iat, tgt_mlm_size, tgt_mlm_temporal)
@@ -308,7 +339,7 @@ class PacketSizeMlmTrainer(Trainer):
         return loss
 
     def report_and_reset_stats(self):
-        done_tokens = self.batch_size * self.seq_length * self.report_steps
+        done_tokens = self.batch_size * self.seq_length * self.report_steps * self.accumulation_steps
         if self.dist_train:
             done_tokens *= self.world_size
 
@@ -326,9 +357,9 @@ class PacketSizeMlmTrainer(Trainer):
             self.total_steps,
             (time.time() - self.start_time),
             done_tokens / (time.time() - self.start_time),
-            self.total_loss_mlm_size / self.report_steps,
+            self.total_loss_mlm_size / (self.report_steps * self.accumulation_steps),
             self.total_correct_mlm_size / (self.total_denominator_size + 1e-6),
-            self.total_loss_mlm_temporal / self.report_steps,
+            self.total_loss_mlm_temporal / (self.report_steps * self.accumulation_steps),
             self.total_correct_mlm_temporal_exact / (self.total_denominator_temporal + 1e-6),
             self.total_correct_mlm_temporal_range / (self.total_denominator_temporal + 1e-6)))
 
@@ -380,10 +411,14 @@ class MultiModalTrainer(Trainer):
         self.lambda_recon_size = getattr(args, 'lambda_recon_size', 1.0)
         self.lambda_recon_temporal = getattr(args, 'lambda_recon_temporal', 1.0)
 
+        # ALBEF ITC momentum-distillation weight (ramped over the LR-warmup window)
+        self.itc_alpha = getattr(args, 'itc_alpha', 0.4)
+        self.itc_alpha_current = 0.0
+
         # Count batches for averaging
         self.batch_count = 0
 
-    def forward_propagation(self, batch, model):
+    def forward_propagation(self, batch, model, update_momentum=True):
         """
         Forward pass for ALBEF-style multimodal pretraining with Masked Reconstruction
 
@@ -399,12 +434,19 @@ class MultiModalTrainer(Trainer):
          size_src_clean, iat_src_clean, size_src_masked, iat_src_masked,
          tgt_mlm_size, tgt_mlm_temporal) = batch
 
+        # ALBEF momentum-distillation weight, linearly ramped 0 -> itc_alpha over the
+        # LR-warmup window (the momentum teacher's projection is least reliable early).
+        warmup_steps = max(1, int(self.total_steps * getattr(self.args, 'warmup', 0.1)))
+        alpha = self.itc_alpha * min(1.0, self.current_step / warmup_steps)
+        self.itc_alpha_current = alpha
+
         # Forward through model (must call through DDP wrapper for gradient synchronization)
         loss_dict = model(
             raw_src, raw_packet_ids, raw_directions,
             size_src_clean, iat_src_clean,
             size_src_masked, iat_src_masked,
-            tgt_mlm_size, tgt_mlm_temporal
+            tgt_mlm_size, tgt_mlm_temporal,
+            itc_alpha=alpha, update_momentum=update_momentum
         )
 
         # Extract losses
@@ -439,7 +481,7 @@ class MultiModalTrainer(Trainer):
         return loss
 
     def report_and_reset_stats(self):
-        done_tokens = self.batch_size * self.seq_length * self.report_steps
+        done_tokens = self.batch_size * self.seq_length * self.report_steps * self.accumulation_steps
         if self.dist_train:
             done_tokens *= self.world_size
 
@@ -462,6 +504,7 @@ class MultiModalTrainer(Trainer):
             " | {:3.1f}s".format(time.time() - self.start_time),
             " | loss {:5.2f}".format(avg_loss),
             " | itc: {:4.2f}".format(avg_loss_itc),
+            " | itc_a: {:4.2f}".format(self.itc_alpha_current),
             " | itm: {:4.2f}".format(avg_loss_itm),
             " | rc_sz: {:4.2f}".format(avg_loss_recon_sz),
             " | rc_tp: {:4.2f}".format(avg_loss_recon_tp),
@@ -560,10 +603,22 @@ def worker(proc_id, gpu_ranks, args, model):
         other_params_decay = []
         other_params_no_decay = []
         calibration_params = []
+        gate_matrix_params = []
+        gate_scalar_params = []
 
         # ITGCA calibration parameter names — need higher LR, no weight decay
         calibration_names = ('stat_scale', 'stat_shift',
                              'local_stat_scale', 'local_stat_shift')
+
+        # ITGCA "learned gate" parameters. Previously these fell into the base-LR
+        # groups (some with weight decay); combined with their small init (bilinear
+        # gain, beta=sigmoid(alpha)~0.12) the gradient reaching them is ~0.03x, so they
+        # barely moved in 100K steps and ITGCA degraded to a pure entropy prior. Give
+        # them a higher LR and no weight decay so the learned gate actually trains and
+        # beta can grow over training (realizing the intended prior->learned curriculum).
+        # Weight matrices get a milder multiplier than the scalars.
+        gate_matrix_names = ('bilinear_W', 'W_k', 'W_v')
+        gate_scalar_names = ('alpha_modality', 'token_gate_bias', 'bilinear_bias')
 
         for n, p in param_optimizer:
             if not p.requires_grad:
@@ -575,9 +630,15 @@ def worker(proc_id, gpu_ranks, args, model):
                               "_m" not in n)  # Exclude momentum encoders
             is_no_decay = any(nd in n for nd in no_decay)
             is_calibration = any(cn in n for cn in calibration_names)
+            is_gate_matrix = any(gn in n for gn in gate_matrix_names)
+            is_gate_scalar = any(gn in n for gn in gate_scalar_names)
 
             if is_calibration:
                 calibration_params.append(p)
+            elif is_gate_matrix:
+                gate_matrix_params.append(p)
+            elif is_gate_scalar:
+                gate_scalar_params.append(p)
             elif is_main_encoder:
                 if is_no_decay:
                     encoder_params_no_decay.append(p)
@@ -589,13 +650,17 @@ def worker(proc_id, gpu_ranks, args, model):
                 else:
                     other_params_decay.append(p)
 
-        calibration_lr = args.learning_rate * 10  # 10× higher LR for calibration
+        calibration_lr = args.learning_rate * 10  # 10× higher LR for entropy calibration
+        gate_matrix_lr = args.learning_rate * 3   # learned-gate weight matrices (bilinear_W, W_k, W_v)
+        gate_scalar_lr = args.learning_rate * 5   # learned-gate scalars (alpha, token_gate_bias, bilinear_bias)
         optimizer_grouped_parameters = [
             {"params": encoder_params_decay, "lr": encoder_lr, "weight_decay": 0.01},
             {"params": encoder_params_no_decay, "lr": encoder_lr, "weight_decay": 0.0},
             {"params": other_params_decay, "lr": args.learning_rate, "weight_decay": 0.01},
             {"params": other_params_no_decay, "lr": args.learning_rate, "weight_decay": 0.0},
             {"params": calibration_params, "lr": calibration_lr, "weight_decay": 0.0},
+            {"params": gate_matrix_params, "lr": gate_matrix_lr, "weight_decay": 0.0},
+            {"params": gate_scalar_params, "lr": gate_scalar_lr, "weight_decay": 0.0},
         ]
 
         print(f"  Encoder params (lr={encoder_lr:.2e}): "
@@ -603,6 +668,8 @@ def worker(proc_id, gpu_ranks, args, model):
         print(f"  Other params (lr={args.learning_rate:.2e}): "
               f"{len(other_params_decay)} decay, {len(other_params_no_decay)} no_decay")
         print(f"  Calibration params (lr={calibration_lr:.2e}, no wd): {len(calibration_params)}")
+        print(f"  Gate matrix params (lr={gate_matrix_lr:.2e}, no wd): {len(gate_matrix_params)}")
+        print(f"  Gate scalar params (lr={gate_scalar_lr:.2e}, no wd): {len(gate_scalar_params)}")
     else:
         # Non-multimodal: all parameters use same learning rate
         optimizer_grouped_parameters = [

@@ -247,6 +247,35 @@ class MultiModalModel(nn.Module):
             param_m.data = param_m.data * self.momentum + param.data * (1.0 - self.momentum)
 
     @torch.no_grad()
+    def init_momentum_encoders(self):
+        """
+        Hard-copy every online module into its momentum counterpart.
+
+        Must be called ONCE after (a) Stage-1 weights are loaded into the online
+        encoders and (b) the trainer's blanket re-initialization of all
+        non-pretrained parameters. The ITC projection heads (itc_proj_*_m) are
+        deep-copied at construction time, but their online versions are
+        re-initialized later in the trainer; without this re-sync the momentum
+        (teacher) projections would start from a different random init than the
+        online (student) ones, corrupting the ITC contrastive target for the
+        first thousands of steps. Encoders/embeddings are already identical
+        (loaded into both online and momentum), so copying them is a harmless
+        no-op that also future-proofs against any further desync.
+        """
+        module_pairs = [
+            (self.embedding_raw, self.embedding_raw_m),
+            (self.encoder_raw, self.encoder_raw_m),
+            (self.embedding_size, self.embedding_size_m),
+            (self.encoder_size, self.encoder_size_m),
+            (self.target.itc_proj_raw, self.itc_proj_raw_m),
+            (self.target.itc_proj_size, self.itc_proj_size_m),
+        ]
+        for online, momentum in module_pairs:
+            for p, p_m in zip(online.parameters(), momentum.parameters()):
+                p_m.data.copy_(p.data)
+                p_m.requires_grad = False
+
+    @torch.no_grad()
     def _dequeue_and_enqueue(self, raw_feat, size_feat):
         """Update feature queues with new features."""
         batch_size = raw_feat.size(0)
@@ -306,7 +335,7 @@ class MultiModalModel(nn.Module):
     def forward(self, raw_src, raw_packet_ids, raw_directions,
                 size_src_clean, iat_src_clean,
                 size_src_masked, iat_src_masked,
-                tgt_mlm_size, tgt_mlm_temporal):
+                tgt_mlm_size, tgt_mlm_temporal, itc_alpha=0.0, update_momentum=True):
         """
         Forward pass for training with Masked Reconstruction (ALBEF-style).
 
@@ -362,14 +391,19 @@ class MultiModalModel(nn.Module):
             raw_cls_m_proj = F.normalize(self.itc_proj_raw_m(raw_cls_m), dim=-1)
             size_cls_m_proj = F.normalize(self.itc_proj_size_m(size_cls_m), dim=-1)
 
-            self._momentum_update()
+            # EMA update once per OPTIMIZER step: only the last micro-batch of an
+            # accumulation group passes update_momentum=True. This keeps the teacher
+            # constant within a group and makes the EMA rate independent of
+            # accumulation_steps (with accum=1, update_momentum is always True).
+            if update_momentum:
+                self._momentum_update()
 
         # ===== Step 4: ITC Loss =====
         itc_loss, sim_r2s, sim_s2r = self.target.forward_itc(
             raw_cls, size_cls,
             raw_cls_m_proj, size_cls_m_proj,
             self.raw_queue, self.size_queue,
-            temperature=self.itc_temp
+            temperature=self.itc_temp, alpha=itc_alpha
         )
 
         # ===== Step 5: Update Queues =====

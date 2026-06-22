@@ -148,6 +148,13 @@ def main():
     parser.add_argument("--itm_temperature", type=float, default=0.07,
                         help="Temperature for ITM hard negative sampling.")
 
+    # ITC momentum distillation (ALBEF). alpha=0 disables it (pure hard-label
+    # InfoNCE); alpha>0 mixes in soft targets from the momentum model. The value
+    # is linearly ramped from 0 to itc_alpha over the LR-warmup window.
+    parser.add_argument("--itc_alpha", type=float, default=0.4,
+                        help="Max weight for ITC momentum-distillation soft targets "
+                             "(ALBEF). 0 = disabled (hard-label InfoNCE only).")
+
     # Temporal soft-label parameters
     parser.add_argument("--temporal_sigma", type=float, default=10,
                         help="Standard deviation for temporal soft-label KL loss. "
