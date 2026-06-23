@@ -49,6 +49,7 @@ import random
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pickle
 from tqdm import tqdm
 import numpy as np
@@ -67,6 +68,35 @@ from uer.opts import finetune_opts
 from uer.models.multimodal_model import (
     compute_flow_reliability_raw, compute_local_entropy
 )
+
+
+class ClassifierHead(nn.Module):
+    """
+    Two-layer MLP head with optional multi-sample dropout (item 5).
+
+    With msd_num > 1 at train time, the (Dropout -> output Linear) is resampled
+    msd_num times from the SAME pre-dropout features and the per-sample logits are
+    returned stacked as [batch, msd_num, labels]; the caller averages the per-sample
+    cross-entropy (Inoue 2019). At eval time (dropout off) it returns [batch, labels].
+    The batch dim stays first so DataParallel gathers correctly. Kept under the
+    attribute name `classifier` so existing name-based grouping/freezing is unchanged.
+    """
+
+    def __init__(self, in_dim, hidden, labels_num, dropout, msd_num=1):
+        super(ClassifierHead, self).__init__()
+        self.dense = nn.Linear(in_dim, hidden)
+        self.act = nn.Tanh()
+        self.dropout = nn.Dropout(dropout)
+        self.out = nn.Linear(hidden, labels_num)
+        self.msd_num = msd_num
+
+    def forward(self, x):
+        h = self.act(self.dense(x))
+        if self.training and self.msd_num > 1:
+            return torch.stack(
+                [self.out(self.dropout(h)) for _ in range(self.msd_num)], dim=1
+            )  # [batch, msd_num, labels]
+        return self.out(self.dropout(h))
 
 
 class Stage2Classifier(nn.Module):
@@ -119,11 +149,11 @@ class Stage2Classifier(nn.Module):
         self.fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_itgca=self.use_itgca)
 
         # Classification head: 4 * hidden_size -> hidden_size -> labels_num.
-        self.classifier = nn.Sequential(
-            nn.Linear(4 * args.hidden_size, args.hidden_size),
-            nn.Tanh(),
-            nn.Dropout(args.dropout),
-            nn.Linear(args.hidden_size, labels_num)
+        # Multi-sample dropout (item 5) is folded into the head; msd_num == 1 keeps
+        # the original single-sample behavior.
+        msd_num = getattr(args, 'msd_num', 1) if getattr(args, 'use_msd', False) else 1
+        self.classifier = ClassifierHead(
+            4 * args.hidden_size, args.hidden_size, labels_num, args.dropout, msd_num=msd_num
         )
 
     def forward(self, raw_src, packet_ids, directions, size_src, iat_src):
@@ -299,8 +329,129 @@ def batch_loader(batch_size, dataset_tensors, shuffle=False):
                dataset_tensors['label'][idx])
 
 
-def train_epoch(args, model, optimizer, scheduler, train_data_tensors, criterion, scaler=None):
-    """Train for one epoch (with optional AMP via scaler)."""
+class ModelEMA:
+    """
+    Exponential moving average of model parameters (item 1; always on in Phase 2).
+
+    decay is ramped as min(decay, (1+t)/(10+t)) so the average is not pinned near the
+    post-Phase-1 weights early in the short fine-tuning schedule. The model has only
+    LayerNorm (no BatchNorm), so no running-stat recomputation is needed. The shadow
+    is held in fp32 (params are fp32 even under AMP).
+    """
+
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.num_updates = 0
+        m = model.module if hasattr(model, 'module') else model
+        self.shadow = {n: p.detach().clone().float() for n, p in m.named_parameters()}
+        self.backup = {}
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        d = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+        m = model.module if hasattr(model, 'module') else model
+        for n, p in m.named_parameters():
+            if p.requires_grad:
+                self.shadow[n].mul_(d).add_(p.detach().float(), alpha=1.0 - d)
+            else:
+                self.shadow[n].copy_(p.detach().float())
+
+    @torch.no_grad()
+    def store(self, model):
+        """Back up the current (online) params so they can be restored after EMA eval."""
+        m = model.module if hasattr(model, 'module') else model
+        self.backup = {n: p.detach().clone() for n, p in m.named_parameters()}
+
+    @torch.no_grad()
+    def copy_to(self, model):
+        """Load EMA params into the model (for eval / saving)."""
+        m = model.module if hasattr(model, 'module') else model
+        for n, p in m.named_parameters():
+            p.data.copy_(self.shadow[n].to(p.dtype))
+
+    @torch.no_grad()
+    def restore(self, model):
+        m = model.module if hasattr(model, 'module') else model
+        for n, p in m.named_parameters():
+            p.data.copy_(self.backup[n])
+        self.backup = {}
+
+
+class FGM:
+    """
+    Fast Gradient Method adversarial training (item 4; Phase 2 only).
+
+    Perturbs BOTH modalities' token embeddings along the normalized gradient
+    direction (epsilon * g / ||g||). The normalization makes the perturbation
+    scale-invariant, so it is correct under AMP/GradScaler (the loss-scale cancels).
+    ITGCA priors are computed from token IDs, not embeddings, so they stay identical
+    across the clean and adversarial passes.
+    """
+
+    DEFAULT_TARGETS = ('embedding_raw.token_embedding', 'embedding_size.token_embedding')
+
+    def __init__(self, model, epsilon, targets=DEFAULT_TARGETS):
+        self.model = model.module if hasattr(model, 'module') else model
+        self.epsilon = epsilon
+        self.targets = targets
+        self.backup = {}
+
+    @torch.no_grad()
+    def attack(self):
+        for name, p in self.model.named_parameters():
+            if (p.requires_grad and p.grad is not None
+                    and any(t in name for t in self.targets)):
+                norm = p.grad.norm()
+                if torch.isfinite(norm) and norm > 0:
+                    self.backup[name] = p.data.clone()
+                    p.data.add_(self.epsilon * p.grad / norm)
+
+    @torch.no_grad()
+    def restore(self):
+        for name, p in self.model.named_parameters():
+            if name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = {}
+
+
+def rdrop_kl_loss(logits1, logits2):
+    """Symmetric KL between two dropout views (item 6, R-Drop)."""
+    lp1 = F.log_softmax(logits1, dim=-1)
+    lp2 = F.log_softmax(logits2, dim=-1)
+    return 0.5 * (F.kl_div(lp1, lp2, log_target=True, reduction='batchmean')
+                  + F.kl_div(lp2, lp1, log_target=True, reduction='batchmean'))
+
+
+def compute_loss(args, model, inputs, tgt, criterion):
+    """
+    Unified per-batch loss honoring the item-5/6 switches.
+
+    - R-Drop (--use_rdrop): two independent dropout passes + alpha * symmetric KL.
+    - Multi-sample dropout (--use_msd): head returns [B, K, C]; average per-sample CE.
+    - Otherwise: plain cross-entropy.
+    MSD and R-Drop are mutually exclusive (asserted in main()).
+    """
+    if getattr(args, 'use_rdrop', False) and model.training:
+        logits1 = model(*inputs)
+        logits2 = model(*inputs)
+        ce = 0.5 * (criterion(logits1, tgt) + criterion(logits2, tgt))
+        return ce + args.rdrop_alpha * rdrop_kl_loss(logits1, logits2)
+
+    logits = model(*inputs)
+    if logits.dim() == 3:  # multi-sample dropout: [B, K, C]
+        k = logits.size(1)
+        loss = sum(criterion(logits[:, j, :], tgt) for j in range(k)) / k
+    else:
+        loss = criterion(logits, tgt)
+    if loss.dim() > 0:  # DataParallel reduction safety
+        loss = loss.mean()
+    return loss
+
+
+def train_epoch(args, model, optimizer, scheduler, train_data_tensors, criterion,
+                scaler=None, fgm=None, ema=None):
+    """Train for one epoch (optional AMP, FGM adversarial, and EMA update)."""
     model.train()
     total_loss = 0.0
     step = 0
@@ -314,17 +465,29 @@ def train_epoch(args, model, optimizer, scheduler, train_data_tensors, criterion
         size_src = size_src.to(args.device, non_blocking=True)
         iat_src = iat_src.to(args.device, non_blocking=True)
         tgt = tgt.to(args.device, non_blocking=True)
+        inputs = (raw_src, packet_ids, directions, size_src, iat_src)
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            logits = model(raw_src, packet_ids, directions, size_src, iat_src)
-            loss = criterion(logits, tgt)
-            if loss.dim() > 0:  # DataParallel reduction.
-                loss = torch.mean(loss)
-
+            loss = compute_loss(args, model, inputs, tgt, criterion)
         if use_amp:
             scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # FGM: perturb token embeddings, accumulate a second (adversarial) gradient.
+        if fgm is not None:
+            fgm.attack()
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                loss_adv = compute_loss(args, model, inputs, tgt, criterion)
+            if use_amp:
+                scaler.scale(loss_adv).backward()
+            else:
+                loss_adv.backward()
+            fgm.restore()
+
+        if use_amp:
             if args.max_grad_norm > 0:
                 scaler.unscale_(optimizer)
                 # Only clip when no inf/nan is present, to avoid inf*0 = NaN inside clip_grad_norm.
@@ -336,13 +499,14 @@ def train_epoch(args, model, optimizer, scheduler, train_data_tensors, criterion
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss.backward()
             if args.max_grad_norm > 0:
                 params = (model.module if hasattr(model, 'module') else model).parameters()
                 torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
             optimizer.step()
 
         scheduler.step()
+        if ema is not None:
+            ema.update(model)
 
         total_loss += loss.item()
         step += 1
@@ -454,7 +618,7 @@ def build_phase1_optimizer(args, model, num_train_samples):
     ]
 
     optimizer = str2optimizer["adamw"](
-        optimizer_grouped_parameters, lr=args.phase1_lr, correct_bias=False
+        optimizer_grouped_parameters, lr=args.phase1_lr, correct_bias=True
     )
 
     train_steps = max(1, int(num_train_samples * args.phase1_epochs / args.batch_size) + 1)
@@ -468,70 +632,85 @@ def build_phase1_optimizer(args, model, num_train_samples):
 
 def build_phase2_optimizer(args, model):
     """
-    Build the Phase 2 optimizer/scheduler with layer-wise LR decay (paper §4.1.4):
-        encoder LR = base_lr * --llrd_encoder_ratio
-        fusion  LR = base_lr * --llrd_fusion_ratio
-        classifier LR = base_lr
+    Phase 2 optimizer/scheduler with two LR anchors + optional per-layer LLRD (item 3).
 
-    ITGCA calibration parameters (`stat_scale / stat_shift / local_stat_scale /
-    local_stat_shift`) are kept on a separate, faster LR group (5 x fusion_lr,
-    no weight decay) since they parameterize a sigmoid mapping and need a higher
-    LR to escape saturation.
+        classifier      LR = base_lr
+        fusion  stack   top-layer LR = base_lr * --llrd_fusion_ratio  (0.7)
+        encoder stacks  top-layer LR = base_lr * --llrd_encoder_ratio (0.3)
+
+    With --use_llrd, each stack is geometrically decayed downward by --llrd_decay
+    per layer (top layer = anchor, embedding = anchor * decay^depth), applied
+    INDEPENDENTLY within the raw encoder, the size encoder, and the fusion stack.
+    --llrd_decay == 1.0 (or --use_llrd off) reproduces the original flat
+    encoder/fusion/classifier grouping exactly.
+
+    ITGCA calibration parameters (stat_scale / stat_shift / local_stat_scale /
+    local_stat_shift) stay on a separate faster group (5 * fusion anchor, no decay).
     """
     no_decay = ['bias', 'gamma', 'beta', 'LayerNorm']
     calibration_names = ('stat_scale', 'stat_shift', 'local_stat_scale', 'local_stat_shift')
 
     actual_model = model.module if hasattr(model, 'module') else model
-    encoder_lr = args.learning_rate * args.llrd_encoder_ratio
-    fusion_lr = args.learning_rate * args.llrd_fusion_ratio
-    classifier_lr = args.learning_rate
+    base_lr = args.learning_rate
+    encoder_anchor = base_lr * args.llrd_encoder_ratio
+    fusion_anchor = base_lr * args.llrd_fusion_ratio
+    decay = args.llrd_decay if getattr(args, 'use_llrd', False) else 1.0
 
-    encoder_decay, encoder_no_decay = [], []
-    fusion_decay, fusion_no_decay, calibration_params = [], [], []
-    classifier_decay, classifier_no_decay = [], []
+    base_layers = args.layers_num
+    l_raw = getattr(args, 'layers_num_raw', base_layers) or base_layers
+    l_size = getattr(args, 'layers_num_size', base_layers) or base_layers
+    l_fus = getattr(args, 'num_fusion_layers', 6)
 
+    def _idx(name, marker):
+        return int(name.split(marker, 1)[1].split('.', 1)[0])
+
+    def param_lr(name):
+        # Depth measured from the top of each stack; deeper => more decay.
+        if name.startswith('classifier'):
+            return base_lr
+        if 'encoder_raw.transformer.' in name:
+            return encoder_anchor * (decay ** (l_raw - 1 - _idx(name, 'encoder_raw.transformer.')))
+        if 'encoder_size.transformer.' in name:
+            return encoder_anchor * (decay ** (l_size - 1 - _idx(name, 'encoder_size.transformer.')))
+        if name.startswith('embedding_raw'):
+            return encoder_anchor * (decay ** l_raw)
+        if name.startswith('embedding_size'):
+            return encoder_anchor * (decay ** l_size)
+        if 'fusion.fusion_layers.' in name:
+            return fusion_anchor * (decay ** (l_fus - 1 - _idx(name, 'fusion.fusion_layers.')))
+        if name.startswith('fusion'):
+            return fusion_anchor
+        return base_lr
+
+    # Bucket params into groups keyed by (lr, weight_decay); calibration params separate.
+    groups = {}
     for name, param in actual_model.named_parameters():
-        if 'embedding_raw' in name or 'encoder_raw' in name or \
-           'embedding_size' in name or 'encoder_size' in name:
-            (encoder_no_decay if any(nd in name for nd in no_decay) else encoder_decay).append(param)
-        elif 'fusion' in name:
-            if any(cn in name for cn in calibration_names):
-                calibration_params.append(param)
-            elif any(nd in name for nd in no_decay):
-                fusion_no_decay.append(param)
-            else:
-                fusion_decay.append(param)
-        elif 'classifier' in name:
-            (classifier_no_decay if any(nd in name for nd in no_decay) else classifier_decay).append(param)
+        if not param.requires_grad:
+            continue
+        is_calib = ('fusion' in name) and any(cn in name for cn in calibration_names)
+        if is_calib:
+            key, lr, wd = ('calib',), fusion_anchor * 5, 0.0
+        else:
+            lr = param_lr(name)
+            wd = 0.0 if any(nd in name for nd in no_decay) else 0.01
+            key = (round(lr, 12), wd)
+        g = groups.setdefault(key, {'params': [], 'lr': lr, 'weight_decay': wd})
+        g['params'].append(param)
 
-    optimizer_grouped_parameters = [
-        {'params': encoder_decay,     'lr': encoder_lr,    'weight_decay': 0.01},
-        {'params': encoder_no_decay,  'lr': encoder_lr,    'weight_decay': 0.0},
-        {'params': fusion_decay,      'lr': fusion_lr,     'weight_decay': 0.01},
-        {'params': fusion_no_decay,   'lr': fusion_lr,     'weight_decay': 0.0},
-        {'params': classifier_decay,    'lr': classifier_lr, 'weight_decay': 0.01},
-        {'params': classifier_no_decay, 'lr': classifier_lr, 'weight_decay': 0.0},
-    ]
-    if calibration_params:
-        optimizer_grouped_parameters.append({
-            'params': calibration_params,
-            'lr': fusion_lr * 5,
-            'weight_decay': 0.0,
-        })
-
+    optimizer_grouped_parameters = list(groups.values())
     optimizer = str2optimizer["adamw"](
-        optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False
+        optimizer_grouped_parameters, lr=base_lr, correct_bias=True
     )
-
     scheduler = str2scheduler[args.scheduler](
         optimizer, args.train_steps * args.warmup, args.train_steps
     )
 
-    print(f"  LLRD: encoder_lr={encoder_lr:.2e}, fusion_lr={fusion_lr:.2e}, "
-          f"classifier_lr={classifier_lr:.2e}")
-    if calibration_params:
-        print(f"  Calibration params ({len(calibration_params)}): lr={fusion_lr * 5:.2e}, no weight_decay")
-
+    n_calib = sum(len(g['params']) for k, g in groups.items() if k == ('calib',))
+    print(f"  LLRD: {'ON' if decay < 1.0 else 'OFF (flat)'} (decay={decay}), "
+          f"encoder_anchor={encoder_anchor:.2e}, fusion_anchor={fusion_anchor:.2e}, "
+          f"classifier_lr={base_lr:.2e}")
+    print(f"  Phase 2 param groups: {len(optimizer_grouped_parameters)} "
+          f"(calibration params: {n_calib}, lr={fusion_anchor * 5:.2e})")
     return optimizer, scheduler
 
 
@@ -603,6 +782,33 @@ def main():
     parser.add_argument("--phase1_lr", type=float, default=1e-3,
                         help="Phase 1 learning rate (classifier-only).")
 
+    # ---- Fine-tuning tricks (items 3/4/5/6; default OFF -> reproduces the baseline) ----
+    # Item 3: per-layer LLRD. Off -> current flat encoder/fusion/classifier LRs.
+    parser.add_argument("--use_llrd", action="store_true",
+                        help="Enable per-layer LLRD within each stack (anchored on "
+                             "--llrd_encoder_ratio / --llrd_fusion_ratio).")
+    parser.add_argument("--llrd_decay", type=float, default=0.9,
+                        help="Geometric LR decay per layer, top=anchor going down. "
+                             "Only used with --use_llrd; 1.0 == flat.")
+    # Item 4: FGM adversarial training on token embeddings (Phase 2 only).
+    parser.add_argument("--use_fgm", action="store_true",
+                        help="Enable FGM adversarial training (perturbs both modalities' "
+                             "token embeddings). Phase 2 only.")
+    parser.add_argument("--adv_epsilon", type=float, default=1.0,
+                        help="FGM perturbation magnitude (normalized-gradient units).")
+    # Item 5: multi-sample dropout in the classifier head.
+    parser.add_argument("--use_msd", action="store_true",
+                        help="Enable multi-sample dropout in the head (averages per-sample "
+                             "CE). Mutually exclusive with --use_rdrop.")
+    parser.add_argument("--msd_num", type=int, default=4,
+                        help="Number of dropout samples for --use_msd.")
+    # Item 6: R-Drop consistency regularization.
+    parser.add_argument("--use_rdrop", action="store_true",
+                        help="Enable R-Drop (two dropout passes + symmetric KL). "
+                             "Mutually exclusive with --use_msd.")
+    parser.add_argument("--rdrop_alpha", type=float, default=1.0,
+                        help="Weight of the R-Drop symmetric-KL term.")
+
     # GPU options.
     parser.add_argument("--world_size", type=int, default=1,
                         help="Total number of processes (GPUs) for training.")
@@ -610,6 +816,10 @@ def main():
                         help="List of GPU ranks to use (e.g., --gpu_ranks 0 1).")
 
     args = parser.parse_args()
+
+    # Guardrail: items 5 and 6 both reshape dropout/loss; keep them mutually exclusive.
+    assert not (args.use_msd and args.use_rdrop), \
+        "--use_msd and --use_rdrop are mutually exclusive (item-5 vs item-6)."
 
     # Load hyperparameters from config.
     if args.config_path:
@@ -738,23 +948,53 @@ def main():
     args.train_steps = max(1, int(len(train_data) * args.epochs_num / args.batch_size) + 1)
     optimizer, scheduler = build_phase2_optimizer(args, model)
 
+    # Item 1: EMA (always on in Phase 2, initialized from the post-Phase-1 weights).
+    # Item 4: FGM (Phase 2 only).
+    ema = ModelEMA(model, decay=0.999)
+    fgm = FGM(model, args.adv_epsilon) if args.use_fgm else None
+    print(f"  EMA: ON (decay=0.999, warmup-ramped)")
+    print(f"  FGM adversarial: {('ON (eps=%.2f)' % args.adv_epsilon) if fgm else 'OFF'}")
+    if args.use_msd:
+        print(f"  Multi-sample dropout: ON (k={args.msd_num})")
+    if args.use_rdrop:
+        print(f"  R-Drop: ON (alpha={args.rdrop_alpha})")
+    if args.use_rdrop and args.use_fgm:
+        print("  WARNING: --use_rdrop + --use_fgm => 4 forward passes/step (2x R-Drop x 2x FGM).")
+
     patience_counter = 0
     for epoch in range(1, args.epochs_num + 1):
         print(f"\n[Phase 2] Epoch {epoch}/{args.epochs_num}")
         print("-" * 30)
         avg_loss = train_epoch(args, model, optimizer, scheduler, train_tensors,
-                               criterion, scaler)
+                               criterion, scaler, fgm=fgm, ema=ema)
         print(f"Training loss: {avg_loss:.4f}")
 
-        print("Validation:")
-        f1, _ = evaluate(args, model, dev_tensors)
+        # Dual validation: online weights vs EMA weights; keep the better of the two.
+        print("Validation [online]:")
+        f1_online, _ = evaluate(args, model, dev_tensors)
+        ema.store(model)
+        ema.copy_to(model)
+        print("Validation [EMA]:")
+        f1_ema, _ = evaluate(args, model, dev_tensors)
+        ema.restore(model)
+
+        use_ema = f1_ema >= f1_online
+        f1 = max(f1_online, f1_ema)
+        print(f"  -> online F1={f1_online:.4f}, EMA F1={f1_ema:.4f}; "
+              f"selected={'EMA' if use_ema else 'online'} ({f1:.4f})")
 
         if f1 > best_f1:
             best_f1 = f1
             best_epoch = args.phase1_epochs + epoch
             patience_counter = 0
-            save_model(model, args.output_model_path)
-            print(f"New best model saved! F1: {best_f1:.4f}")
+            if use_ema:
+                ema.store(model)
+                ema.copy_to(model)
+                save_model(model, args.output_model_path)
+                ema.restore(model)
+            else:
+                save_model(model, args.output_model_path)
+            print(f"New best model saved ({'EMA' if use_ema else 'online'})! F1: {best_f1:.4f}")
         else:
             patience_counter += 1
             print(f"No improvement. Patience: {patience_counter}/{args.earlystop}")
