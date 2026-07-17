@@ -513,8 +513,10 @@ def main():
         print("Test Set Evaluation")
         print("=" * 50)
 
-        # Load best model
-        if torch.cuda.device_count() > 1:
+        # Load best model. Gate on whether the model is actually DataParallel-
+        # wrapped (has .module), NOT on the number of visible GPUs -- the
+        # checkpoint is always saved without a 'module.' prefix (see save_model).
+        if hasattr(model, "module"):
             model.module.load_state_dict(torch.load(args.output_model_path))
         else:
             model.load_state_dict(torch.load(args.output_model_path))

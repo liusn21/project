@@ -42,7 +42,9 @@ def main():
     parser.add_argument("--accumulation_steps", type=int, default=1,
                         help="Specific steps to accumulate gradient.")
     parser.add_argument("--batch_size", type=int, default=32,
-                        help="Training batch size. The actual batch_size is [batch_size x world_size x accumulation_steps].")
+                        help="Per-process micro-batch size. Optimizer global batch is "
+                             "batch_size x world_size x accumulation_steps; Stage-2 "
+                             "ITC/ITM candidate sets remain micro-batch-local.")
     parser.add_argument("--instances_buffer_size", type=int, default=25600,
                         help="The buffer size of instances in memory.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout value.")

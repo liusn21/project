@@ -155,8 +155,14 @@ class Trainer(object):
         self.batch_size = args.batch_size
         self.world_size = args.world_size
 
-    def forward_propagation(self, batch, model, update_momentum=True):
+    def forward_propagation(self, batch, model):
         raise NotImplementedError
+
+    def begin_accumulation_group(self):
+        """Prepare trainer-owned state for one optimizer-step attempt."""
+
+    def finish_optimizer_step(self, model, step_succeeded):
+        """Commit or discard trainer-owned state after the optimizer attempt."""
 
     def report_and_reset_stats(self):
         raise NotImplementedError
@@ -175,11 +181,10 @@ class Trainer(object):
                 break
 
             # ----- Gradient accumulation over `accumulation_steps` micro-batches -----
-            # current_step counts OPTIMIZER steps; each consumes accumulation_steps
-            # micro-batches. total_steps / LR schedule / warmup / report / save are all
-            # in optimizer-step units, so accumulation_steps=k with a 1/k batch is truly
-            # equivalent to one large batch: same #updates, full LR decay (no truncated
-            # tail), no silent under-training.
+            # This reproduces a larger optimizer batch for separable objectives such
+            # as MLM. Stage-2 ITC/ITM candidate sets remain micro-batch-local; the
+            # momentum teacher and feature queue stay fixed across the whole group.
+            self.begin_accumulation_group()
             for micro in range(self.accumulation_steps):
                 batch = list(next(loader_iter))
                 self.seq_length = batch[0].size(1)
@@ -199,10 +204,7 @@ class Trainer(object):
 
                 with sync_context:
                     with torch.cuda.amp.autocast(enabled=use_amp):
-                        # Momentum (ALBEF teacher) encoders are EMA-updated once per
-                        # optimizer step → only on the last micro-batch of the group.
-                        loss = self.forward_propagation(batch, model,
-                                                        update_momentum=is_last_micro)
+                        loss = self.forward_propagation(batch, model)
                     scaler.scale(loss).backward()
 
             if hasattr(args, 'clip_grad_norm') and args.clip_grad_norm > 0:
@@ -211,10 +213,21 @@ class Trainer(object):
                     model.parameters(), args.clip_grad_norm
                 )
 
+            scale_before_step = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            step_succeeded = not use_amp or scaler.get_scale() >= scale_before_step
+
+            # Stage-2 EMA and queue state advance only with a real online update.
+            self.finish_optimizer_step(model, step_succeeded)
             model.zero_grad()
+
+            if not step_succeeded:
+                if not self.dist_train or rank == 0:
+                    print("AMP overflow: optimizer/EMA/queue step skipped; retrying current step.")
+                continue
+
+            scheduler.step()
 
             if self.current_step % self.report_steps == 0 and \
                     (not self.dist_train or (self.dist_train and rank == 0)):
@@ -238,9 +251,7 @@ class RawPacketMlmTrainer(Trainer):
         self.total_correct_mlm = 0.0
         self.total_denominator = 0.0
 
-    def forward_propagation(self, batch, model, update_momentum=True):
-        # update_momentum is unused here (Stage 1 has no momentum encoder); accepted
-        # for a uniform Trainer.train() calling convention.
+    def forward_propagation(self, batch, model):
         src, tgt_mlm, packet_ids, directions = batch
         loss_mlm, correct_mlm, denominator = model(src, tgt_mlm, packet_ids, directions)
 
@@ -299,8 +310,7 @@ class PacketSizeMlmTrainer(Trainer):
         self.lambda_mlm_size = getattr(args, 'lambda_mlm_size', 1.0)
         self.lambda_mlm_temporal = getattr(args, 'lambda_mlm_temporal', 1.0)
 
-    def forward_propagation(self, batch, model, update_momentum=True):
-        # update_momentum is unused here (Stage 1 has no momentum encoder).
+    def forward_propagation(self, batch, model):
         # Check if batch has temporal info (4 tensors) or legacy format (2 tensors)
         if len(batch) == 4:
             # New format with temporal: (src_size, src_iat, tgt_mlm_size, tgt_mlm_temporal)
@@ -418,7 +428,33 @@ class MultiModalTrainer(Trainer):
         # Count batches for averaging
         self.batch_count = 0
 
-    def forward_propagation(self, batch, model, update_momentum=True):
+        # Momentum keys are tiny compared with encoder activations. Keep them
+        # detached until the entire accumulation group can be committed atomically.
+        self._pending_queue_raw = []
+        self._pending_queue_size = []
+
+    def begin_accumulation_group(self):
+        self._pending_queue_raw.clear()
+        self._pending_queue_size.clear()
+
+    def finish_optimizer_step(self, model, step_succeeded):
+        try:
+            if not step_succeeded:
+                return
+            model_ref = model.module if hasattr(model, 'module') else model
+            raw_feat = torch.cat(self._pending_queue_raw, dim=0)
+            size_feat = torch.cat(self._pending_queue_size, dim=0)
+
+            # The online weights now include this optimizer step. The updated
+            # teacher is used by the next accumulation group; the queued keys were
+            # all produced by one fixed teacher during the just-finished group.
+            model_ref._momentum_update()
+            model_ref._dequeue_and_enqueue(raw_feat, size_feat)
+        finally:
+            self._pending_queue_raw.clear()
+            self._pending_queue_size.clear()
+
+    def forward_propagation(self, batch, model):
         """
         Forward pass for ALBEF-style multimodal pretraining with Masked Reconstruction
 
@@ -446,8 +482,11 @@ class MultiModalTrainer(Trainer):
             size_src_clean, iat_src_clean,
             size_src_masked, iat_src_masked,
             tgt_mlm_size, tgt_mlm_temporal,
-            itc_alpha=alpha, update_momentum=update_momentum
+            itc_alpha=alpha
         )
+
+        self._pending_queue_raw.append(loss_dict['queue_raw_feat'])
+        self._pending_queue_size.append(loss_dict['queue_size_feat'])
 
         # Extract losses
         itc_loss = loss_dict['itc_loss']
@@ -559,10 +598,6 @@ def worker(proc_id, gpu_ranks, args, model):
                  The id of process (and GPU) for multiprocessing distributed mode.
         gpu_ranks: List of ranks of each process.
     """
-    set_seed(args.seed)
-    
-    print("Starting worker function")
-
     if args.dist_train:
         rank = gpu_ranks[proc_id]
         gpu_id = proc_id
@@ -572,6 +607,24 @@ def worker(proc_id, gpu_ranks, args, model):
     else:
         rank = None
         gpu_id = None
+
+    # The model is initialized once in the parent process with args.seed.  Give
+    # each DDP worker a deterministic but distinct runtime RNG stream for data
+    # shuffling, dynamic masking, and dropout.
+    runtime_seed = args.seed + (rank if rank is not None else 0)
+    set_seed(runtime_seed)
+
+    print(f"Starting worker function (runtime seed: {runtime_seed})")
+
+    if args.target == "multimodal" and (not args.dist_train or rank == 0):
+        per_rank_optimizer_batch = args.batch_size * args.accumulation_steps
+        global_optimizer_batch = per_rank_optimizer_batch * args.world_size
+        print(
+            "Stage-2 batch geometry: "
+            f"local_itc_itm_batch={args.batch_size}, "
+            f"per_rank_optimizer_batch={per_rank_optimizer_batch}, "
+            f"global_optimizer_batch={global_optimizer_batch}."
+        )
 
     print("train loader constructing...")
     if args.dist_train:

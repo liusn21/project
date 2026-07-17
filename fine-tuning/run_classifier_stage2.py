@@ -38,6 +38,7 @@ Usage example (Stage 2 fine-tune, single GPU):
         --epochs_num 10 \
         --llrd_encoder_ratio 0.3 --llrd_fusion_ratio 0.7 \
         --label_smoothing 0.1 --max_grad_norm 1.0 \
+        --reserve_gpu_memory auto \
         --seed 42 --gpu_ranks 0
 """
 
@@ -45,6 +46,7 @@ import os
 import sys
 sys.path.append(os.getcwd())
 
+import gc
 import random
 import argparse
 import torch
@@ -68,6 +70,13 @@ from uer.opts import finetune_opts
 from uer.models.multimodal_model import (
     compute_flow_reliability_raw, compute_local_entropy
 )
+
+
+BYTES_PER_MIB = 1024 ** 2
+BYTES_PER_GIB = 1024 ** 3
+MEMORY_PROBE_STEPS = 2
+MEMORY_RESERVATION_CHUNK_BYTES = 64 * BYTES_PER_MIB
+MEMORY_RESERVATION_TOLERANCE_BYTES = 64 * BYTES_PER_MIB
 
 
 class ClassifierHead(nn.Module):
@@ -579,26 +588,28 @@ def evaluate(args, model, eval_tensors, print_confusion=False):
     return macro_f1, confusion
 
 
-def freeze_backbone(model):
+def freeze_backbone(model, verbose=True):
     """Phase 1: freeze everything except the classifier head."""
     actual_model = model.module if hasattr(model, 'module') else model
     for name, param in actual_model.named_parameters():
         param.requires_grad = name.startswith('classifier')
     trainable = sum(p.numel() for p in actual_model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in actual_model.parameters())
-    print(f"  Backbone frozen: {trainable}/{total} params trainable")
+    if verbose:
+        print(f"  Backbone frozen: {trainable}/{total} params trainable")
 
 
-def unfreeze_backbone(model):
+def unfreeze_backbone(model, verbose=True):
     """Phase 2: unfreeze every parameter."""
     actual_model = model.module if hasattr(model, 'module') else model
     for param in actual_model.parameters():
         param.requires_grad = True
     trainable = sum(p.numel() for p in actual_model.parameters() if p.requires_grad)
-    print(f"  All params unfrozen: {trainable} params trainable")
+    if verbose:
+        print(f"  All params unfrozen: {trainable} params trainable")
 
 
-def build_phase1_optimizer(args, model, num_train_samples):
+def build_phase1_optimizer(args, model, num_train_samples, verbose=True):
     """Build the Phase 1 optimizer/scheduler: classifier-only with AdamW."""
     actual_model = model.module if hasattr(model, 'module') else model
     no_decay = ['bias', 'gamma', 'beta', 'LayerNorm']
@@ -626,11 +637,12 @@ def build_phase1_optimizer(args, model, num_train_samples):
         optimizer, int(train_steps * args.warmup), train_steps
     )
 
-    print(f"  Phase 1 optimizer: AdamW, lr={args.phase1_lr:.1e}, steps={train_steps}")
+    if verbose:
+        print(f"  Phase 1 optimizer: AdamW, lr={args.phase1_lr:.1e}, steps={train_steps}")
     return optimizer, scheduler
 
 
-def build_phase2_optimizer(args, model):
+def build_phase2_optimizer(args, model, verbose=True):
     """
     Phase 2 optimizer/scheduler with two LR anchors + optional per-layer LLRD (item 3).
 
@@ -706,12 +718,363 @@ def build_phase2_optimizer(args, model):
     )
 
     n_calib = sum(len(g['params']) for k, g in groups.items() if k == ('calib',))
-    print(f"  LLRD: {'ON' if decay < 1.0 else 'OFF (flat)'} (decay={decay}), "
-          f"encoder_anchor={encoder_anchor:.2e}, fusion_anchor={fusion_anchor:.2e}, "
-          f"classifier_lr={base_lr:.2e}")
-    print(f"  Phase 2 param groups: {len(optimizer_grouped_parameters)} "
-          f"(calibration params: {n_calib}, lr={fusion_anchor * 5:.2e})")
+    if verbose:
+        print(f"  LLRD: {'ON' if decay < 1.0 else 'OFF (flat)'} (decay={decay}), "
+              f"encoder_anchor={encoder_anchor:.2e}, fusion_anchor={fusion_anchor:.2e}, "
+              f"classifier_lr={base_lr:.2e}")
+        print(f"  Phase 2 param groups: {len(optimizer_grouped_parameters)} "
+              f"(calibration params: {n_calib}, lr={fusion_anchor * 5:.2e})")
     return optimizer, scheduler
+
+
+def _gib(num_bytes):
+    return num_bytes / BYTES_PER_GIB
+
+
+def _capture_rng_state(device):
+    return {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state(device),
+    }
+
+
+def _restore_rng_state(state, device):
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    torch.cuda.set_rng_state(state['cuda'], device)
+
+
+def _capture_model_probe_state(model):
+    actual_model = model.module if hasattr(model, 'module') else model
+    return {
+        'state_dict': {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in actual_model.state_dict().items()
+        },
+        'requires_grad': [(param, param.requires_grad)
+                          for param in actual_model.parameters()],
+        'training_modes': [(module, module.training)
+                           for module in actual_model.modules()],
+    }
+
+
+def _restore_model_probe_state(model, state):
+    actual_model = model.module if hasattr(model, 'module') else model
+    model.zero_grad(set_to_none=True)
+    actual_model.load_state_dict(state['state_dict'], strict=True)
+    for param, requires_grad in state['requires_grad']:
+        param.requires_grad = requires_grad
+    for module, training in state['training_modes']:
+        module.training = training
+
+
+def _build_probe_batch(args, train_tensors):
+    samples_num = train_tensors['label'].size(0)
+    if samples_num == 0:
+        raise ValueError("Cannot probe GPU memory with an empty training dataset.")
+
+    end = min(args.batch_size, samples_num)
+    keys = ('raw_src', 'packet_ids', 'directions', 'size_src', 'iat_src', 'label')
+    return tuple(
+        train_tensors[key][:end].to(args.device, non_blocking=True)
+        for key in keys
+    )
+
+
+def _run_memory_probe_step(args, model, optimizer, inputs, tgt, criterion,
+                           scaler=None, fgm=None, ema=None):
+    """Run the same GPU-heavy lifecycle as one real training step."""
+    use_amp = scaler is not None
+    optimizer.zero_grad(set_to_none=True)
+
+    with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+        loss = compute_loss(args, model, inputs, tgt, criterion)
+    if use_amp:
+        scaler.scale(loss).backward()
+    else:
+        loss.backward()
+
+    if fgm is not None:
+        fgm.attack()
+        try:
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                loss_adv = compute_loss(args, model, inputs, tgt, criterion)
+            if use_amp:
+                scaler.scale(loss_adv).backward()
+            else:
+                loss_adv.backward()
+        finally:
+            fgm.restore()
+
+    if use_amp:
+        if args.max_grad_norm > 0:
+            scaler.unscale_(optimizer)
+            found_inf = sum(
+                value.item()
+                for scaler_state in scaler._per_optimizer_states.values()
+                for value in scaler_state["found_inf_per_device"].values()
+            ) > 0
+            if not found_inf:
+                actual_model = model.module if hasattr(model, 'module') else model
+                torch.nn.utils.clip_grad_norm_(actual_model.parameters(), args.max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        if args.max_grad_norm > 0:
+            actual_model = model.module if hasattr(model, 'module') else model
+            torch.nn.utils.clip_grad_norm_(actual_model.parameters(), args.max_grad_norm)
+        optimizer.step()
+
+    if ema is not None:
+        ema.update(model)
+
+
+def _run_memory_probe_evaluation(model, inputs, ema=None):
+    """Cover the online and optional EMA validation memory lifecycle."""
+    model.eval()
+    with torch.no_grad():
+        logits = model(*inputs)
+        del logits
+
+    if ema is None:
+        return
+
+    ema.store(model)
+    try:
+        ema.copy_to(model)
+        with torch.no_grad():
+            logits = model(*inputs)
+            del logits
+    finally:
+        ema.restore(model)
+
+
+def _measure_training_memory_peak(args, model, train_tensors, criterion, phase):
+    """Measure one phase with real tensor shapes without retaining training state."""
+    optimizer = scheduler = scaler = ema = fgm = probe_batch = None
+    device = args.device
+
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+
+    try:
+        if phase == 1:
+            freeze_backbone(model, verbose=False)
+            optimizer, scheduler = build_phase1_optimizer(
+                args, model, train_tensors['label'].size(0), verbose=False
+            )
+        elif phase == 2:
+            unfreeze_backbone(model, verbose=False)
+            optimizer, scheduler = build_phase2_optimizer(args, model, verbose=False)
+            ema = ModelEMA(model, decay=0.999)
+            fgm = FGM(model, args.adv_epsilon) if args.use_fgm else None
+        else:
+            raise ValueError(f"Unknown memory-probe phase: {phase}")
+
+        # A zero LR exercises AdamW's real allocation/update path without changing
+        # parameters. A full CPU snapshot is restored after both probes as a second
+        # guard against any future optimizer/model changes.
+        for group in optimizer.param_groups:
+            group['lr'] = 0.0
+
+        use_amp = getattr(args, 'fp16', False)
+        if use_amp:
+            scaler = torch.amp.GradScaler(device="cuda", init_scale=1.0)
+
+        probe_batch = _build_probe_batch(args, train_tensors)
+        inputs, tgt = probe_batch[:-1], probe_batch[-1]
+        model.train()
+
+        for _ in range(MEMORY_PROBE_STEPS):
+            _run_memory_probe_step(
+                args, model, optimizer, inputs, tgt, criterion,
+                scaler=scaler, fgm=fgm, ema=ema
+            )
+
+        _run_memory_probe_evaluation(model, inputs, ema=ema)
+        torch.cuda.synchronize(device)
+        return {
+            'allocated': torch.cuda.max_memory_allocated(device),
+            'reserved': torch.cuda.max_memory_reserved(device),
+        }
+    finally:
+        if fgm is not None and fgm.backup:
+            fgm.restore()
+        if ema is not None and ema.backup:
+            ema.restore(model)
+        model.zero_grad(set_to_none=True)
+        optimizer = scheduler = scaler = ema = fgm = probe_batch = None
+        gc.collect()
+        torch.cuda.synchronize(device)
+
+
+class Phase1GpuMemoryReservation:
+    """Live, computation-independent CUDA tensors held only during Phase 1."""
+
+    def __init__(self, device, tensors, target_reserved, phase1_peak, phase2_peak):
+        self.device = device
+        self.tensors = tensors
+        self.target_reserved = target_reserved
+        self.phase1_peak = phase1_peak
+        self.phase2_peak = phase2_peak
+        self.reserved_bytes = sum(tensor.numel() * tensor.element_size()
+                                  for tensor in tensors)
+
+    def verify(self):
+        torch.cuda.synchronize(self.device)
+        current_reserved = torch.cuda.memory_reserved(self.device)
+        if current_reserved + MEMORY_RESERVATION_TOLERANCE_BYTES < self.target_reserved:
+            raise RuntimeError(
+                "Phase 1 GPU memory reservation was unexpectedly released: "
+                f"current_reserved={_gib(current_reserved):.2f} GiB, "
+                f"target={_gib(self.target_reserved):.2f} GiB."
+            )
+
+    def release_for_phase2(self):
+        """Return live blocks to PyTorch's cache so Phase 2 can reuse them."""
+        self.verify()
+        self.tensors.clear()
+        self.reserved_bytes = 0
+        gc.collect()
+        torch.cuda.synchronize(self.device)
+        print(f"  Phase 1 reservation released to the PyTorch cache; "
+              f"process still reserves {_gib(torch.cuda.memory_reserved(self.device)):.2f} GiB.")
+
+
+def _allocate_phase1_reservation(device, num_bytes, target_reserved,
+                                 phase1_peak, phase2_peak):
+    tensors = []
+    remaining = num_bytes
+    try:
+        while remaining > 0:
+            chunk_bytes = min(remaining, MEMORY_RESERVATION_CHUNK_BYTES)
+            tensors.append(torch.empty(chunk_bytes, dtype=torch.uint8, device=device))
+            remaining -= chunk_bytes
+        torch.cuda.synchronize(device)
+    except torch.OutOfMemoryError as error:
+        tensors.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+        raise RuntimeError(
+            "Phase 2 memory probing succeeded, but the Phase 1 reservation could "
+            f"not retain {_gib(num_bytes):.2f} GiB on {device}. Another process may "
+            "have claimed memory during setup; training was not started.\n"
+            f"Original PyTorch OOM: {error}"
+        ) from None
+
+    reservation = Phase1GpuMemoryReservation(
+        device, tensors, target_reserved, phase1_peak, phase2_peak
+    )
+    reservation.verify()
+    return reservation
+
+
+def setup_phase1_gpu_memory_reservation(args, model, train_tensors, criterion):
+    """Probe real single-GPU lifecycles and reserve the Phase 1/2 memory gap."""
+    if args.reserve_gpu_memory == 'none':
+        return None
+    if args.device.type != 'cuda':
+        raise RuntimeError("--reserve_gpu_memory auto requires CUDA.")
+    if isinstance(model, torch.nn.DataParallel):
+        raise RuntimeError(
+            "--reserve_gpu_memory auto currently supports one GPU only. "
+            "Use --world_size 1 with exactly one --gpu_ranks entry."
+        )
+
+    device = args.device
+    print("  GPU memory reservation: probing real single-GPU Phase 1/Phase 2 peaks...")
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '<not set>')
+    print(f"    process pid={os.getpid()}, CUDA_VISIBLE_DEVICES={visible_devices}, "
+          f"device={device}, batch_size={args.batch_size}, "
+          f"AMP={'on' if args.fp16 else 'off'}, "
+          f"global_free={_gib(free_bytes):.2f}/{_gib(total_bytes):.2f} GiB")
+
+    rng_state = _capture_rng_state(device)
+    model_state = _capture_model_probe_state(model)
+    phase1_peak = phase2_peak = retained_phase1_peak = None
+    reservation = None
+    failed_phase = 'Phase 1'
+    oom_message = None
+    setup_succeeded = False
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(device)
+
+    try:
+        phase1_peak = _measure_training_memory_peak(
+            args, model, train_tensors, criterion, phase=1
+        )
+
+        model.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
+
+        failed_phase = 'Phase 2'
+        phase2_peak = _measure_training_memory_peak(
+            args, model, train_tensors, criterion, phase=2
+        )
+
+        target_reserved = max(phase1_peak['reserved'], phase2_peak['reserved'])
+        reservation_bytes = max(0, target_reserved - phase1_peak['allocated'])
+        reservation = _allocate_phase1_reservation(
+            device, reservation_bytes, target_reserved, phase1_peak, phase2_peak
+        )
+
+        # The live tensors can alter allocator block layout. Replaying Phase 1
+        # while they are held proves that the remaining workspace is usable,
+        # rather than relying only on an arithmetic byte difference.
+        failed_phase = 'Phase 1 reservation verification'
+        retained_phase1_peak = _measure_training_memory_peak(
+            args, model, train_tensors, criterion, phase=1
+        )
+        setup_succeeded = True
+    except torch.OutOfMemoryError as error:
+        oom_message = str(error)
+    finally:
+        if not setup_succeeded and reservation is not None:
+            reservation.tensors.clear()
+            reservation = None
+        _restore_model_probe_state(model, model_state)
+        _restore_rng_state(rng_state, device)
+        del model_state
+        gc.collect()
+        torch.cuda.synchronize(device)
+
+    if oom_message is not None:
+        torch.cuda.empty_cache()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        raise RuntimeError(
+            f"Automatic GPU memory probe ran out of memory during {failed_phase}. "
+            "The corresponding real training phase is likely to OOM as well, so "
+            "training was not started.\n"
+            f"  device={device}, free={_gib(free_bytes):.2f}/{_gib(total_bytes):.2f} GiB, "
+            f"batch_size={args.batch_size}, AMP={'on' if args.fp16 else 'off'}\n"
+            f"Original PyTorch OOM: {oom_message}"
+        ) from None
+
+    print(f"    Phase 1 peak: allocated={_gib(phase1_peak['allocated']):.2f} GiB, "
+          f"reserved={_gib(phase1_peak['reserved']):.2f} GiB")
+    print(f"    Phase 2 peak: allocated={_gib(phase2_peak['allocated']):.2f} GiB, "
+          f"reserved={_gib(phase2_peak['reserved']):.2f} GiB")
+    print(f"    Phase 1 with reservation: "
+          f"allocated={_gib(retained_phase1_peak['allocated']):.2f} GiB, "
+          f"reserved={_gib(retained_phase1_peak['reserved']):.2f} GiB")
+
+    target_reserved = reservation.target_reserved
+    reservation_bytes = reservation.reserved_bytes
+    current_allocated = torch.cuda.memory_allocated(device)
+    current_reserved = torch.cuda.memory_reserved(device)
+    print(f"    Phase 1 live reservation tensors: {_gib(reservation_bytes):.2f} GiB")
+    print(f"    After reservation: allocated={_gib(current_allocated):.2f} GiB, "
+          f"reserved={_gib(current_reserved):.2f} GiB "
+          f"(target={_gib(target_reserved):.2f} GiB)")
+    return reservation
 
 
 def main():
@@ -728,11 +1091,11 @@ def main():
     # Path options.
     parser.add_argument("--label2id_path", type=str, required=True,
                         help="Path to label2id mapping (pickle)")
-    parser.add_argument("--vocab_path_raw", type=str, required=True,
+    parser.add_argument("--vocab_path_raw", type=str, default="./test/vocab_raw_bytes.txt",
                         help="Path to raw modality vocabulary")
-    parser.add_argument("--vocab_path_size", type=str, required=True,
+    parser.add_argument("--vocab_path_size", type=str, default="./test/vocab_size.txt",
                         help="Path to size modality vocabulary")
-    parser.add_argument("--vocab_path_temporal", type=str, required=True,
+    parser.add_argument("--vocab_path_temporal", type=str, default="./test/vocab_temporal.txt",
                         help="Path to temporal (IAT) modality vocabulary")
 
     # Training options.
@@ -814,6 +1177,10 @@ def main():
                         help="Total number of processes (GPUs) for training.")
     parser.add_argument("--gpu_ranks", default=[], nargs='+', type=int,
                         help="List of GPU ranks to use (e.g., --gpu_ranks 0 1).")
+    parser.add_argument("--reserve_gpu_memory", choices=("none", "auto"), default="none",
+                        help="Single-GPU Phase 1 memory occupancy matching. 'auto' "
+                             "probes the real Phase 1/Phase 2 lifecycle and retains "
+                             "the measured difference; 'none' disables it.")
 
     args = parser.parse_args()
 
@@ -879,7 +1246,14 @@ def main():
     ranks_num = len(args.gpu_ranks)
     if args.world_size > 1 and ranks_num > 1:
         assert torch.cuda.is_available(), "No available GPUs."
-        assert ranks_num <= torch.cuda.device_count(), "Specified GPUs exceed available GPUs."
+        assert len(set(args.gpu_ranks)) == ranks_num, \
+            f"Duplicate GPU IDs are not allowed: {args.gpu_ranks}"
+        invalid_ranks = [
+            rank for rank in args.gpu_ranks
+            if rank < 0 or rank >= torch.cuda.device_count()
+        ]
+        assert not invalid_ranks, \
+            f"GPU IDs not available: {invalid_ranks}"
         primary_gpu = args.gpu_ranks[0]
         args.device = torch.device(f"cuda:{primary_gpu}")
         model = model.to(args.device)
@@ -888,7 +1262,7 @@ def main():
     elif ranks_num == 1:
         assert torch.cuda.is_available(), "No available GPUs."
         gpu_id = args.gpu_ranks[0]
-        assert gpu_id < torch.cuda.device_count(), \
+        assert 0 <= gpu_id < torch.cuda.device_count(), \
             f"GPU {gpu_id} not available (only {torch.cuda.device_count()} GPUs)."
         args.device = torch.device(f"cuda:{gpu_id}")
         model = model.to(args.device)
@@ -915,6 +1289,7 @@ def main():
 
     best_f1 = 0.0
     best_epoch = 0
+    args.train_steps = max(1, int(len(train_data) * args.epochs_num / args.batch_size) + 1)
 
     # ===== Phase 1: Classifier head warmup (backbone frozen) =====
     print("\n" + "=" * 50)
@@ -922,6 +1297,9 @@ def main():
     print("=" * 50)
 
     print(f"\n--- Phase 1: Classifier head warmup ({args.phase1_epochs} epochs) ---")
+    phase1_memory_reservation = setup_phase1_gpu_memory_reservation(
+        args, model, train_tensors, criterion
+    )
     freeze_backbone(model)
     p1_optimizer, p1_scheduler = build_phase1_optimizer(args, model, len(train_data))
 
@@ -938,14 +1316,20 @@ def main():
             best_epoch = epoch
             save_model(model, args.output_model_path)
             print(f"New best model saved! F1: {best_f1:.4f}")
+        if phase1_memory_reservation is not None:
+            phase1_memory_reservation.verify()
 
     print(f"\nPhase 1 complete. Best F1 so far: {best_f1:.4f}")
 
     # ===== Phase 2: Full fine-tuning with LLRD =====
     print(f"\n--- Phase 2: Full fine-tuning with LLRD ({args.epochs_num} epochs) ---")
+    model.zero_grad(set_to_none=True)
+    del p1_optimizer, p1_scheduler
+    if phase1_memory_reservation is not None:
+        phase1_memory_reservation.release_for_phase2()
+        phase1_memory_reservation = None
     unfreeze_backbone(model)
 
-    args.train_steps = max(1, int(len(train_data) * args.epochs_num / args.batch_size) + 1)
     optimizer, scheduler = build_phase2_optimizer(args, model)
 
     # Item 1: EMA (always on in Phase 2, initialized from the post-Phase-1 weights).

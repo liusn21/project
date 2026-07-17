@@ -224,7 +224,7 @@ class MultiModalModel(nn.Module):
 
     @torch.no_grad()
     def _momentum_update(self):
-        """Update momentum encoders and projection layers using EMA."""
+        """Update momentum modules after a successful online optimizer step."""
         for param, param_m in zip(self.embedding_raw.parameters(),
                                    self.embedding_raw_m.parameters()):
             param_m.data = param_m.data * self.momentum + param.data * (1.0 - self.momentum)
@@ -277,7 +277,7 @@ class MultiModalModel(nn.Module):
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, raw_feat, size_feat):
-        """Update feature queues with new features."""
+        """Commit one complete accumulation group's features to the queues."""
         batch_size = raw_feat.size(0)
         ptr = int(self.queue_ptr)
 
@@ -335,7 +335,7 @@ class MultiModalModel(nn.Module):
     def forward(self, raw_src, raw_packet_ids, raw_directions,
                 size_src_clean, iat_src_clean,
                 size_src_masked, iat_src_masked,
-                tgt_mlm_size, tgt_mlm_temporal, itc_alpha=0.0, update_momentum=True):
+                tgt_mlm_size, tgt_mlm_temporal, itc_alpha=0.0):
         """
         Forward pass for training with Masked Reconstruction (ALBEF-style).
 
@@ -391,13 +391,6 @@ class MultiModalModel(nn.Module):
             raw_cls_m_proj = F.normalize(self.itc_proj_raw_m(raw_cls_m), dim=-1)
             size_cls_m_proj = F.normalize(self.itc_proj_size_m(size_cls_m), dim=-1)
 
-            # EMA update once per OPTIMIZER step: only the last micro-batch of an
-            # accumulation group passes update_momentum=True. This keeps the teacher
-            # constant within a group and makes the EMA rate independent of
-            # accumulation_steps (with accum=1, update_momentum is always True).
-            if update_momentum:
-                self._momentum_update()
-
         # ===== Step 4: ITC Loss =====
         itc_loss, sim_r2s, sim_s2r = self.target.forward_itc(
             raw_cls, size_cls,
@@ -406,11 +399,7 @@ class MultiModalModel(nn.Module):
             temperature=self.itc_temp, alpha=itc_alpha
         )
 
-        # ===== Step 5: Update Queues =====
-        with torch.no_grad():
-            self._dequeue_and_enqueue(raw_cls_m_proj, size_cls_m_proj)
-
-        # ===== Step 6: Fusion for Positive Samples =====
+        # ===== Step 5: Fusion for Positive Samples =====
         raw_fused, size_fused, gate_info_pos = self.fusion(
             raw_output, size_output_clean, raw_seg, size_seg,
             **itgca_kwargs
@@ -419,12 +408,12 @@ class MultiModalModel(nn.Module):
         pos_raw_cls = raw_fused[:, 0, :]
         pos_size_cls = size_fused[:, 0, :]
 
-        # ===== Step 7: Hard Negative Sampling =====
+        # ===== Step 6: Hard Negative Sampling =====
         neg_size_idx, neg_raw_idx = self.target.sample_hard_negatives(
             sim_r2s, sim_s2r, batch_size
         )
 
-        # ===== Step 8: Fusion for Negative Samples =====
+        # ===== Step 7: Fusion for Negative Samples =====
         # Negative type 1: (raw_i, size_neg)
         neg_size_output_1 = size_output_clean[neg_size_idx]
         neg_size_seg_1 = size_seg[neg_size_idx]
@@ -474,19 +463,19 @@ class MultiModalModel(nn.Module):
         neg2_raw_cls = neg2_raw_fused[:, 0, :]
         neg2_size_cls = neg2_size_fused[:, 0, :]
 
-        # ===== Step 9: ITM Loss =====
+        # ===== Step 8: ITM Loss =====
         itm_loss, itm_acc = self.target.forward_itm(
             pos_raw_cls, pos_size_cls,
             neg1_raw_cls, neg1_size_cls,
             neg2_raw_cls, neg2_size_cls
         )
 
-        # ===== Step 10: Encode MASKED Size+IAT =====
+        # ===== Step 9: Encode MASKED Size+IAT =====
         size_emb_masked = self.embedding_size(size_src_masked, iat_src_masked)
         size_seg_masked = (size_src_masked != PAD_ID).long()
         size_output_masked = self.encoder_size(size_emb_masked, size_seg_masked)
 
-        # ===== Step 11: Fusion with Masked Size features =====
+        # ===== Step 10: Fusion with Masked Size features =====
         if self.use_itgca:
             # Use clean encoder CLS and clean r_stat/local_ent for masked fusion
             itgca_kwargs_masked = dict(itgca_kwargs)
@@ -498,7 +487,7 @@ class MultiModalModel(nn.Module):
             **itgca_kwargs_masked
         )
 
-        # ===== Step 12: Masked Reconstruction Loss =====
+        # ===== Step 11: Masked Reconstruction Loss =====
         recon_results = self.target.forward_masked_reconstruction(
             size_fused_masked, tgt_mlm_size, tgt_mlm_temporal
         )
@@ -515,6 +504,10 @@ class MultiModalModel(nn.Module):
             'recon_temporal_correct_exact': recon_results['temporal_correct_exact'],
             'recon_temporal_correct_range': recon_results['temporal_correct_range'],
             'recon_temporal_denom': recon_results['temporal_denom'],
+            # The trainer commits these detached keys only after the complete
+            # accumulation group finishes a successful optimizer step.
+            'queue_raw_feat': raw_cls_m_proj.detach(),
+            'queue_size_feat': size_cls_m_proj.detach(),
         }
 
         return loss_dict

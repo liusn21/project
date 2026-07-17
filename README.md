@@ -213,16 +213,16 @@ python3 pre-training/pretrain.py \
 
 ### 4.6 OOM mitigation: gradient accumulation
 
-Stage 2 is the most memory-hungry step (two encoders + 6-layer fusion + momentum encoders + 4096-entry queue + ITM hard negatives that triple the fused-CLS forward pass). On smaller GPUs, reduce `--batch_size` and compensate with `--accumulation_steps` to keep the effective batch fixed:
+Stage 2 is the most memory-hungry step (two encoders + 6-layer fusion + momentum encoders + 4096-entry queue + ITM hard negatives that triple the fused-CLS forward pass). On smaller GPUs, reduce `--batch_size` and compensate with `--accumulation_steps` to keep the optimizer batch fixed:
 
-| Effective batch | Per-GPU batch | `--accumulation_steps` (4 GPUs) |
-|-----------------|---------------|---------------------------------|
+| Global optimizer batch | Per-GPU batch | `--accumulation_steps` (4 GPUs) |
+|------------------------|---------------|---------------------------------|
 | 256 (paper)     | 64            | 1                               |
 | 256             | 32            | 2                               |
 | 256             | 16            | 4                               |
 | 256             |  8            | 8                               |
 
-The same trick applies to Stage 1 if needed.
+For Stage 2, gradient accumulation does not enlarge the per-forward ITC/ITM candidate set: `--batch_size` remains the local contrastive/matching batch, while the table above preserves only the optimizer batch. The momentum teacher and feature queue remain fixed throughout each accumulation group and are updated once after its optimizer step. Stage 1 MLM has a separable per-example objective, so accumulation is equivalent to a larger optimizer batch up to normal stochastic differences.
 
 ### Component-level ablation flags
 

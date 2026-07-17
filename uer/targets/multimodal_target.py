@@ -200,6 +200,12 @@ class MultiModalTarget(nn.Module):
             neg_size_idx: [batch] - hard negative size indices for each raw
             neg_raw_idx: [batch] - hard negative raw indices for each size
         """
+        if batch_size < 2:
+            raise ValueError(
+                "ITM hard-negative mining requires a local batch with at least "
+                "2 samples. Check that the multimodal dataloader drops single-sample tail batches."
+            )
+
         with torch.no_grad():
             # Use only the in-batch similarities (the first batch_size columns).
             sim_r2s_batch = sim_r2s[:, :batch_size].clone()
