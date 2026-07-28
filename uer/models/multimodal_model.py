@@ -224,7 +224,7 @@ class MultiModalModel(nn.Module):
 
     @torch.no_grad()
     def _momentum_update(self):
-        """Update momentum modules after a successful online optimizer step."""
+        """Update momentum encoders and projection layers using EMA."""
         for param, param_m in zip(self.embedding_raw.parameters(),
                                    self.embedding_raw_m.parameters()):
             param_m.data = param_m.data * self.momentum + param.data * (1.0 - self.momentum)
@@ -247,37 +247,8 @@ class MultiModalModel(nn.Module):
             param_m.data = param_m.data * self.momentum + param.data * (1.0 - self.momentum)
 
     @torch.no_grad()
-    def init_momentum_encoders(self):
-        """
-        Hard-copy every online module into its momentum counterpart.
-
-        Must be called ONCE after (a) Stage-1 weights are loaded into the online
-        encoders and (b) the trainer's blanket re-initialization of all
-        non-pretrained parameters. The ITC projection heads (itc_proj_*_m) are
-        deep-copied at construction time, but their online versions are
-        re-initialized later in the trainer; without this re-sync the momentum
-        (teacher) projections would start from a different random init than the
-        online (student) ones, corrupting the ITC contrastive target for the
-        first thousands of steps. Encoders/embeddings are already identical
-        (loaded into both online and momentum), so copying them is a harmless
-        no-op that also future-proofs against any further desync.
-        """
-        module_pairs = [
-            (self.embedding_raw, self.embedding_raw_m),
-            (self.encoder_raw, self.encoder_raw_m),
-            (self.embedding_size, self.embedding_size_m),
-            (self.encoder_size, self.encoder_size_m),
-            (self.target.itc_proj_raw, self.itc_proj_raw_m),
-            (self.target.itc_proj_size, self.itc_proj_size_m),
-        ]
-        for online, momentum in module_pairs:
-            for p, p_m in zip(online.parameters(), momentum.parameters()):
-                p_m.data.copy_(p.data)
-                p_m.requires_grad = False
-
-    @torch.no_grad()
     def _dequeue_and_enqueue(self, raw_feat, size_feat):
-        """Commit one complete accumulation group's features to the queues."""
+        """Update feature queues with new features."""
         batch_size = raw_feat.size(0)
         ptr = int(self.queue_ptr)
 
@@ -335,7 +306,7 @@ class MultiModalModel(nn.Module):
     def forward(self, raw_src, raw_packet_ids, raw_directions,
                 size_src_clean, iat_src_clean,
                 size_src_masked, iat_src_masked,
-                tgt_mlm_size, tgt_mlm_temporal, itc_alpha=0.0):
+                tgt_mlm_size, tgt_mlm_temporal):
         """
         Forward pass for training with Masked Reconstruction (ALBEF-style).
 
@@ -391,15 +362,21 @@ class MultiModalModel(nn.Module):
             raw_cls_m_proj = F.normalize(self.itc_proj_raw_m(raw_cls_m), dim=-1)
             size_cls_m_proj = F.normalize(self.itc_proj_size_m(size_cls_m), dim=-1)
 
+            self._momentum_update()
+
         # ===== Step 4: ITC Loss =====
         itc_loss, sim_r2s, sim_s2r = self.target.forward_itc(
             raw_cls, size_cls,
             raw_cls_m_proj, size_cls_m_proj,
             self.raw_queue, self.size_queue,
-            temperature=self.itc_temp, alpha=itc_alpha
+            temperature=self.itc_temp
         )
 
-        # ===== Step 5: Fusion for Positive Samples =====
+        # ===== Step 5: Update Queues =====
+        with torch.no_grad():
+            self._dequeue_and_enqueue(raw_cls_m_proj, size_cls_m_proj)
+
+        # ===== Step 6: Fusion for Positive Samples =====
         raw_fused, size_fused, gate_info_pos = self.fusion(
             raw_output, size_output_clean, raw_seg, size_seg,
             **itgca_kwargs
@@ -408,12 +385,12 @@ class MultiModalModel(nn.Module):
         pos_raw_cls = raw_fused[:, 0, :]
         pos_size_cls = size_fused[:, 0, :]
 
-        # ===== Step 6: Hard Negative Sampling =====
+        # ===== Step 7: Hard Negative Sampling =====
         neg_size_idx, neg_raw_idx = self.target.sample_hard_negatives(
             sim_r2s, sim_s2r, batch_size
         )
 
-        # ===== Step 7: Fusion for Negative Samples =====
+        # ===== Step 8: Fusion for Negative Samples =====
         # Negative type 1: (raw_i, size_neg)
         neg_size_output_1 = size_output_clean[neg_size_idx]
         neg_size_seg_1 = size_seg[neg_size_idx]
@@ -463,19 +440,19 @@ class MultiModalModel(nn.Module):
         neg2_raw_cls = neg2_raw_fused[:, 0, :]
         neg2_size_cls = neg2_size_fused[:, 0, :]
 
-        # ===== Step 8: ITM Loss =====
+        # ===== Step 9: ITM Loss =====
         itm_loss, itm_acc = self.target.forward_itm(
             pos_raw_cls, pos_size_cls,
             neg1_raw_cls, neg1_size_cls,
             neg2_raw_cls, neg2_size_cls
         )
 
-        # ===== Step 9: Encode MASKED Size+IAT =====
+        # ===== Step 10: Encode MASKED Size+IAT =====
         size_emb_masked = self.embedding_size(size_src_masked, iat_src_masked)
         size_seg_masked = (size_src_masked != PAD_ID).long()
         size_output_masked = self.encoder_size(size_emb_masked, size_seg_masked)
 
-        # ===== Step 10: Fusion with Masked Size features =====
+        # ===== Step 11: Fusion with Masked Size features =====
         if self.use_itgca:
             # Use clean encoder CLS and clean r_stat/local_ent for masked fusion
             itgca_kwargs_masked = dict(itgca_kwargs)
@@ -487,7 +464,7 @@ class MultiModalModel(nn.Module):
             **itgca_kwargs_masked
         )
 
-        # ===== Step 11: Masked Reconstruction Loss =====
+        # ===== Step 12: Masked Reconstruction Loss =====
         recon_results = self.target.forward_masked_reconstruction(
             size_fused_masked, tgt_mlm_size, tgt_mlm_temporal
         )
@@ -504,10 +481,6 @@ class MultiModalModel(nn.Module):
             'recon_temporal_correct_exact': recon_results['temporal_correct_exact'],
             'recon_temporal_correct_range': recon_results['temporal_correct_range'],
             'recon_temporal_denom': recon_results['temporal_denom'],
-            # The trainer commits these detached keys only after the complete
-            # accumulation group finishes a successful optimizer step.
-            'queue_raw_feat': raw_cls_m_proj.detach(),
-            'queue_size_feat': size_cls_m_proj.detach(),
         }
 
         return loss_dict

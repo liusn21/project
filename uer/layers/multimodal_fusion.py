@@ -67,10 +67,7 @@ class ITGCrossAttentionGate(nn.Module):
         # Bilinear: r_learned = sigmoid(c_q^T W c_k + bias). Always created.
         self.bilinear_W = nn.Parameter(torch.zeros(hidden_size, hidden_size))
         self.bilinear_bias = nn.Parameter(torch.zeros(1))
-        # gain 0.5 (was 0.1): give r_learned enough initial magnitude that it is not a
-        # dead-neutral 0.5 at start, so the learned modality gate has signal to train
-        # from (paired with the higher gate LR in the optimizer grouping).
-        nn.init.xavier_uniform_(self.bilinear_W, gain=0.5)
+        nn.init.xavier_uniform_(self.bilinear_W, gain=0.1)
 
         # alpha_1: gated residual mixing. sigmoid(alpha_init) controls initial blend.
         # Default -2.0 → sigmoid ≈ 0.12 (heavy r_stat reliance, curriculum learning).

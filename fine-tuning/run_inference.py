@@ -63,6 +63,20 @@ from uer.utils.seed import set_seed
 from uer.opts import model_opts
 
 
+def get_stage2_classifier(old=False):
+    """Return the Stage 2 classifier implementation matching the checkpoint."""
+    if not old:
+        return Stage2Classifier
+
+    try:
+        from run_classifier_stage2_old import Stage2Classifier as OldStage2Classifier
+    except ImportError as exc:
+        raise ImportError(
+            "--old requires fine-tuning/run_classifier_stage2_old.py"
+        ) from exc
+    return OldStage2Classifier
+
+
 def build_args():
     parser = argparse.ArgumentParser(
         description="Stage1/Stage2 Classifier Inference & Evaluation",
@@ -108,6 +122,24 @@ def build_args():
                         help="[Stage 2] Enable ITGCA (must match training config)")
     parser.add_argument("--itgca_window_size", type=int, default=16,
                         help="[Stage 2] ITGCA sliding window size")
+    parser.add_argument(
+        "--old",
+        action="store_true",
+        help=(
+            "[Stage 2] Use the legacy classifier implementation from "
+            "run_classifier_stage2_old.py"
+        ),
+    )
+    parser.add_argument(
+        "--use_attn_pooling",
+        action="store_true",
+        help="[Stage 2 --old] Enable the legacy attention-pooling modules",
+    )
+    parser.add_argument(
+        "--use_scl",
+        action="store_true",
+        help="[Stage 2 --old] Enable the legacy SCL projection head",
+    )
 
     # ITGCA component-level ablation flags — MUST match the pretrained checkpoint config.
     parser.add_argument("--ablate_r_stat", action="store_true",
@@ -137,11 +169,18 @@ def build_args():
                              "(only used with --detailed)")
 
     args = parser.parse_args()
+    legacy_cli_options = (args.old, args.use_attn_pooling, args.use_scl)
 
     # Load hyperparameters from config JSON
     if args.config_path:
         args = load_hyperparam(args)
     args = apply_modality_configs(args)
+    args.old, args.use_attn_pooling, args.use_scl = legacy_cli_options
+
+    if args.old and args.stage != 2:
+        parser.error("--old is only valid with --stage 2")
+    if (args.use_attn_pooling or args.use_scl) and not args.old:
+        parser.error("--use_attn_pooling and --use_scl require --old")
 
     args.max_seq_length = max(args.seq_length_raw, args.seq_length_size)
     args.dropout = getattr(args, 'dropout', 0.1)
@@ -373,7 +412,14 @@ def main():
             args, len(vocab_raw), len(vocab_size), len(vocab_temporal), args.labels_num
         )
     else:
-        model = Stage2Classifier(
+        stage2_classifier = get_stage2_classifier(args.old)
+        if args.old:
+            print(
+                "  Legacy classifier: "
+                f"attention_pooling={args.use_attn_pooling}, "
+                f"SCL={args.use_scl}"
+            )
+        model = stage2_classifier(
             args, len(vocab_raw), len(vocab_size), len(vocab_temporal), args.labels_num
         )
 
@@ -452,6 +498,9 @@ def main():
         print(f"    --ablate_g_token={getattr(args, 'ablate_g_token', False)}")
         print(f"    --ablate_source_bias={getattr(args, 'ablate_source_bias', False)}")
         print(f"    --num_fusion_layers={getattr(args, 'num_fusion_layers', 6)}")
+        print(f"    --old={getattr(args, 'old', False)}")
+        print(f"    --use_attn_pooling={getattr(args, 'use_attn_pooling', False)}")
+        print(f"    --use_scl={getattr(args, 'use_scl', False)}")
         sys.exit(1)
 
     # Filter and load with strict=True

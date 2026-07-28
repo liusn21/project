@@ -1415,12 +1415,6 @@ class MultiModalDataLoader(DataLoader):
 
             self.start += self.batch_size
 
-            # ITM hard-negative mining needs at least one in-batch negative.
-            # A single-item EOF tail batch would become an all-masked similarity
-            # row after removing the positive pair.
-            if len(instances) < 2:
-                continue
-
             # Batch lists (9 tensors: raw*3, size/iat clean*2, size/iat masked*2, targets*2)
             raw_src_batch = []
             raw_packet_ids_batch = []

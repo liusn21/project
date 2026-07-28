@@ -122,7 +122,7 @@ class MultiModalTarget(nn.Module):
             self.recon_temporal_linear_2 = nn.Linear(hidden_size, self.vocab_size_temporal)
 
     def forward_itc(self, raw_cls, size_cls, raw_cls_m, size_cls_m,
-                    raw_queue, size_queue, temperature=0.07, alpha=0.0):
+                    raw_queue, size_queue, temperature=0.07):
         """
         ITC (Image-Text Contrastive) Loss
 
@@ -136,9 +136,6 @@ class MultiModalTarget(nn.Module):
             raw_queue: [queue_size, hidden] - Raw feature queue
             size_queue: [queue_size, hidden] - Size feature queue
             temperature: contrastive temperature
-            alpha: ALBEF momentum-distillation weight in [0, 1]
-                   (0 = pure hard-label InfoNCE; >0 mixes in momentum soft targets)
-
         Returns:
             itc_loss: ITC loss
             sim_r2s: [batch, batch+queue] similarity matrix (reused by ITM hard-negative mining)
@@ -146,43 +143,28 @@ class MultiModalTarget(nn.Module):
         """
         batch_size = raw_cls.size(0)
 
-        # Project and normalize student (online) features
-        raw_feat = F.normalize(self.itc_proj_raw(raw_cls), dim=-1)   # [batch, hidden]
+        # Project and normalize
+        raw_feat = F.normalize(self.itc_proj_raw(raw_cls), dim=-1)  # [batch, hidden]
         size_feat = F.normalize(self.itc_proj_size(size_cls), dim=-1)  # [batch, hidden]
 
-        # Momentum (teacher) features — already projected & normalized in the model
-        raw_feat_m = F.normalize(raw_cls_m, dim=-1)   # [batch, hidden]
+        # Momentum features (already projected and normalized in model)
+        raw_feat_m = F.normalize(raw_cls_m, dim=-1)  # [batch, hidden]
         size_feat_m = F.normalize(size_cls_m, dim=-1)  # [batch, hidden]
 
-        # Append the feature queue to enlarge the negative pool
-        raw_feat_all = torch.cat([raw_feat_m, raw_queue.clone().detach()], dim=0)    # [batch+queue, hidden]
-        size_feat_all = torch.cat([size_feat_m, size_queue.clone().detach()], dim=0)  # [batch+queue, hidden]
+        # Concatenate with queue
+        raw_feat_all = torch.cat([raw_feat_m, raw_queue.clone().detach()], dim=0)
+        size_feat_all = torch.cat([size_feat_m, size_queue.clone().detach()], dim=0)
 
-        # Student similarities (with grad)
+        # Compute similarity
         sim_r2s = raw_feat @ size_feat_all.T / temperature  # [batch, batch+queue]
         sim_s2r = size_feat @ raw_feat_all.T / temperature  # [batch, batch+queue]
 
-        # ===== Soft targets: ALBEF momentum distillation =====
-        # target = alpha * softmax(teacher_sim) + (1 - alpha) * one_hot_positive.
-        # The positive for row i is the teacher feature of sample i, on the diagonal
-        # of the first `batch` columns. With alpha=0 the target is a pure one-hot, so
-        # the loss below reduces EXACTLY to the previous InfoNCE (cross-entropy with
-        # arange labels) — this keeps the change backward-compatible / ablatable.
-        with torch.no_grad():
-            sim_targets = torch.zeros_like(sim_r2s)
-            sim_targets.fill_diagonal_(1.0)
-            if alpha > 0:
-                sim_r2s_m = raw_feat_m @ size_feat_all.T / temperature
-                sim_s2r_m = size_feat_m @ raw_feat_all.T / temperature
-                sim_r2s_targets = alpha * F.softmax(sim_r2s_m, dim=1) + (1.0 - alpha) * sim_targets
-                sim_s2r_targets = alpha * F.softmax(sim_s2r_m, dim=1) + (1.0 - alpha) * sim_targets
-            else:
-                sim_r2s_targets = sim_targets
-                sim_s2r_targets = sim_targets
+        # Labels: positive pairs are on diagonal (indices 0 to batch-1)
+        labels = torch.arange(batch_size, device=raw_cls.device)
 
-        # Soft-label cross-entropy (== InfoNCE when alpha=0)
-        loss_r2s = -torch.sum(F.log_softmax(sim_r2s, dim=1) * sim_r2s_targets, dim=1).mean()
-        loss_s2r = -torch.sum(F.log_softmax(sim_s2r, dim=1) * sim_s2r_targets, dim=1).mean()
+        # Contrastive loss (InfoNCE)
+        loss_r2s = F.cross_entropy(sim_r2s, labels)
+        loss_s2r = F.cross_entropy(sim_s2r, labels)
         itc_loss = (loss_r2s + loss_s2r) / 2
 
         return itc_loss, sim_r2s, sim_s2r
@@ -200,12 +182,6 @@ class MultiModalTarget(nn.Module):
             neg_size_idx: [batch] - hard negative size indices for each raw
             neg_raw_idx: [batch] - hard negative raw indices for each size
         """
-        if batch_size < 2:
-            raise ValueError(
-                "ITM hard-negative mining requires a local batch with at least "
-                "2 samples. Check that the multimodal dataloader drops single-sample tail batches."
-            )
-
         with torch.no_grad():
             # Use only the in-batch similarities (the first batch_size columns).
             sim_r2s_batch = sim_r2s[:, :batch_size].clone()

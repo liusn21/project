@@ -9,16 +9,18 @@ The input layout is the same as ``fine-tuning/multimodal_data_utils.py``::
 
 Each PCAP is treated as one bidirectional flow/sample.  The audit deliberately
 reports a conservative lower bound: a flow is "confirmed compressed" only when
-one of the explicitly supported detectors validates it.  Encryption, unsupported
-uncompressed.
+a detector admitted by the selected ``--compression-level`` produces exact
+wire-byte regions.  Encryption and unsupported evidence are never silently
+treated as uncompressed.
 
-Supported confirmed compression:
+Compression levels are cumulative:
 
-* cleartext HTTP/1.x Content-Encoding/Transfer-Encoding gzip or deflate;
-* intrinsic gzip, ZIP (deflate/bzip2/LZMA entries), PNG, JPEG, and WebP data.
+* level 1 preserves the original strict HTTP/gzip/ZIP/PNG/JPEG/WebP scope;
+* level 2 adds fully validated zlib, BZIP2, XZ, GIF, WOFF1, and CWS objects;
+* level 3 adds exactly bounded HTTP br/zstd/compress declarations, declared ZIP
+  methods, and structurally complete Zstandard/LZ4 compressed blocks.
 
-Explicit but unsupported HTTP codings (including br and zstd) are recorded in
-the per-flow output but are not counted as confirmed.
+The default is level 1 so existing commands and strict results remain stable.
 
 The content window exactly follows the default fine-tuning path: the first eight
 payload-bearing TCP/UDP packets, at most 64 payload bytes per packet, concatenated
@@ -35,6 +37,7 @@ Example::
 
     python revision/compression_audit.py /data/Browser \
         --output-dir /results/Browser_compression_audit \
+        --compression-level 2 \
         --workers 8
 
 This script is an offline audit utility.  It does not modify the input dataset.
@@ -45,9 +48,11 @@ from __future__ import annotations
 import argparse
 import bisect
 import binascii
+import bz2
 import csv
 import io
 import json
+import lzma
 import math
 import os
 import re
@@ -67,7 +72,7 @@ from scapy.all import PcapReader
 from scapy.layers.inet import IP, TCP, UDP
 
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.3.0"
 
 BYTES_PER_PACKET = 64
 MAX_RAW_PACKETS = 8
@@ -83,12 +88,23 @@ BYTE_TOKEN_OFFSET = 5
 DEFAULT_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_HTTP_HEADER_BYTES = 64 * 1024
 DEFAULT_WORKERS = max(1, min(4, os.cpu_count() or 1))
+DEFAULT_COMPRESSION_LEVEL = 1
+COMPRESSION_LEVELS = (1, 2, 3)
 PENDING_TASKS_PER_WORKER = 2
+DECODE_PROBE_CHUNK_BYTES = 4 * 1024
+DECODE_INPUT_CHUNK_BYTES = 64 * 1024
 
 TCP_SEQUENCE_MODULUS = 1 << 32
 TCP_SEQUENCE_MASK = TCP_SEQUENCE_MODULUS - 1
 
 SUPPORTED_HTTP_CODINGS = {"gzip", "x-gzip", "deflate", "x-deflate"}
+DECLARED_HTTP_COMPRESSION_CODINGS = {
+    *SUPPORTED_HTTP_CODINGS,
+    "br",
+    "zstd",
+    "compress",
+    "x-compress",
+}
 NON_COMPRESSING_HTTP_CODINGS = {"identity", "chunked"}
 
 ZIP_SUPPORTED_METHODS = {
@@ -96,6 +112,44 @@ ZIP_SUPPORTED_METHODS = {
     zipfile.ZIP_BZIP2,
     zipfile.ZIP_LZMA,
 }
+
+# APPNOTE compression method identifiers.  Method 99 (AES) and encrypted
+# entries are deliberately excluded: their wire representation is ciphertext,
+# not observable compressed bytes.
+ZIP_DECLARED_COMPRESSION_METHODS = {
+    1,              # Shrunk
+    2, 3, 4, 5,     # Reduced
+    6,              # Imploded
+    8,              # Deflate
+    9,              # Deflate64
+    10,             # Old IBM TERSE
+    12,             # BZIP2
+    14,             # LZMA
+    16,             # IBM z/OS CMPSC
+    18,             # IBM TERSE
+    19,             # IBM LZ77
+    20, 93,         # Zstandard (deprecated/current identifiers)
+    94,             # MP3
+    95,             # XZ
+    96,             # JPEG
+    97,             # WavPack
+    98,             # PPMd
+}
+
+ZSTD_FRAME_MAGIC = b"\x28\xb5\x2f\xfd"
+LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+XZ_STREAM_MAGIC = b"\xfd7zXZ\x00"
+ZLIB_NO_DICTIONARY_HEADERS = tuple(
+    bytes((cmf, flags))
+    for cmf in range(0x08, 0x79, 0x10)
+    for flags in range(256)
+    if ((cmf << 8) | flags) % 31 == 0 and not (flags & 0x20)
+)
+ZLIB_HEADER_PATTERN = re.compile(
+    b"(?=(?:" + b"|".join(
+        re.escape(header) for header in ZLIB_NO_DICTIONARY_HEADERS
+    ) + b"))"
+)
 
 PCAP_SUFFIXES = {".pcap", ".pcapng"}
 
@@ -540,7 +594,9 @@ def read_pcap_for_audit(path: Path) -> ParsedPcap:
                                 carrier=protocol_name,
                                 direction=direction,
                                 position=data_start + payload_offset,
-                                packet_index=packet_index if protocol_number == 17 else None,
+                                packet_index=(
+                                    packet_index if protocol_number == 17 else None
+                                ),
                                 value=value,
                             )
                         )
@@ -596,7 +652,12 @@ class DecodeResult:
     flavor: str
 
 
-def _bounded_zlib_decode(data: bytes, wbits: int, max_output: int, flavor: str) -> DecodeResult:
+def _bounded_zlib_decode(
+    data: bytes,
+    wbits: int,
+    max_output: int,
+    flavor: str,
+) -> DecodeResult:
     """Decode exactly one zlib/deflate/gzip member with an output cap."""
 
     decoder = zlib.decompressobj(wbits)
@@ -643,6 +704,85 @@ def _bounded_zlib_decode(data: bytes, wbits: int, max_output: int, flavor: str) 
         raise DetectionError(f"incomplete {flavor} stream")
 
 
+def _bounded_zlib_decode_range(
+    data: bytes,
+    wbits: int,
+    max_output: int,
+    flavor: str,
+    *,
+    start: int,
+    end: Optional[int] = None,
+) -> DecodeResult:
+    """Decode a Level 2/3 candidate without allocating ``data[start:]``.
+
+    ``consumed`` is relative to ``start``.  Fixed-size input chunks prevent the
+    common two-byte zlib candidates in high-entropy traffic from repeatedly
+    copying the entire remaining flow.
+    """
+
+    if end is None:
+        end = len(data)
+    if not (0 <= start <= end <= len(data)):
+        raise ValueError(
+            f"invalid {flavor} input bounds [{start}, {end}) for {len(data)} bytes"
+        )
+
+    decoder = zlib.decompressobj(wbits)
+    output = bytearray()
+    cursor = start
+    pending = b""
+
+    while True:
+        if not pending:
+            if cursor >= end:
+                raise DetectionError(f"incomplete {flavor} stream")
+            chunk_size = (
+                DECODE_PROBE_CHUNK_BYTES
+                if cursor == start
+                else DECODE_INPUT_CHUNK_BYTES
+            )
+            chunk_end = min(end, cursor + chunk_size)
+            pending = data[cursor:chunk_end]
+            cursor = chunk_end
+
+        remaining = max_output - len(output)
+        if remaining < 0:
+            raise DecompressionLimitError(
+                f"decoded output exceeds {max_output} bytes"
+            )
+        try:
+            part = decoder.decompress(pending, remaining + 1)
+        except zlib.error as exc:
+            raise DetectionError(f"{flavor} decode failed: {exc}") from exc
+        output.extend(part)
+        if len(output) > max_output:
+            raise DecompressionLimitError(
+                f"decoded output exceeds {max_output} bytes"
+            )
+
+        if decoder.eof:
+            try:
+                tail = decoder.flush(max(1, max_output - len(output) + 1))
+            except zlib.error as exc:
+                raise DetectionError(f"{flavor} flush failed: {exc}") from exc
+            output.extend(tail)
+            if len(output) > max_output:
+                raise DecompressionLimitError(
+                    f"decoded output exceeds {max_output} bytes"
+                )
+            consumed = cursor - start - len(decoder.unused_data)
+            if consumed <= 0:
+                raise DetectionError(f"{flavor} decoder consumed no input")
+            return DecodeResult(bytes(output), consumed, flavor)
+
+        if decoder.unconsumed_tail:
+            if len(decoder.unconsumed_tail) == len(pending) and not part:
+                raise DetectionError(f"{flavor} decoder made no progress")
+            pending = decoder.unconsumed_tail
+            continue
+        pending = b""
+
+
 def _decode_gzip_members(data: bytes, max_output: int) -> DecodeResult:
     offset = 0
     output = bytearray()
@@ -684,11 +824,122 @@ def _decode_deflate(data: bytes, max_output: int) -> DecodeResult:
     raise DetectionError("; ".join(errors))
 
 
+def _bounded_bz2_decode(
+    data: bytes,
+    max_output: int,
+    *,
+    start: int = 0,
+    end: Optional[int] = None,
+) -> DecodeResult:
+    """Decode one BZIP2 stream in fixed-size input chunks."""
+
+    if end is None:
+        end = len(data)
+    if not (0 <= start <= end <= len(data)):
+        raise ValueError(
+            f"invalid bzip2 input bounds [{start}, {end}) for {len(data)} bytes"
+        )
+
+    decoder = bz2.BZ2Decompressor()
+    output = bytearray()
+    cursor = start
+
+    while True:
+        if decoder.needs_input:
+            if cursor >= end:
+                raise DetectionError("incomplete bzip2 stream")
+            chunk_end = min(end, cursor + DECODE_INPUT_CHUNK_BYTES)
+            pending = data[cursor:chunk_end]
+            cursor = chunk_end
+        else:
+            pending = b""
+
+        remaining = max_output - len(output)
+        if remaining < 0:
+            raise DecompressionLimitError(
+                f"decoded output exceeds {max_output} bytes"
+            )
+        try:
+            part = decoder.decompress(pending, remaining + 1)
+        except (OSError, EOFError) as exc:
+            raise DetectionError(f"bzip2 decode failed: {exc}") from exc
+        output.extend(part)
+        if len(output) > max_output:
+            raise DecompressionLimitError(
+                f"decoded output exceeds {max_output} bytes"
+            )
+        if decoder.eof:
+            consumed = cursor - start - len(decoder.unused_data)
+            if consumed <= 0:
+                raise DetectionError("bzip2 decoder consumed no input")
+            return DecodeResult(bytes(output), consumed, "bzip2")
+        if not part and not pending:
+            raise DetectionError("bzip2 decoder made no progress")
+
+
+def _bounded_xz_decode(
+    data: bytes,
+    max_output: int,
+    *,
+    start: int = 0,
+    end: Optional[int] = None,
+) -> DecodeResult:
+    """Decode one XZ stream in fixed-size input chunks."""
+
+    if end is None:
+        end = len(data)
+    if not (0 <= start <= end <= len(data)):
+        raise ValueError(
+            f"invalid xz input bounds [{start}, {end}) for {len(data)} bytes"
+        )
+
+    decoder = lzma.LZMADecompressor(
+        format=lzma.FORMAT_XZ,
+        memlimit=max(1024 * 1024, max_output),
+    )
+    output = bytearray()
+    cursor = start
+
+    while True:
+        if decoder.needs_input:
+            if cursor >= end:
+                raise DetectionError("incomplete xz stream")
+            chunk_end = min(end, cursor + DECODE_INPUT_CHUNK_BYTES)
+            pending = data[cursor:chunk_end]
+            cursor = chunk_end
+        else:
+            pending = b""
+
+        remaining = max_output - len(output)
+        if remaining < 0:
+            raise DecompressionLimitError(
+                f"decoded output exceeds {max_output} bytes"
+            )
+        try:
+            part = decoder.decompress(pending, remaining + 1)
+        except lzma.LZMAError as exc:
+            raise DetectionError(f"xz decode failed: {exc}") from exc
+        output.extend(part)
+        if len(output) > max_output:
+            raise DecompressionLimitError(
+                f"decoded output exceeds {max_output} bytes"
+            )
+        if decoder.eof:
+            consumed = cursor - start - len(decoder.unused_data)
+            if consumed <= 0:
+                raise DetectionError("xz decoder consumed no input")
+            return DecodeResult(bytes(output), consumed, "xz")
+        if not part and not pending:
+            raise DetectionError("xz decoder made no progress")
+
+
 def _canonical_http_coding(coding: str) -> str:
     if coding in {"gzip", "x-gzip"}:
         return "gzip"
     if coding in {"deflate", "x-deflate"}:
         return "deflate"
+    if coding in {"compress", "x-compress"}:
+        return "compress"
     return coding
 
 
@@ -979,6 +1230,7 @@ def detect_http_compression(
     source: SourceBuffer,
     max_output: int,
     max_header_bytes: int,
+    compression_level: int,
     evidence: List[CompressionEvidence],
     unsupported: List[Dict[str, Any]],
     candidate_failures: List[Dict[str, Any]],
@@ -1017,6 +1269,70 @@ def detect_http_compression(
             if coding not in SUPPORTED_HTTP_CODINGS
         })
         if unsupported_codings:
+            declared_supported = (
+                compression_level >= 3
+                and all(
+                    coding in DECLARED_HTTP_COMPRESSION_CODINGS
+                    for coding in compressing_codings
+                )
+            )
+            if declared_supported:
+                try:
+                    body = _extract_http_body(
+                        source.data,
+                        header,
+                        transfer_codings,
+                    )
+                    if not body.encoded or not body.spans:
+                        raise DetectionError(
+                            "declared-compressed HTTP entity has an empty body"
+                        )
+                    if not body.framed_complete and not source.closed_at_end:
+                        raise DetectionError(
+                            "declared compression lacks an exact HTTP body boundary"
+                        )
+                    span_key = tuple(body.spans)
+                    if span_key in seen_evidence:
+                        continue
+                    seen_evidence.add(span_key)
+                    evidence.append(
+                        CompressionEvidence(
+                            category="protocol",
+                            kind="http:" + "+".join(
+                                _canonical_http_coding(value)
+                                for value in compressing_codings
+                            ),
+                            source=source.source_id,
+                            regions=[
+                                source.region(start, end)
+                                for start, end in body.spans
+                            ],
+                            detail={
+                                "start_line": header.start_line,
+                                "header_stream_offset": (
+                                    source.start + header.start
+                                ),
+                                "body_mode": body.mode,
+                                "wire_encoded_bytes": len(body.encoded),
+                                "minimum_level": 3,
+                                "validation": (
+                                    "explicit recognized HTTP compression coding "
+                                    "plus exact message framing; payload not decoded"
+                                ),
+                            },
+                        )
+                    )
+                except (DetectionError, ValueError) as exc:
+                    candidate_failures.append({
+                        "kind": "http-declared:" + "+".join(
+                            compressing_codings
+                        ),
+                        "source": source.source_id,
+                        "stream_offset": source.start + header.start,
+                        "reason": str(exc),
+                    })
+                continue
+
             unsupported.append({
                 "kind": "http-content-coding",
                 "source": source.source_id,
@@ -1237,6 +1553,7 @@ def _zip_local_data_region(blob: bytes, info: zipfile.ZipInfo) -> Tuple[int, int
 def detect_zip(
     source: SourceBuffer,
     max_output: int,
+    compression_level: int,
     evidence: List[CompressionEvidence],
     unsupported: List[Dict[str, Any]],
     candidate_failures: List[Dict[str, Any]],
@@ -1279,7 +1596,9 @@ def detect_zip(
 
             blob = source.data[archive_start:archive_end]
             regions: List[ByteRegion] = []
+            declared_regions: List[ByteRegion] = []
             methods: Set[int] = set()
+            declared_methods: Set[int] = set()
             unsupported_entries: List[Dict[str, Any]] = []
 
             with zipfile.ZipFile(io.BytesIO(blob), "r") as archive:
@@ -1300,6 +1619,30 @@ def detect_zip(
                         })
                         continue
                     if info.compress_type not in ZIP_SUPPORTED_METHODS:
+                        if info.flag_bits & 0x40:
+                            unsupported_entries.append({
+                                "filename": info.filename,
+                                "method": info.compress_type,
+                                "encrypted": True,
+                            })
+                            continue
+                        if (
+                            compression_level >= 3
+                            and info.compress_type
+                            in ZIP_DECLARED_COMPRESSION_METHODS
+                        ):
+                            local_start, local_end = _zip_local_data_region(
+                                blob,
+                                info,
+                            )
+                            declared_regions.append(
+                                source.region(
+                                    archive_start + local_start,
+                                    archive_start + local_end,
+                                )
+                            )
+                            declared_methods.add(info.compress_type)
+                            continue
                         unsupported_entries.append({
                             "filename": info.filename,
                             "method": info.compress_type,
@@ -1342,6 +1685,28 @@ def detect_zip(
                             "compressed_entries": len(regions),
                             "methods": sorted(methods),
                             "validation": "central/local headers plus per-entry decode/CRC",
+                        },
+                    )
+                )
+            if declared_regions:
+                accepted_archives.add(archive_key)
+                evidence.append(
+                    CompressionEvidence(
+                        category="intrinsic",
+                        kind="zip-declared",
+                        source=source.source_id,
+                        regions=declared_regions,
+                        detail={
+                            "object_start": source.start + archive_start,
+                            "object_end": source.start + archive_end,
+                            "compressed_entries": len(declared_regions),
+                            "methods": sorted(declared_methods),
+                            "minimum_level": 3,
+                            "validation": (
+                                "complete ZIP central/local structure plus "
+                                "recognized non-stored, non-encrypted method; "
+                                "entry payload not decoded"
+                            ),
                         },
                     )
                 )
@@ -1748,9 +2113,1098 @@ def detect_webp(
             cursor = start + 4
 
 
+def _has_supported_zlib_header(data: bytes, start: int) -> bool:
+    if start < 0 or start + 2 > len(data):
+        return False
+    cmf = data[start]
+    flags = data[start + 1]
+    return (
+        cmf & 0x0F == 8
+        and cmf >> 4 <= 7
+        and ((cmf << 8) | flags) % 31 == 0
+        and not (flags & 0x20)  # preset dictionary unavailable to the audit
+    )
+
+
+def detect_zlib_streams(
+    source: SourceBuffer,
+    max_output: int,
+    evidence: List[CompressionEvidence],
+) -> None:
+    """Find fully validated zlib streams without preset dictionaries.
+
+    A two-byte zlib header is too common to retain failed candidates on large
+    high-entropy datasets.  Only no-dictionary streams that reach EOF and pass
+    Adler-32 are emitted.
+    """
+
+    accepted_until = -1
+    for match in ZLIB_HEADER_PATTERN.finditer(source.data):
+        start = match.start()
+        if start < accepted_until:
+            continue
+        try:
+            decoded = _bounded_zlib_decode_range(
+                source.data,
+                zlib.MAX_WBITS,
+                max_output,
+                "zlib",
+                start=start,
+            )
+            if not decoded.output:
+                raise DetectionError("zlib stream expands to an empty payload")
+            object_end = start + decoded.consumed
+            deflate_start = start + 2
+            deflate_end = object_end - 4  # Adler-32 trailer
+            if deflate_start >= deflate_end:
+                raise DetectionError("zlib stream has no DEFLATE payload")
+            evidence.append(
+                CompressionEvidence(
+                    category="intrinsic",
+                    kind="zlib",
+                    source=source.source_id,
+                    regions=[source.region(deflate_start, deflate_end)],
+                    detail={
+                        "object_start": source.start + start,
+                        "object_end": source.start + object_end,
+                        "decoded_bytes": len(decoded.output),
+                        "minimum_level": 2,
+                        "validation": (
+                            "valid no-dictionary zlib header plus complete decode "
+                            "and Adler-32"
+                        ),
+                    },
+                )
+            )
+            accepted_until = object_end
+        except (DetectionError, DecompressionLimitError, ValueError):
+            # Failed two-byte candidates are intentionally silent; otherwise
+            # random/high-entropy traffic would create enormous audit JSON.
+            continue
+
+
+def detect_bzip2_streams(
+    source: SourceBuffer,
+    max_output: int,
+    evidence: List[CompressionEvidence],
+    candidate_failures: List[Dict[str, Any]],
+) -> None:
+    cursor = 0
+    while True:
+        start = source.data.find(b"BZh", cursor)
+        if start < 0:
+            return
+        try:
+            if (
+                start + 4 > len(source.data)
+                or source.data[start + 3] not in b"123456789"
+            ):
+                raise DetectionError("invalid BZIP2 block-size header")
+            decoded = _bounded_bz2_decode(
+                source.data,
+                max_output,
+                start=start,
+            )
+            if not decoded.output:
+                raise DetectionError("BZIP2 stream expands to an empty payload")
+            object_end = start + decoded.consumed
+            evidence.append(
+                CompressionEvidence(
+                    category="intrinsic",
+                    kind="bzip2",
+                    source=source.source_id,
+                    regions=[source.region(start, object_end)],
+                    detail={
+                        "object_start": source.start + start,
+                        "object_end": source.start + object_end,
+                        "decoded_bytes": len(decoded.output),
+                        "minimum_level": 2,
+                        "validation": "complete BZIP2 decode plus internal CRC",
+                    },
+                )
+            )
+            cursor = object_end
+        except (DetectionError, DecompressionLimitError, ValueError) as exc:
+            candidate_failures.append({
+                "kind": "bzip2",
+                "source": source.source_id,
+                "offset": source.start + start,
+                "reason": str(exc),
+            })
+            cursor = start + 3
+
+
+def detect_xz_streams(
+    source: SourceBuffer,
+    max_output: int,
+    evidence: List[CompressionEvidence],
+    candidate_failures: List[Dict[str, Any]],
+) -> None:
+    cursor = 0
+    while True:
+        start = source.data.find(XZ_STREAM_MAGIC, cursor)
+        if start < 0:
+            return
+        try:
+            decoded = _bounded_xz_decode(
+                source.data,
+                max_output,
+                start=start,
+            )
+            if not decoded.output:
+                raise DetectionError("XZ stream expands to an empty payload")
+            object_end = start + decoded.consumed
+            evidence.append(
+                CompressionEvidence(
+                    category="intrinsic",
+                    kind="xz",
+                    source=source.source_id,
+                    regions=[source.region(start, object_end)],
+                    detail={
+                        "object_start": source.start + start,
+                        "object_end": source.start + object_end,
+                        "decoded_bytes": len(decoded.output),
+                        "minimum_level": 2,
+                        "validation": "complete XZ decode plus integrity check",
+                    },
+                )
+            )
+            cursor = object_end
+        except (DetectionError, DecompressionLimitError, ValueError) as exc:
+            candidate_failures.append({
+                "kind": "xz",
+                "source": source.source_id,
+                "offset": source.start + start,
+                "reason": str(exc),
+            })
+            cursor = start + len(XZ_STREAM_MAGIC)
+
+
+def detect_cws(
+    source: SourceBuffer,
+    max_output: int,
+    evidence: List[CompressionEvidence],
+    candidate_failures: List[Dict[str, Any]],
+) -> None:
+    """Validate zlib-compressed SWF (CWS) objects."""
+
+    cursor = 0
+    while True:
+        start = source.data.find(b"CWS", cursor)
+        if start < 0:
+            return
+        try:
+            if start + 8 > len(source.data):
+                raise DetectionError("truncated CWS header")
+            version = source.data[start + 3]
+            file_length = int.from_bytes(
+                source.data[start + 4:start + 8],
+                "little",
+            )
+            if version < 6 or file_length < 8:
+                raise DetectionError("invalid CWS version or file length")
+            if file_length - 8 > max_output:
+                raise DecompressionLimitError(
+                    f"CWS decoded body exceeds {max_output} bytes"
+                )
+            encoded_start = start + 8
+            if not _has_supported_zlib_header(source.data, encoded_start):
+                raise DetectionError("CWS body lacks a supported zlib header")
+            decoded = _bounded_zlib_decode_range(
+                source.data,
+                zlib.MAX_WBITS,
+                max_output,
+                "cws-zlib",
+                start=encoded_start,
+            )
+            if len(decoded.output) != file_length - 8:
+                raise DetectionError(
+                    "CWS decoded length does not match FileLength"
+                )
+            object_end = encoded_start + decoded.consumed
+            deflate_start = encoded_start + 2
+            deflate_end = object_end - 4
+            if deflate_start >= deflate_end:
+                raise DetectionError("CWS body has no DEFLATE payload")
+            evidence.append(
+                CompressionEvidence(
+                    category="intrinsic",
+                    kind="swf-cws",
+                    source=source.source_id,
+                    regions=[source.region(deflate_start, deflate_end)],
+                    detail={
+                        "object_start": source.start + start,
+                        "object_end": source.start + object_end,
+                        "swf_version": version,
+                        "decoded_bytes": len(decoded.output),
+                        "minimum_level": 2,
+                        "validation": (
+                            "CWS header plus complete zlib decode to declared "
+                            "SWF FileLength"
+                        ),
+                    },
+                )
+            )
+            cursor = object_end
+        except (DetectionError, DecompressionLimitError, ValueError) as exc:
+            candidate_failures.append({
+                "kind": "swf-cws",
+                "source": source.source_id,
+                "offset": source.start + start,
+                "reason": str(exc),
+            })
+            cursor = start + 3
+
+
+def _read_gif_subblocks(
+    data: bytes,
+    position: int,
+) -> Tuple[bytes, List[Tuple[int, int]], int]:
+    payloads: List[bytes] = []
+    spans: List[Tuple[int, int]] = []
+    while True:
+        if position >= len(data):
+            raise DetectionError("truncated GIF data sub-block length")
+        length = data[position]
+        position += 1
+        if length == 0:
+            return b"".join(payloads), spans, position
+        block_end = position + length
+        if block_end > len(data):
+            raise DetectionError("truncated GIF data sub-block")
+        payloads.append(data[position:block_end])
+        spans.append((position, block_end))
+        position = block_end
+
+
+def _decode_gif_lzw(
+    encoded: bytes,
+    minimum_code_size: int,
+    expected_pixels: int,
+    color_table_size: int,
+    max_output: int,
+) -> int:
+    if not 2 <= minimum_code_size <= 8:
+        raise DetectionError("GIF LZW minimum code size is outside 2..8")
+    if expected_pixels <= 0:
+        raise DetectionError("GIF image has no pixels")
+    if color_table_size <= 0:
+        raise DetectionError("GIF image has no active color table")
+    if expected_pixels > max_output:
+        raise DecompressionLimitError(
+            f"GIF decoded image exceeds {max_output} bytes"
+        )
+
+    clear_code = 1 << minimum_code_size
+    eoi_code = clear_code + 1
+    bit_position = 0
+    total_bits = len(encoded) * 8
+    dictionary: Dict[int, bytes] = {}
+    code_size = minimum_code_size + 1
+    next_code = eoi_code + 1
+    previous: Optional[bytes] = None
+    saw_clear = False
+    saw_eoi = False
+    output_count = 0
+
+    def reset_dictionary() -> None:
+        nonlocal dictionary, code_size, next_code, previous
+        dictionary = {value: bytes([value]) for value in range(clear_code)}
+        code_size = minimum_code_size + 1
+        next_code = eoi_code + 1
+        previous = None
+
+    def read_code(width: int) -> int:
+        nonlocal bit_position
+        if bit_position + width > total_bits:
+            raise DetectionError("GIF LZW stream ends before EOI")
+        value = 0
+        for shift in range(width):
+            byte_index = (bit_position + shift) >> 3
+            bit_index = (bit_position + shift) & 7
+            value |= ((encoded[byte_index] >> bit_index) & 1) << shift
+        bit_position += width
+        return value
+
+    reset_dictionary()
+    while bit_position + code_size <= total_bits:
+        code = read_code(code_size)
+        if code == clear_code:
+            reset_dictionary()
+            saw_clear = True
+            continue
+        if code == eoi_code:
+            saw_eoi = True
+            break
+        if not saw_clear:
+            raise DetectionError("GIF LZW stream does not begin with a clear code")
+
+        if code in dictionary:
+            entry = dictionary[code]
+        elif code == next_code and previous is not None:
+            entry = previous + previous[:1]
+        else:
+            raise DetectionError("GIF LZW code is outside the active dictionary")
+
+        output_count += len(entry)
+        if output_count > expected_pixels or output_count > max_output:
+            raise DetectionError("GIF LZW output exceeds declared image dimensions")
+        if any(value >= color_table_size for value in entry):
+            raise DetectionError("GIF LZW output indexes outside the color table")
+
+        if previous is not None and next_code < 4096:
+            dictionary[next_code] = previous + entry[:1]
+            next_code += 1
+            if next_code == (1 << code_size) and code_size < 12:
+                code_size += 1
+        previous = entry
+
+    if not saw_eoi:
+        raise DetectionError("GIF LZW EOI code not found")
+    if output_count != expected_pixels:
+        raise DetectionError(
+            f"GIF LZW pixel count mismatch: {output_count} != {expected_pixels}"
+        )
+    if total_bits - bit_position > 7:
+        raise DetectionError("GIF LZW data contains bytes after the EOI code")
+    return output_count
+
+
+def _parse_gif(
+    data: bytes,
+    start: int,
+    max_output: int,
+) -> Tuple[int, List[Tuple[int, int]], int, int]:
+    if data[start:start + 6] not in {b"GIF87a", b"GIF89a"}:
+        raise DetectionError("GIF signature is invalid")
+    if start + 13 > len(data):
+        raise DetectionError("truncated GIF logical screen descriptor")
+
+    screen_width = int.from_bytes(data[start + 6:start + 8], "little")
+    screen_height = int.from_bytes(data[start + 8:start + 10], "little")
+    if screen_width == 0 or screen_height == 0:
+        raise DetectionError("GIF logical screen dimensions are zero")
+    packed = data[start + 10]
+    position = start + 13
+    global_color_count = 0
+    if packed & 0x80:
+        global_color_count = 1 << ((packed & 0x07) + 1)
+        global_table_bytes = 3 * global_color_count
+        position += global_table_bytes
+        if position > len(data):
+            raise DetectionError("truncated GIF global color table")
+
+    compressed_spans: List[Tuple[int, int]] = []
+    image_count = 0
+    decoded_pixels = 0
+
+    while position < len(data):
+        marker = data[position]
+        if marker == 0x3B:  # trailer
+            if image_count == 0 or not compressed_spans:
+                raise DetectionError("GIF contains no compressed image data")
+            return position + 1, compressed_spans, image_count, decoded_pixels
+
+        if marker == 0x21:  # extension
+            if position + 2 > len(data):
+                raise DetectionError("truncated GIF extension label")
+            label = data[position + 1]
+            extension, _spans, position = _read_gif_subblocks(
+                data,
+                position + 2,
+            )
+            if label == 0xF9 and len(extension) != 4:
+                raise DetectionError("invalid GIF graphic-control extension")
+            continue
+
+        if marker != 0x2C:
+            raise DetectionError(f"unexpected GIF block marker 0x{marker:02x}")
+        if position + 10 > len(data):
+            raise DetectionError("truncated GIF image descriptor")
+
+        left = int.from_bytes(data[position + 1:position + 3], "little")
+        top = int.from_bytes(data[position + 3:position + 5], "little")
+        width = int.from_bytes(data[position + 5:position + 7], "little")
+        height = int.from_bytes(data[position + 7:position + 9], "little")
+        image_packed = data[position + 9]
+        if width == 0 or height == 0:
+            raise DetectionError("GIF image dimensions are zero")
+        if left + width > screen_width or top + height > screen_height:
+            raise DetectionError("GIF image lies outside the logical screen")
+        if image_packed & 0x18:
+            raise DetectionError("GIF image descriptor reserved bits are set")
+
+        position += 10
+        active_color_count = global_color_count
+        if image_packed & 0x80:
+            active_color_count = 1 << ((image_packed & 0x07) + 1)
+            local_table_bytes = 3 * active_color_count
+            position += local_table_bytes
+            if position > len(data):
+                raise DetectionError("truncated GIF local color table")
+        if position >= len(data):
+            raise DetectionError("truncated GIF LZW code-size field")
+
+        minimum_code_size = data[position]
+        encoded, spans, position = _read_gif_subblocks(data, position + 1)
+        if not encoded or not spans:
+            raise DetectionError("GIF image has empty LZW data")
+        pixels = width * height
+        decoded_pixels += _decode_gif_lzw(
+            encoded,
+            minimum_code_size,
+            pixels,
+            active_color_count,
+            max_output,
+        )
+        if decoded_pixels > max_output:
+            raise DecompressionLimitError(
+                f"GIF decoded images exceed {max_output} bytes in total"
+            )
+        compressed_spans.extend(spans)
+        image_count += 1
+
+    raise DetectionError("GIF trailer not found")
+
+
+def detect_gif(
+    source: SourceBuffer,
+    max_output: int,
+    evidence: List[CompressionEvidence],
+    candidate_failures: List[Dict[str, Any]],
+) -> None:
+    starts = sorted({
+        *list(_iter_signature_offsets(source.data, b"GIF87a")),
+        *list(_iter_signature_offsets(source.data, b"GIF89a")),
+    })
+    accepted_until = -1
+    for start in starts:
+        if start < accepted_until:
+            continue
+        try:
+            object_end, spans, image_count, decoded_pixels = _parse_gif(
+                source.data,
+                start,
+                max_output,
+            )
+            evidence.append(
+                CompressionEvidence(
+                    category="intrinsic",
+                    kind="gif",
+                    source=source.source_id,
+                    regions=[source.region(a, b) for a, b in spans],
+                    detail={
+                        "object_start": source.start + start,
+                        "object_end": source.start + object_end,
+                        "image_count": image_count,
+                        "decoded_pixels": decoded_pixels,
+                        "minimum_level": 2,
+                        "validation": (
+                            "complete GIF structure plus per-image LZW decode "
+                            "to EOI and declared pixel count"
+                        ),
+                    },
+                )
+            )
+            accepted_until = object_end
+        except (DetectionError, DecompressionLimitError, ValueError) as exc:
+            candidate_failures.append({
+                "kind": "gif",
+                "source": source.source_id,
+                "offset": source.start + start,
+                "reason": str(exc),
+            })
+
+
+def _validate_non_overlapping_ranges(
+    ranges: Sequence[Tuple[int, int, str]],
+    minimum_start: int,
+    maximum_end: int,
+) -> None:
+    previous_end = minimum_start
+    for start, end, name in sorted(ranges):
+        if start < minimum_start or end <= start or end > maximum_end:
+            raise DetectionError(f"{name} range is outside the WOFF object")
+        if start < previous_end:
+            raise DetectionError(f"{name} overlaps another WOFF region")
+        previous_end = end
+
+
+def _sfnt_table_checksum(tag: bytes, table: bytes) -> int:
+    checksum_data = bytearray(table)
+    if tag == b"head" and len(checksum_data) >= 12:
+        checksum_data[8:12] = b"\x00\x00\x00\x00"
+    padding = (-len(checksum_data)) % 4
+    if padding:
+        checksum_data.extend(b"\x00" * padding)
+    return sum(
+        int.from_bytes(checksum_data[offset:offset + 4], "big")
+        for offset in range(0, len(checksum_data), 4)
+    ) & 0xFFFFFFFF
+
+
+def detect_woff(
+    source: SourceBuffer,
+    max_output: int,
+    evidence: List[CompressionEvidence],
+    candidate_failures: List[Dict[str, Any]],
+) -> None:
+    cursor = 0
+    while True:
+        start = source.data.find(b"wOFF", cursor)
+        if start < 0:
+            return
+        try:
+            if start + 44 > len(source.data):
+                raise DetectionError("truncated WOFF header")
+            (
+                signature,
+                _flavor,
+                length,
+                num_tables,
+                reserved,
+                total_sfnt_size,
+                _major_version,
+                _minor_version,
+                meta_offset,
+                meta_length,
+                meta_orig_length,
+                priv_offset,
+                priv_length,
+            ) = struct.unpack_from(">4s4sIHHIHHIIIII", source.data, start)
+            if signature != b"wOFF" or reserved != 0:
+                raise DetectionError("invalid WOFF signature/reserved field")
+            directory_end = 44 + 20 * num_tables
+            if num_tables == 0 or directory_end > length:
+                raise DetectionError("invalid WOFF table count or directory")
+            if total_sfnt_size == 0 or start + length > len(source.data):
+                raise DetectionError("invalid or incomplete WOFF object length")
+
+            compressed_spans: List[Tuple[int, int]] = []
+            occupied: List[Tuple[int, int, str]] = []
+            decoded_total = 0
+            calculated_sfnt_size = 12 + 16 * num_tables
+            table_position = start + 44
+            previous_tag: Optional[bytes] = None
+            for table_index in range(num_tables):
+                (
+                    tag,
+                    offset,
+                    comp_length,
+                    orig_length,
+                    orig_checksum,
+                ) = struct.unpack_from(">4sIIII", source.data, table_position)
+                table_position += 20
+                label = f"WOFF table {tag!r}#{table_index}"
+                if previous_tag is not None and tag <= previous_tag:
+                    raise DetectionError("WOFF table tags are not strictly sorted")
+                previous_tag = tag
+                if (
+                    offset % 4 != 0
+                    or comp_length == 0
+                    or orig_length == 0
+                    or comp_length > orig_length
+                    or offset < directory_end
+                    or offset + comp_length > length
+                ):
+                    raise DetectionError(f"invalid {label} lengths/alignment")
+                occupied.append((offset, offset + comp_length, label))
+                decoded_total += orig_length
+                calculated_sfnt_size += (orig_length + 3) & ~3
+                if decoded_total > max_output:
+                    raise DecompressionLimitError(
+                        f"WOFF decoded tables exceed {max_output} bytes"
+                    )
+                if comp_length == orig_length:
+                    table_data = source.data[
+                        start + offset:start + offset + comp_length
+                    ]
+                else:
+                    decoded = _bounded_zlib_decode_range(
+                        source.data,
+                        zlib.MAX_WBITS,
+                        max_output,
+                        "woff-table-zlib",
+                        start=start + offset,
+                        end=start + offset + comp_length,
+                    )
+                    if (
+                        decoded.consumed != comp_length
+                        or len(decoded.output) != orig_length
+                    ):
+                        raise DetectionError(
+                            f"{label} zlib length does not match its directory entry"
+                        )
+                    table_data = decoded.output
+                    compressed_spans.append(
+                        (start + offset, start + offset + comp_length)
+                    )
+                if _sfnt_table_checksum(tag, table_data) != orig_checksum:
+                    raise DetectionError(f"{label} original checksum mismatch")
+
+            if calculated_sfnt_size != total_sfnt_size:
+                raise DetectionError(
+                    "WOFF totalSfntSize does not match the table directory"
+                )
+
+            if meta_offset == 0:
+                if meta_length != 0 or meta_orig_length != 0:
+                    raise DetectionError("WOFF metadata lengths lack an offset")
+            else:
+                if (
+                    meta_length == 0
+                    or meta_orig_length == 0
+                    or meta_offset % 4 != 0
+                    or meta_offset < directory_end
+                    or meta_offset + meta_length > length
+                ):
+                    raise DetectionError("WOFF metadata has an empty length")
+                occupied.append((
+                    meta_offset,
+                    meta_offset + meta_length,
+                    "WOFF metadata",
+                ))
+                decoded_total += meta_orig_length
+                if decoded_total > max_output:
+                    raise DecompressionLimitError(
+                        f"WOFF decoded content exceeds {max_output} bytes"
+                    )
+                decoded = _bounded_zlib_decode_range(
+                    source.data,
+                    zlib.MAX_WBITS,
+                    max_output,
+                    "woff-metadata-zlib",
+                    start=start + meta_offset,
+                    end=start + meta_offset + meta_length,
+                )
+                if (
+                    decoded.consumed != meta_length
+                    or len(decoded.output) != meta_orig_length
+                ):
+                    raise DetectionError(
+                        "WOFF metadata zlib length does not match the header"
+                    )
+                compressed_spans.append((
+                    start + meta_offset,
+                    start + meta_offset + meta_length,
+                ))
+
+            if priv_offset == 0:
+                if priv_length != 0:
+                    raise DetectionError("WOFF private length lacks an offset")
+            else:
+                if (
+                    priv_length == 0
+                    or priv_offset % 4 != 0
+                    or priv_offset < directory_end
+                    or priv_offset + priv_length > length
+                ):
+                    raise DetectionError("WOFF private block has an empty length")
+                occupied.append((
+                    priv_offset,
+                    priv_offset + priv_length,
+                    "WOFF private data",
+                ))
+
+            _validate_non_overlapping_ranges(occupied, directory_end, length)
+            object_end = start + length
+            if compressed_spans:
+                evidence.append(
+                    CompressionEvidence(
+                        category="intrinsic",
+                        kind="woff",
+                        source=source.source_id,
+                        regions=[
+                            source.region(a, b) for a, b in compressed_spans
+                        ],
+                        detail={
+                            "object_start": source.start + start,
+                            "object_end": source.start + object_end,
+                            "compressed_regions": len(compressed_spans),
+                            "decoded_bytes": decoded_total,
+                            "minimum_level": 2,
+                            "validation": (
+                                "complete WOFF1 directory plus zlib decode of "
+                                "every compressed table/metadata region"
+                            ),
+                        },
+                    )
+                )
+            cursor = object_end
+        except (
+            DetectionError,
+            DecompressionLimitError,
+            ValueError,
+            struct.error,
+        ) as exc:
+            candidate_failures.append({
+                "kind": "woff",
+                "source": source.source_id,
+                "offset": source.start + start,
+                "reason": str(exc),
+            })
+            cursor = start + 4
+
+
+def _parse_zstd_frame(
+    data: bytes,
+    start: int,
+) -> Tuple[int, List[Tuple[int, int]], int, bool]:
+    if data[start:start + 4] != ZSTD_FRAME_MAGIC:
+        raise DetectionError("Zstandard frame magic is invalid")
+    if start + 5 > len(data):
+        raise DetectionError("truncated Zstandard frame header")
+
+    descriptor = data[start + 4]
+    frame_content_size_flag = descriptor >> 6
+    single_segment = bool(descriptor & 0x20)
+    if descriptor & 0x18:
+        raise DetectionError("Zstandard frame unused/reserved bit is set")
+    content_checksum = bool(descriptor & 0x04)
+    dictionary_id_flag = descriptor & 0x03
+
+    position = start + 5
+    window_size: Optional[int] = None
+    if not single_segment:
+        if position >= len(data):
+            raise DetectionError("truncated Zstandard window descriptor")
+        window_descriptor = data[position]
+        window_log = 10 + (window_descriptor >> 3)
+        window_base = 1 << window_log
+        window_size = window_base + (window_base >> 3) * (
+            window_descriptor & 0x07
+        )
+        position += 1
+
+    dictionary_id_size = (0, 1, 2, 4)[dictionary_id_flag]
+    frame_content_size_size = (
+        (1 if single_segment else 0)
+        if frame_content_size_flag == 0
+        else (2 if frame_content_size_flag == 1 else (
+            4 if frame_content_size_flag == 2 else 8
+        ))
+    )
+    frame_content_size_start = position + dictionary_id_size
+    header_end = frame_content_size_start + frame_content_size_size
+    if header_end > len(data):
+        raise DetectionError("truncated Zstandard optional frame fields")
+    if frame_content_size_size:
+        frame_content_size = int.from_bytes(
+            data[frame_content_size_start:header_end],
+            "little",
+        )
+        if frame_content_size_size == 2:
+            frame_content_size += 256
+        if single_segment:
+            window_size = frame_content_size
+    if window_size is None:
+        raise DetectionError("Zstandard frame has no derivable window size")
+    maximum_block_size = min(window_size, 128 * 1024)
+    position = header_end
+
+    compressed_spans: List[Tuple[int, int]] = []
+    block_count = 0
+    while True:
+        if position + 3 > len(data):
+            raise DetectionError("truncated Zstandard block header")
+        block_header = int.from_bytes(data[position:position + 3], "little")
+        position += 3
+        last_block = bool(block_header & 0x01)
+        block_type = (block_header >> 1) & 0x03
+        block_size = block_header >> 3
+        if block_type == 3:
+            raise DetectionError("Zstandard block uses the reserved type")
+        if block_size > maximum_block_size:
+            raise DetectionError(
+                "Zstandard block exceeds the frame block/window limit"
+            )
+
+        if block_type == 1:  # RLE: one encoded byte expands to block_size bytes.
+            if block_size == 0:
+                raise DetectionError("Zstandard RLE block has zero output size")
+            encoded_size = 1
+        else:
+            encoded_size = block_size
+        block_end = position + encoded_size
+        if block_end > len(data):
+            raise DetectionError("truncated Zstandard block payload")
+        if block_type in {1, 2} and encoded_size:
+            compressed_spans.append((position, block_end))
+        position = block_end
+        block_count += 1
+        if last_block:
+            break
+
+    if content_checksum:
+        if position + 4 > len(data):
+            raise DetectionError("truncated Zstandard content checksum")
+        position += 4
+    return position, compressed_spans, block_count, content_checksum
+
+
+def detect_zstd_frames(
+    source: SourceBuffer,
+    evidence: List[CompressionEvidence],
+    candidate_failures: List[Dict[str, Any]],
+) -> None:
+    cursor = 0
+    while True:
+        start = source.data.find(ZSTD_FRAME_MAGIC, cursor)
+        if start < 0:
+            return
+        try:
+            object_end, spans, block_count, has_checksum = _parse_zstd_frame(
+                source.data,
+                start,
+            )
+            if spans:
+                evidence.append(
+                    CompressionEvidence(
+                        category="intrinsic",
+                        kind="zstd-frame",
+                        source=source.source_id,
+                        regions=[source.region(a, b) for a, b in spans],
+                        detail={
+                            "object_start": source.start + start,
+                            "object_end": source.start + object_end,
+                            "block_count": block_count,
+                            "compressed_or_rle_blocks": len(spans),
+                            "content_checksum_present": has_checksum,
+                            "minimum_level": 3,
+                            "validation": (
+                                "complete Zstandard frame/block structure; "
+                                "compressed payload not decoded"
+                            ),
+                        },
+                    )
+                )
+            cursor = object_end
+        except (DetectionError, ValueError) as exc:
+            candidate_failures.append({
+                "kind": "zstd-frame",
+                "source": source.source_id,
+                "offset": source.start + start,
+                "reason": str(exc),
+            })
+            cursor = start + len(ZSTD_FRAME_MAGIC)
+
+
+def _rotate_left_32(value: int, bits: int) -> int:
+    return ((value << bits) | (value >> (32 - bits))) & 0xFFFFFFFF
+
+
+def _xxh32(data: bytes, seed: int = 0) -> int:
+    """Small dependency-free XXH32 implementation for LZ4 checksums."""
+
+    prime1 = 0x9E3779B1
+    prime2 = 0x85EBCA77
+    prime3 = 0xC2B2AE3D
+    prime4 = 0x27D4EB2F
+    prime5 = 0x165667B1
+    length = len(data)
+    position = 0
+
+    def round_value(accumulator: int, lane: int) -> int:
+        accumulator = (accumulator + lane * prime2) & 0xFFFFFFFF
+        accumulator = _rotate_left_32(accumulator, 13)
+        return (accumulator * prime1) & 0xFFFFFFFF
+
+    if length >= 16:
+        v1 = (seed + prime1 + prime2) & 0xFFFFFFFF
+        v2 = (seed + prime2) & 0xFFFFFFFF
+        v3 = seed & 0xFFFFFFFF
+        v4 = (seed - prime1) & 0xFFFFFFFF
+        limit = length - 16
+        while position <= limit:
+            v1 = round_value(v1, int.from_bytes(
+                data[position:position + 4], "little"
+            ))
+            position += 4
+            v2 = round_value(v2, int.from_bytes(
+                data[position:position + 4], "little"
+            ))
+            position += 4
+            v3 = round_value(v3, int.from_bytes(
+                data[position:position + 4], "little"
+            ))
+            position += 4
+            v4 = round_value(v4, int.from_bytes(
+                data[position:position + 4], "little"
+            ))
+            position += 4
+        value = (
+            _rotate_left_32(v1, 1)
+            + _rotate_left_32(v2, 7)
+            + _rotate_left_32(v3, 12)
+            + _rotate_left_32(v4, 18)
+        ) & 0xFFFFFFFF
+    else:
+        value = (seed + prime5) & 0xFFFFFFFF
+
+    value = (value + length) & 0xFFFFFFFF
+    while position + 4 <= length:
+        lane = int.from_bytes(data[position:position + 4], "little")
+        value = (value + lane * prime3) & 0xFFFFFFFF
+        value = (_rotate_left_32(value, 17) * prime4) & 0xFFFFFFFF
+        position += 4
+    while position < length:
+        value = (value + data[position] * prime5) & 0xFFFFFFFF
+        value = (_rotate_left_32(value, 11) * prime1) & 0xFFFFFFFF
+        position += 1
+
+    value ^= value >> 15
+    value = (value * prime2) & 0xFFFFFFFF
+    value ^= value >> 13
+    value = (value * prime3) & 0xFFFFFFFF
+    value ^= value >> 16
+    return value & 0xFFFFFFFF
+
+
+def _parse_lz4_frame(
+    data: bytes,
+    start: int,
+) -> Tuple[int, List[Tuple[int, int]], int, bool, bool]:
+    if data[start:start + 4] != LZ4_FRAME_MAGIC:
+        raise DetectionError("LZ4 frame magic is invalid")
+    if start + 7 > len(data):
+        raise DetectionError("truncated LZ4 frame header")
+
+    descriptor_start = start + 4
+    flags = data[descriptor_start]
+    block_descriptor = data[descriptor_start + 1]
+    if flags & 0xC0 != 0x40 or flags & 0x02:
+        raise DetectionError("invalid LZ4 frame version/reserved flags")
+    if block_descriptor & 0x8F:
+        raise DetectionError("LZ4 block descriptor reserved bits are set")
+    maximum_code = (block_descriptor >> 4) & 0x07
+    maximum_sizes = {
+        4: 64 * 1024,
+        5: 256 * 1024,
+        6: 1024 * 1024,
+        7: 4 * 1024 * 1024,
+    }
+    if maximum_code not in maximum_sizes:
+        raise DetectionError("invalid LZ4 maximum block-size code")
+
+    block_checksum = bool(flags & 0x10)
+    content_size_present = bool(flags & 0x08)
+    content_checksum = bool(flags & 0x04)
+    dictionary_id_present = bool(flags & 0x01)
+    position = descriptor_start + 2
+    if content_size_present:
+        position += 8
+    if dictionary_id_present:
+        position += 4
+    if position >= len(data):
+        raise DetectionError("truncated LZ4 optional frame fields")
+    expected_header_checksum = data[position]
+    actual_header_checksum = (_xxh32(data[descriptor_start:position]) >> 8) & 0xFF
+    if expected_header_checksum != actual_header_checksum:
+        raise DetectionError("LZ4 frame header checksum mismatch")
+    position += 1
+
+    compressed_spans: List[Tuple[int, int]] = []
+    block_count = 0
+    while True:
+        if position + 4 > len(data):
+            raise DetectionError("truncated LZ4 block-size field")
+        raw_size = int.from_bytes(data[position:position + 4], "little")
+        position += 4
+        if raw_size == 0:
+            break
+        uncompressed = bool(raw_size & 0x80000000)
+        block_size = raw_size & 0x7FFFFFFF
+        if (
+            (block_size == 0 and not uncompressed)
+            or block_size > maximum_sizes[maximum_code]
+        ):
+            raise DetectionError("invalid LZ4 block length")
+        block_end = position + block_size
+        if block_end > len(data):
+            raise DetectionError("truncated LZ4 block payload")
+        block_payload = data[position:block_end]
+        if not uncompressed:
+            compressed_spans.append((position, block_end))
+        position = block_end
+        if block_checksum:
+            if position + 4 > len(data):
+                raise DetectionError("truncated LZ4 block checksum")
+            expected = int.from_bytes(data[position:position + 4], "little")
+            if _xxh32(block_payload) != expected:
+                raise DetectionError("LZ4 block checksum mismatch")
+            position += 4
+        block_count += 1
+
+    if content_checksum:
+        if position + 4 > len(data):
+            raise DetectionError("truncated LZ4 content checksum")
+        # Validation would require decompression.  Its presence and exact
+        # boundary are recorded, but Level 3 deliberately does not decode it.
+        position += 4
+    return (
+        position,
+        compressed_spans,
+        block_count,
+        block_checksum,
+        content_checksum,
+    )
+
+
+def detect_lz4_frames(
+    source: SourceBuffer,
+    evidence: List[CompressionEvidence],
+    candidate_failures: List[Dict[str, Any]],
+) -> None:
+    cursor = 0
+    while True:
+        start = source.data.find(LZ4_FRAME_MAGIC, cursor)
+        if start < 0:
+            return
+        try:
+            (
+                object_end,
+                spans,
+                block_count,
+                block_checksum,
+                content_checksum,
+            ) = _parse_lz4_frame(source.data, start)
+            if spans:
+                evidence.append(
+                    CompressionEvidence(
+                        category="intrinsic",
+                        kind="lz4-frame",
+                        source=source.source_id,
+                        regions=[source.region(a, b) for a, b in spans],
+                        detail={
+                            "object_start": source.start + start,
+                            "object_end": source.start + object_end,
+                            "block_count": block_count,
+                            "compressed_blocks": len(spans),
+                            "block_checksum_present": block_checksum,
+                            "content_checksum_present": content_checksum,
+                            "minimum_level": 3,
+                            "validation": (
+                                "complete LZ4 frame structure and header/block "
+                                "checksums when present; payload not decoded"
+                            ),
+                        },
+                    )
+                )
+            cursor = object_end
+        except (DetectionError, ValueError) as exc:
+            candidate_failures.append({
+                "kind": "lz4-frame",
+                "source": source.source_id,
+                "offset": source.start + start,
+                "reason": str(exc),
+            })
+            cursor = start + len(LZ4_FRAME_MAGIC)
+
+
 def detect_intrinsic_compression(
     source: SourceBuffer,
     max_output: int,
+    compression_level: int,
     evidence: List[CompressionEvidence],
     unsupported: List[Dict[str, Any]],
     candidate_failures: List[Dict[str, Any]],
@@ -1761,7 +3215,12 @@ def detect_intrinsic_compression(
             source, max_output, evidence, candidate_failures
         )),
         ("zip", lambda: detect_zip(
-            source, max_output, evidence, unsupported, candidate_failures
+            source,
+            max_output,
+            compression_level,
+            evidence,
+            unsupported,
+            candidate_failures,
         )),
         ("png", lambda: detect_png(
             source, max_output, evidence, candidate_failures
@@ -1781,6 +3240,54 @@ def detect_intrinsic_compression(
                 f"{detector_name}@{source.source_id}: "
                 f"{type(exc).__name__}: {exc}"
             )
+
+    if compression_level >= 2:
+        extended_detectors = (
+            ("gif", lambda: detect_gif(
+                source, max_output, evidence, candidate_failures
+            )),
+            ("woff", lambda: detect_woff(
+                source, max_output, evidence, candidate_failures
+            )),
+            ("swf-cws", lambda: detect_cws(
+                source, max_output, evidence, candidate_failures
+            )),
+            ("zlib", lambda: detect_zlib_streams(
+                source, max_output, evidence
+            )),
+            ("bzip2", lambda: detect_bzip2_streams(
+                source, max_output, evidence, candidate_failures
+            )),
+            ("xz", lambda: detect_xz_streams(
+                source, max_output, evidence, candidate_failures
+            )),
+        )
+        for detector_name, detector in extended_detectors:
+            try:
+                detector()
+            except Exception as exc:
+                analysis_errors.append(
+                    f"{detector_name}@{source.source_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    if compression_level >= 3:
+        declared_detectors = (
+            ("zstd-frame", lambda: detect_zstd_frames(
+                source, evidence, candidate_failures
+            )),
+            ("lz4-frame", lambda: detect_lz4_frames(
+                source, evidence, candidate_failures
+            )),
+        )
+        for detector_name, detector in declared_detectors:
+            try:
+                detector()
+            except Exception as exc:
+                analysis_errors.append(
+                    f"{detector_name}@{source.source_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
 
 def _map_dechunked_region(
@@ -1821,6 +3328,7 @@ def detect_chunked_intrinsic_compression(
     source: SourceBuffer,
     max_output: int,
     max_header_bytes: int,
+    compression_level: int,
     evidence: List[CompressionEvidence],
     unsupported: List[Dict[str, Any]],
     candidate_failures: List[Dict[str, Any]],
@@ -1887,6 +3395,7 @@ def detect_chunked_intrinsic_compression(
         detect_intrinsic_compression(
             logical_source,
             max_output,
+            compression_level,
             logical_evidence,
             logical_unsupported,
             logical_failures,
@@ -1962,6 +3471,54 @@ def _deduplicate_evidence(
         if key in seen:
             continue
         seen.add(key)
+        result.append(item)
+    return result
+
+
+def _region_covers(outer: ByteRegion, inner: ByteRegion) -> bool:
+    return (
+        outer.carrier == inner.carrier
+        and outer.direction == inner.direction
+        and outer.packet_index == inner.packet_index
+        and outer.start <= inner.start
+        and inner.end <= outer.end
+    )
+
+
+def _suppress_nested_generic_streams(
+    evidence: Sequence[CompressionEvidence],
+) -> List[CompressionEvidence]:
+    """Prefer a validated container detector over its generic inner stream.
+
+    For example, a single PNG IDAT chunk can also look like a standalone zlib
+    stream.  Keeping both does not change the byte union, but obscures evidence
+    counts and format summaries.  A more weakly validated container never hides
+    a stronger generic decode.
+    """
+
+    generic_kinds = {"zlib", "bzip2", "xz"}
+    result: List[CompressionEvidence] = []
+    for item in evidence:
+        if item.category != "intrinsic" or item.kind not in generic_kinds:
+            result.append(item)
+            continue
+        item_level = int(item.detail.get("minimum_level", 1))
+        covering_regions = [
+            region
+            for other in evidence
+            if (
+                other is not item
+                and other.category == "intrinsic"
+                and other.kind not in generic_kinds
+                and int(other.detail.get("minimum_level", 1)) <= item_level
+            )
+            for region in other.regions
+        ]
+        if item.regions and all(
+            any(_region_covers(outer, inner) for outer in covering_regions)
+            for inner in item.regions
+        ):
+            continue
         result.append(item)
     return result
 
@@ -2166,6 +3723,7 @@ def analyze_pcap(
     pcap_path: Path,
     max_output: int,
     max_header_bytes: int,
+    compression_level: int,
 ) -> Dict[str, Any]:
     row = _empty_flow_row(dataset_name, dataset_dir, pcap_path)
     try:
@@ -2185,6 +3743,7 @@ def analyze_pcap(
                 source,
                 max_output,
                 max_header_bytes,
+                compression_level,
                 evidence,
                 unsupported,
                 candidate_failures,
@@ -2198,6 +3757,7 @@ def analyze_pcap(
         detect_intrinsic_compression(
             source,
             max_output,
+            compression_level,
             evidence,
             unsupported,
             candidate_failures,
@@ -2210,6 +3770,7 @@ def analyze_pcap(
                 source,
                 max_output,
                 max_header_bytes,
+                compression_level,
                 evidence,
                 unsupported,
                 candidate_failures,
@@ -2221,6 +3782,7 @@ def analyze_pcap(
                 f"{type(exc).__name__}: {exc}"
             )
 
+    evidence = _suppress_nested_generic_streams(evidence)
     evidence = _deduplicate_evidence(evidence)
 
     protocol_evidence = [item for item in evidence if item.category == "protocol"]
@@ -2310,6 +3872,7 @@ def analyze_pcaps(
     pcaps: Sequence[Path],
     max_output: int,
     max_header_bytes: int,
+    compression_level: int,
     workers: int,
     quiet: bool,
 ) -> List[Dict[str, Any]]:
@@ -2331,6 +3894,7 @@ def analyze_pcaps(
                     pcap_path,
                     max_output,
                     max_header_bytes,
+                    compression_level,
                 )
             )
             _report_progress(completed, total, pcap_path, quiet)
@@ -2354,6 +3918,7 @@ def analyze_pcaps(
                 pcap_path,
                 max_output,
                 max_header_bytes,
+                compression_level,
             )
             pending[future] = (index, pcap_path)
             return True
@@ -2542,9 +4107,65 @@ def _metadata(
     output_dir: Path,
     max_output: int,
     max_header_bytes: int,
+    compression_level: int,
     workers: int,
     summary: Dict[str, Any],
 ) -> Dict[str, Any]:
+    confirmed_protocol = [
+        "HTTP/1.x Content-Encoding gzip",
+        "HTTP/1.x Content-Encoding deflate",
+        "HTTP/1.x compressed Transfer-Encoding gzip/deflate",
+    ]
+    confirmed_intrinsic = [
+        "gzip deflate region",
+        "ZIP deflate/bzip2/LZMA entry data",
+        "PNG IDAT data",
+        "JPEG entropy-coded scans",
+        "WebP VP8/VP8L bitstreams",
+    ]
+    if compression_level >= 2:
+        confirmed_intrinsic.extend([
+            "fully decoded standalone no-dictionary zlib stream",
+            "fully decoded standalone BZIP2 stream",
+            "fully decoded standalone XZ stream",
+            "GIF LZW image-data sub-blocks",
+            "WOFF1 zlib-compressed tables/metadata",
+            "SWF CWS zlib-compressed body",
+        ])
+    if compression_level >= 3:
+        confirmed_protocol.extend([
+            "exactly framed HTTP/1.x br declaration",
+            "exactly framed HTTP/1.x zstd declaration",
+            "exactly framed HTTP/1.x compress/x-compress declaration",
+        ])
+        confirmed_intrinsic.extend([
+            "recognized non-stored/non-encrypted ZIP method entry data",
+            "structurally complete Zstandard compressed/RLE blocks",
+            "structurally complete LZ4 compressed blocks",
+        ])
+
+    explicitly_unsupported = [
+        "HTTP/2",
+        "HTTP/3",
+        "WebSocket compression",
+        "ZIP64",
+        "encrypted ZIP entries",
+        "unrecognized/reserved ZIP methods",
+        "HTTP dcb/dcz dictionary content codings",
+        "WOFF2, complex PDF filters, and audio/video containers",
+        "incomplete objects or signature-only candidates",
+        "TLS/QUIC ciphertext as compression evidence",
+    ]
+    if compression_level < 3:
+        explicitly_unsupported.extend([
+            "HTTP br",
+            "HTTP zstd",
+            "HTTP compress/x-compress",
+            "ZIP methods outside the runtime decoder scope",
+            "Zstandard frames without decoding",
+            "LZ4 frames without decoding",
+        ])
+
     return {
         "script": "revision/compression_audit.py",
         "script_version": SCRIPT_VERSION,
@@ -2577,29 +4198,23 @@ def _metadata(
             ),
         },
         "compression_scope": {
-            "confirmed_protocol": [
-                "HTTP/1.x Content-Encoding gzip",
-                "HTTP/1.x Content-Encoding deflate",
-                "HTTP/1.x compressed Transfer-Encoding gzip/deflate",
-            ],
-            "confirmed_intrinsic": [
-                "gzip deflate region",
-                "ZIP deflate/bzip2/LZMA entry data",
-                "PNG IDAT data",
-                "JPEG entropy-coded scans",
-                "WebP VP8/VP8L bitstreams",
-            ],
-            "explicitly_unsupported": [
-                "HTTP br",
-                "HTTP zstd",
-                "HTTP/2",
-                "WebSocket compression",
-                "ZIP64",
-                "unsupported/encrypted ZIP entries",
-            ],
+            "selected_level": compression_level,
+            "levels_are_cumulative": True,
+            "level_definitions": {
+                "1": "original detector scope, unchanged",
+                "2": "level 1 plus additional fully decoded/validated formats",
+                "3": (
+                    "levels 1-2 plus explicit compression declarations or "
+                    "complete framed structures with exact compressed regions"
+                ),
+            },
+            "confirmed_protocol": confirmed_protocol,
+            "confirmed_intrinsic": confirmed_intrinsic,
+            "explicitly_unsupported": explicitly_unsupported,
             "interpretation": (
                 "confirmed_compressed / valid_flows is a conservative lower bound "
-                "on wire-visible compression, not true compression prevalence"
+                "on whole-flow wire-visible compression, not true compression "
+                "prevalence"
             ),
             "region_semantics": (
                 "HTTP protocol regions are content-coded entity octets with HTTP "
@@ -2609,6 +4224,9 @@ def _metadata(
         },
         "validation": {
             "maximum_decoded_bytes_per_object_or_layer": max_output,
+            "extended_detector_probe_chunk_bytes": DECODE_PROBE_CHUNK_BYTES,
+            "extended_detector_input_chunk_bytes": DECODE_INPUT_CHUNK_BYTES,
+            "xz_decoder_memory_limit": max(1024 * 1024, max_output),
             "maximum_http_header_bytes": max_header_bytes,
             "tcp_overlap_policy": "first-seen bytes win",
             "tcp_gaps": "analyzed as separate contiguous buffers",
@@ -2643,8 +4261,8 @@ def _metadata(
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Measure strictly confirmed wire-visible compression and its exposure "
-            "inside MM-TrafficBERT's raw-content window."
+            "Measure selected-level wire-visible compression evidence and its "
+            "exposure inside MM-TrafficBERT's raw-content window."
         )
     )
     parser.add_argument(
@@ -2676,6 +4294,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "maximum HTTP header block inspected "
             f"(default: {DEFAULT_MAX_HTTP_HEADER_BYTES})"
+        ),
+    )
+    parser.add_argument(
+        "--compression-level",
+        type=int,
+        choices=COMPRESSION_LEVELS,
+        default=DEFAULT_COMPRESSION_LEVEL,
+        help=(
+            "cumulative compression judgment level: 1 preserves the original "
+            "strict scope; 2 adds fully validated formats; 3 adds explicit, "
+            "exactly bounded declarations/frames "
+            f"(default: {DEFAULT_COMPRESSION_LEVEL})"
         ),
     )
     parser.add_argument(
@@ -2723,7 +4353,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     workers = min(args.workers, total)
     if not args.quiet:
         print(
-            f"[compression-audit] pcaps={total}, workers={workers}",
+            f"[compression-audit] pcaps={total}, workers={workers}, "
+            f"compression_level={args.compression_level}",
             flush=True,
         )
     rows = analyze_pcaps(
@@ -2732,6 +4363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pcaps,
         args.max_decompressed_bytes,
         args.max_http_header_bytes,
+        args.compression_level,
         workers,
         args.quiet,
     )
@@ -2756,6 +4388,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir,
             args.max_decompressed_bytes,
             args.max_http_header_bytes,
+            args.compression_level,
             workers,
             summary,
         ),
@@ -2763,6 +4396,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print(
         "[compression-audit] "
+        f"level={args.compression_level}, "
         f"valid={summary['valid_flows']}/{summary['total_pcaps']}, "
         f"confirmed={summary['confirmed_compressed']}, "
         f"rate={summary['compression_rate']}, "

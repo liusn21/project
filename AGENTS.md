@@ -208,14 +208,15 @@ Losses:
 
 Important training details:
 
-- `itc_alpha` defaults to 0.4 and ramps from 0 to its max over the LR warmup.
-- Gradient accumulation is counted in optimizer steps, not micro-batches.
-- Momentum encoders/projections update only on the last micro-batch in an
-  accumulation group.
-- When Stage 2 is built from Stage 1 checkpoints, `model_builder.py` loads
-  online and momentum encoders, initializes non-pretrained modules, then calls
-  `init_momentum_encoders()` to avoid desynchronizing online and teacher
-  projection heads.
+- ITC uses hard-label symmetric InfoNCE; there is no momentum-distillation
+  soft-target mixture.
+- `total_steps`, checkpoint suffixes, and report steps count micro-batches.
+  The optimizer and scheduler update every `accumulation_steps` micro-batches.
+- Momentum encoders/projections and feature queues update after every Stage 2
+  micro-batch, matching the April compatibility behavior.
+- When Stage 2 is built from Stage 1 checkpoints, `model_builder.py` loads the
+  online and momentum encoders. No additional post-initialization hard sync of
+  the online and momentum projection heads is performed.
 
 ## ITGCA
 
