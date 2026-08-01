@@ -25,8 +25,8 @@ USAGE (run from project/ root):
 
 The ITGCA / ablation / fusion-layer flags MUST match the fine-tuned checkpoint
 (same rule as run_inference.py). If the loader complains about missing /
-unexpected keys, set --use_itgca / --ablate_r_stat / --ablate_g_token /
---ablate_source_bias accordingly.
+unexpected keys, set --use_itgca / --ablate_r_stat / --ablate_r_learned /
+--ablate_g_token / --ablate_source_bias accordingly.
 
 Default output: results/<load_model_path basename>_perflow.csv  (override --output).
 
@@ -110,6 +110,7 @@ def parse_args():
                         help="Must match the fine-tuned checkpoint")
     parser.add_argument("--itgca_window_size", type=int, default=16)
     parser.add_argument("--ablate_r_stat", action="store_true")
+    parser.add_argument("--ablate_r_learned", action="store_true")
     parser.add_argument("--ablate_g_token", action="store_true")
     parser.add_argument("--ablate_source_bias", action="store_true")
     parser.add_argument("--seq_length_raw", type=int, default=512)
@@ -167,6 +168,10 @@ def _filter_ablated_keys(state_dict, model_keys, args):
                          if any(f in k for f in [".alpha_modality",
                                                  ".gate_size.stat_scale",
                                                  ".gate_size.stat_shift"])}
+    if args.ablate_r_learned:
+        safe_to_skip |= {k for k in unexpected
+                         if any(f in k for f in [".bilinear_W", ".bilinear_bias",
+                                                 ".alpha_modality"])}
     if args.ablate_source_bias:
         safe_to_skip |= {k for k in unexpected
                          if any(f in k for f in [".local_stat_scale", ".local_stat_shift"])}

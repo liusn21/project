@@ -433,68 +433,226 @@ Shannon-based prior 与真正面向下游任务的 conditional content utility
 
 ### 建议补充
 
-在 compression、padding 和 shuffle 样本上，同时记录：
+2.4 直接复用 2.3 中不含 \(r_{\mathrm{stat}}\) 的辅助模型定义：
+
+\[
+u_i
+=
+\log p_{\mathrm{concat}}(y_i\mid c_i,b_i)
+-
+\log p_{\mathrm{behavior}}(y_i\mid b_i).
+\]
+
+概率在 validation set 上分别进行 temperature scaling。令
+\(\epsilon=0.01\) 为主要分析阈值：
+
+\[
+\begin{aligned}
+u_i&>\epsilon &&\text{content helpful},\\
+|u_i|&\leq\epsilon &&\text{near zero},\\
+u_i&<-\epsilon &&\text{content harmful}.
+\end{aligned}
+\]
+
+同时报告 \(\epsilon=0\) 和 \(0.05\) 的敏感性结果。
+
+压缩实验继续使用三个正暴露区间作为表格行：
+
+\[
+(0,0.25],\qquad(0.25,0.50],\qquad(0.50,1.00].
+\]
+
+其中 \(e_i\) 是模型原始内容窗口中、被确认压缩区域覆盖的字节比例，
+不是压缩算法的参数或压缩率。
+
+在每个区间同时记录：
 
 \[
 r_{\mathrm{stat}},
+\qquad
+r_{\mathrm{calibrated}},
 \qquad
 r_{\mathrm{learned}},
 \qquad
 r_{\mathrm{mod}}.
 \]
 
-并报告最终学习到的：
+由于模型实际比较的是校准后的统计先验，不能直接比较
+\(r_{\mathrm{learned}}\) 和 \(r_{\mathrm{stat}}\)。定义：
 
 \[
-\beta=\sigma(\alpha),
+\Delta_i^{\mathrm{learned}}
+=
+r_{\mathrm{learned},i}-r_{\mathrm{calibrated},i},
 \]
 
-而不只报告其初始化值。
+\[
+\Delta_i^{\mathrm{mod}}
+=
+r_{\mathrm{mod},i}-r_{\mathrm{calibrated},i}
+=
+\beta\Delta_i^{\mathrm{learned}},
+\qquad
+\beta=\sigma(\alpha).
+\]
+
+\(\Delta^{\mathrm{learned}}\) 表示学习分支建议的方向和幅度，
+\(\Delta^{\mathrm{mod}}\) 表示最终实际施加的修正。两者符号相同，
+不能作为两份独立证据。正文报告 flow-level 跨层均值，附录同时报告
+每个 fusion layer 的 \(\beta\) 和修正分布。
 
 ### 重点分析一：高熵但仍有用的内容
 
-例如某些压缩内容：
+压缩暴露提高时，首先检验：
 
 \[
-r_{\mathrm{stat}}\text{ 较低},
+e_i\uparrow
+\quad\Longrightarrow\quad
+r_{\mathrm{stat}}\downarrow.
+\]
+
+随后同时报告各暴露区间的 median \(u_i\) 和
+\(P(u_i>\epsilon)\)。若二者没有随 \(r_{\mathrm{stat}}\) 出现相应的
+单调下降，则说明压缩暴露改变统计先验的程度大于它改变任务效用的程度。
+更准确的表述是：
+
+\[
+\boxed{
+\text{compression creates low-prior/high-utility mismatch cases}
+}
+\]
+
+而不是声称所有压缩流都被 Shannon 误判。
+
+在 \(u_i>\epsilon\) 的压缩流上，定义 gate-up rate：
+
+\[
+R_{\mathrm{gate}}
+=
+\frac{
+\#\{u_i>\epsilon,\ \Delta_i^{\mathrm{learned}}>0\}
+}{
+\#\{u_i>\epsilon\}
+}.
+\]
+
+还必须在相同 \(e_i\) 区间比较 \(u_i<-\epsilon\) 的流。若 helpful
+和 harmful 两组都得到相同幅度的上调，只能说明 gate 对压缩整体响应，
+不能说明它针对内容效用进行修正。
+
+### 连续效用救回
+
+定义完整模型相对 behavior-only 的真实标签 log-score 增益：
+
+\[
+v_i
+=
+\log p_{\mathrm{ITGCA}}(y_i)
+-
+\log p_{\mathrm{behavior}}(y_i).
+\]
+
+主要的 utility recovery rate 为：
+
+\[
+R_{\mathrm{utility}}
+=
+\frac{
+\#\{u_i>\epsilon,\ v_i>0\}
+}{
+\#\{u_i>\epsilon\}
+}.
+\]
+
+这与 2.3 的连续效用定义一致，应作为主要“救回”指标。
+
+### 严格分类救回
+
+将离散正确/错误救回作为更直观的辅助指标：
+
+\[
+O_i
+=
+\mathbb 1[
+\mathrm{concat\ correct}
+\land
+\mathrm{behavior\ wrong}
+],
+\]
+
+\[
+R_{\mathrm{hard}}
+=
+\frac{
+\#\{O_i=1,\ \mathrm{ITGCA\ correct}\}
+}{
+\#\{O_i=1\}
+}.
+\]
+
+旧版基于 raw-only correct、behavior-only wrong 的 opportunity 不再使用。
+
+### Stat-only 干预
+
+从同一个完整 checkpoint 进行额外推理，将：
+
+\[
+\beta\approx0,
 \qquad
-u_i>0.
+r_{\mathrm{mod}}=r_{\mathrm{calibrated}},
+\]
+
+其他参数保持不变。定义：
+
+\[
+c_i
+=
+\log p_{\mathrm{ITGCA}}(y_i)
+-
+\log p_{\mathrm{stat-only}}(y_i).
+\]
+
+在 \(u_i>\epsilon\) 且 \(\Delta_i^{\mathrm{learned}}>0\) 的样本上，
+若 \(c_i>0\)，则能把 gate 的向上修正与预测改善更直接地联系起来。
+该干预不替代重新训练的正式消融，但比仅观察 gate 数值和最终正确率更强。
+
+### 重点分析二：统计先验虚高但内容无用
+
+如果无法从自然 PCAP 中可靠定位 padding，可以在完整 held-out test set
+中定义一般性的高先验/低效用集合：
+
+\[
+\mathcal S_{\downarrow}
+=
+\left\{
+r_{\mathrm{stat}}\text{ 位于类别内高分位},
+\quad
+u_i<-\epsilon
+\right\}.
 \]
 
 观察是否：
 
 \[
-r_{\mathrm{learned}}>r_{\mathrm{stat}},
+\Delta_i^{\mathrm{learned}}<0,
 \qquad
-r_{\mathrm{mod}}>r_{\mathrm{stat}}.
+\Delta_i^{\mathrm{mod}}<0.
 \]
 
-### 重点分析二：低熵但无用的内容
-
-例如固定值 padding：
-
-\[
-r_{\mathrm{stat}}\text{ 可能虚高},
-\qquad
-u_i\leq0.
-\]
-
-观察是否：
-
-\[
-r_{\mathrm{learned}}<r_{\mathrm{stat}},
-\qquad
-r_{\mathrm{mod}}<r_{\mathrm{stat}}.
-\]
+这些样本只能称为 high-prior/unhelpful cases，不能在没有协议证据时
+称为 padding。显式 padding 仍可作为单独的受控实验。
 
 ### 对照版本
 
 至少比较：
 
 1. 完整模型；
-2. entropy-only：固定 \(\beta=0\)；
+2. 同一 checkpoint 的 stat-only 推理干预：固定 \(\beta\approx0\)；
 3. learned-only：移除 \(r_{\mathrm{stat}}\)；
 4. standard cross-attention。
+
+其中 3--4 最好使用独立训练的 checkpoint；若没有，只把 1--2 用作
+当前 revision 的最小机制验证，不把推理时的结构改变冒充重新训练消融。
 
 ### 想证明的观点
 

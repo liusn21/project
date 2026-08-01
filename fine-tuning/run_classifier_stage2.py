@@ -132,6 +132,7 @@ class Stage2Classifier(nn.Module):
         self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
         self.vocab_size_raw = vocab_size_raw
         self.ablate_r_stat = getattr(args, 'ablate_r_stat', False)
+        self.ablate_r_learned = getattr(args, 'ablate_r_learned', False)
         self.ablate_source_bias = getattr(args, 'ablate_source_bias', False)
 
         # Per-modality encoder depth (falls back to args.layers_num if not set
@@ -1118,6 +1119,8 @@ def main():
     # ITGCA component-level ablation flags -- MUST match the pretrained checkpoint.
     parser.add_argument("--ablate_r_stat", action="store_true",
                         help="Disable r_stat prior. Must match the pretrained checkpoint.")
+    parser.add_argument("--ablate_r_learned", action="store_true",
+                        help="Disable learned compatibility r_learned. Must match the pretrained checkpoint.")
     parser.add_argument("--ablate_g_token", action="store_true",
                         help="Disable token-level gate. Must match the pretrained checkpoint.")
     parser.add_argument("--ablate_source_bias", action="store_true",

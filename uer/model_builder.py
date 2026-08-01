@@ -125,6 +125,9 @@ def build_model(args):
         print(f"  ITGCA: {use_itgca}")
         if use_itgca:
             print(f"  ITGCA window size: {getattr(args, 'itgca_window_size', 16)}")
+            ablations = [name for name in ('r_stat', 'r_learned', 'g_token', 'source_bias')
+                         if getattr(args, f'ablate_{name}', False)]
+            print(f"  ITGCA ablations: {', '.join(ablations) if ablations else 'none'}")
         print(f"  Queue size: {queue_size}")
         print(f"  Momentum: {momentum}")
         print(f"  ITC temperature: {getattr(args, 'itc_temperature', 0.07)}")

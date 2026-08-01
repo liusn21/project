@@ -126,6 +126,10 @@ def main():
     parser.add_argument("--ablate_r_stat", action="store_true",
                         help="Disable the flow-level Shannon entropy prior r_stat. "
                              "Gate falls back to r_mod = r_learned on Size←Raw direction.")
+    parser.add_argument("--ablate_r_learned", action="store_true",
+                        help="Disable the bilinear compatibility signal r_learned. "
+                             "Size←Raw uses calibrated r_stat; Raw←Size fixes r_mod=1 "
+                             "while retaining g_token.")
     parser.add_argument("--ablate_g_token", action="store_true",
                         help="Disable the token-level gate g_token (forced to 1.0 constant). "
                              "Hierarchical gating degrades to flow-level only.")

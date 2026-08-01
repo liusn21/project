@@ -15,6 +15,8 @@ Usage:
         --vocab_path_size models/vocab_size.txt \
         --vocab_path_temporal models/vocab_temporal.txt \
         --config_path models/bert/base_config.json \
+        --config_path_raw models/bert/base_config.json \
+        --config_path_size models/bert/behavior_6_config.json \
         --modality both
 
     # Stage 2 inference
@@ -103,10 +105,10 @@ def build_args():
     parser.add_argument("--config_path", default="models/bert/base_config.json",
                         type=str, help="Path to model config JSON")
     parser.add_argument("--config_path_raw", type=str, default=None,
-                        help="[Stage 2] Optional per-modality config for the Raw encoder; "
+                        help="[Stage 1 both / Stage 2] Optional Raw encoder config; "
                              "layers_num-only override, shared dims must match --config_path.")
     parser.add_argument("--config_path_size", type=str, default=None,
-                        help="[Stage 2] Optional per-modality config for the Size encoder.")
+                        help="[Stage 1 both / Stage 2] Optional Size encoder config.")
 
     # ---- Model architecture (must match training) ----
     model_opts(parser)
@@ -144,6 +146,9 @@ def build_args():
     # ITGCA component-level ablation flags — MUST match the pretrained checkpoint config.
     parser.add_argument("--ablate_r_stat", action="store_true",
                         help="[Stage 2] Disable r_stat prior. Must match the pretrained checkpoint.")
+    parser.add_argument("--ablate_r_learned", action="store_true",
+                        help="[Stage 2] Disable learned compatibility r_learned. "
+                             "Must match the pretrained checkpoint.")
     parser.add_argument("--ablate_g_token", action="store_true",
                         help="[Stage 2] Disable token-level gate. Must match the pretrained checkpoint.")
     parser.add_argument("--ablate_source_bias", action="store_true",
@@ -449,6 +454,10 @@ def main():
                          if any(f in k for f in ['.alpha_modality',
                                                  '.gate_size.stat_scale',
                                                  '.gate_size.stat_shift'])}
+    if getattr(args, 'ablate_r_learned', False):
+        safe_to_skip |= {k for k in unexpected
+                         if any(f in k for f in ['.bilinear_W', '.bilinear_bias',
+                                                 '.alpha_modality'])}
     if getattr(args, 'ablate_source_bias', False):
         safe_to_skip |= {k for k in unexpected
                          if any(f in k for f in ['.local_stat_scale', '.local_stat_shift'])}
@@ -487,7 +496,8 @@ def main():
             print(f"\n  HINT: Model defines ITGCA parameters not in checkpoint.")
             print(f"        If checkpoint was trained WITHOUT ITGCA → remove --use_itgca.")
             print(f"        If checkpoint was trained WITH ablation → add matching "
-                  f"--ablate_r_stat / --ablate_g_token / --ablate_source_bias.")
+                  f"--ablate_r_stat / --ablate_r_learned / --ablate_g_token / "
+                  f"--ablate_source_bias.")
         if any('classifier' in k for k in missing):
             print(f"\n  HINT: Classifier shape mismatch. Check --labels_num.")
 
@@ -495,6 +505,7 @@ def main():
         print(f"\n  Current inference flags:")
         print(f"    --use_itgca={getattr(args, 'use_itgca', False)}")
         print(f"    --ablate_r_stat={getattr(args, 'ablate_r_stat', False)}")
+        print(f"    --ablate_r_learned={getattr(args, 'ablate_r_learned', False)}")
         print(f"    --ablate_g_token={getattr(args, 'ablate_g_token', False)}")
         print(f"    --ablate_source_bias={getattr(args, 'ablate_source_bias', False)}")
         print(f"    --num_fusion_layers={getattr(args, 'num_fusion_layers', 6)}")

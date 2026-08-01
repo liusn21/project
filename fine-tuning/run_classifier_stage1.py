@@ -12,10 +12,14 @@ Usage:
         --label2id_path datasets/processed/label2id.pkl \
         --vocab_path_raw models/vocab_raw.txt \
         --vocab_path_size models/vocab_size.txt \
+        --vocab_path_temporal models/vocab_temporal.txt \
         --pretrained_raw_path models/raw_encoder.bin \
         --pretrained_size_path models/size_encoder.bin \
         --output_model_path models/classifier_stage1.bin \
         --config_path models/bert/base_config.json \
+        --config_path_raw models/bert/base_config.json \
+        --config_path_size models/bert/behavior_6_config.json \
+        --modality both \
         --epochs_num 10 \
         --batch_size 32
 """
@@ -24,6 +28,7 @@ import os
 import sys
 sys.path.append(os.getcwd())
 
+import copy
 import random
 import argparse
 import torch
@@ -36,7 +41,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 from uer.layers import RawPacketEmbedding, PacketSizeEmbedding
 from uer.encoders import str2encoder
 from uer.utils.vocab import Vocab
-from uer.utils.config import load_hyperparam
+from uer.utils.config import load_hyperparam, apply_modality_configs
 from uer.utils.seed import set_seed
 from uer.model_saver import save_model
 from uer.utils.constants import PAD_ID
@@ -66,15 +71,26 @@ class Stage1Classifier(nn.Module):
         self.labels_num = labels_num
         self.modality = getattr(args, 'modality', 'both')  # raw, size, both
 
+        # Per-modality encoder depth. apply_modality_configs() populates these
+        # fields from --config_path_raw / --config_path_size. Callers that do
+        # not use the new options retain the legacy single-config behavior.
+        base_layers = args.layers_num
+        layers_num_raw = getattr(args, 'layers_num_raw', base_layers) or base_layers
+        layers_num_size = getattr(args, 'layers_num_size', base_layers) or base_layers
+
         # Raw modality encoder
         if self.modality in ['raw', 'both']:
             self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
-            self.encoder_raw = str2encoder[args.encoder](args)
+            raw_args = copy.copy(args)
+            raw_args.layers_num = layers_num_raw
+            self.encoder_raw = str2encoder[args.encoder](raw_args)
 
         # Size modality encoder (with temporal/IAT support)
         if self.modality in ['size', 'both']:
             self.embedding_size = PacketSizeEmbedding(args, vocab_size_size, vocab_size_temporal)
-            self.encoder_size = str2encoder[args.encoder](args)
+            size_args = copy.copy(args)
+            size_args.layers_num = layers_num_size
+            self.encoder_size = str2encoder[args.encoder](size_args)
 
         # Classification head
         if self.modality == 'both':
@@ -346,7 +362,16 @@ def build_optimizer(args, model):
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     finetune_opts(parser)
-    
+
+    # Per-modality config overrides (asymmetric encoder depths).
+    parser.add_argument("--config_path_raw", type=str, default=None,
+                        help="Optional per-modality config for the Raw (content) encoder. "
+                             "Only 'layers_num' is applied; shared dimensions must "
+                             "match --config_path.")
+    parser.add_argument("--config_path_size", type=str, default=None,
+                        help="Optional per-modality config for the Size (behavior) encoder. "
+                             "Only 'layers_num' is applied; shared dimensions must "
+                             "match --config_path.")
 
     # Path options
     parser.add_argument("--label2id_path", type=str, required=True,
@@ -384,6 +409,7 @@ def main():
     # Load hyperparameters from config
     if args.config_path:
         args = load_hyperparam(args)
+    args = apply_modality_configs(args)
 
     # Set max_seq_length for embedding layers
     args.max_seq_length = max(args.seq_length_raw, args.seq_length_size)
@@ -419,6 +445,10 @@ def main():
     # Build model
     print("Building model...")
     print(f"  Modality mode: {args.modality}")
+    if args.modality in ['raw', 'both']:
+        print(f"  Raw encoder layers: {args.layers_num_raw}")
+    if args.modality in ['size', 'both']:
+        print(f"  Size encoder layers: {args.layers_num_size}")
     model = Stage1Classifier(args, len(vocab_raw), len(vocab_size), len(vocab_temporal), args.labels_num)
 
     # Load pretrained encoders based on modality

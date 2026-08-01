@@ -33,8 +33,10 @@ class ITGCrossAttentionGate(nn.Module):
 
     Multiplicative gate:
     1. Modality gate (r_mod): flow-level reliability signal
-       - If has_modality_prior: r_mod = r_stat + sigmoid(alpha) * (r_learned - r_stat)
+       - If has_modality_prior: r_mod = r_calibrated + sigmoid(alpha) *
+         (r_learned - r_calibrated)
        - Otherwise: r_mod = r_learned (pure learned)
+       - Without r_learned: use calibrated r_stat when available, otherwise 1
 
     2. Token gate (g_token): per-token learned from SA residual
        g_token = sigmoid(W_k(q) · W_v(delta) / sqrt(d) + bias)
@@ -50,32 +52,38 @@ class ITGCrossAttentionGate(nn.Module):
 
     def __init__(self, hidden_size, dropout=0.1, has_modality_prior=False,
                  ablate_r_stat=False, ablate_g_token=False,
-                 alpha_init=-2.0, token_gate_bias_init=2.0):
+                 alpha_init=-2.0, token_gate_bias_init=2.0,
+                 ablate_r_learned=False):
         super(ITGCrossAttentionGate, self).__init__()
 
         self.hidden_size = hidden_size
         self.has_modality_prior = has_modality_prior
         self.ablate_r_stat = ablate_r_stat
+        self.ablate_r_learned = ablate_r_learned
         self.ablate_g_token = ablate_g_token
         bottleneck = hidden_size // 4
         self.bottleneck = bottleneck
 
         # Derived flag: r_stat sub-path is active iff this gate has the prior AND it's not ablated
         self.uses_r_stat = self.has_modality_prior and not self.ablate_r_stat
+        self.uses_r_learned = not self.ablate_r_learned
 
         # ===== Modality Gate =====
-        # Bilinear: r_learned = sigmoid(c_q^T W c_k + bias). Always created.
-        self.bilinear_W = nn.Parameter(torch.zeros(hidden_size, hidden_size))
-        self.bilinear_bias = nn.Parameter(torch.zeros(1))
-        nn.init.xavier_uniform_(self.bilinear_W, gain=0.1)
+        # Bilinear: r_learned = sigmoid(c_q^T W c_k + bias).
+        if self.uses_r_learned:
+            self.bilinear_W = nn.Parameter(torch.zeros(hidden_size, hidden_size))
+            self.bilinear_bias = nn.Parameter(torch.zeros(1))
+            nn.init.xavier_uniform_(self.bilinear_W, gain=0.1)
 
         # alpha_1: gated residual mixing. sigmoid(alpha_init) controls initial blend.
         # Default -2.0 → sigmoid ≈ 0.12 (heavy r_stat reliance, curriculum learning).
         # r_stat calibration: sigmoid(scale * r_stat + shift) maps entropy prior
         # from its natural range to gate-useful range, preserving ordering.
-        # Both only exist when r_stat is alive on this branch.
+        # Calibration exists whenever r_stat is alive. The mixing coefficient is
+        # unnecessary in the strict r_learned ablation, where r_mod=r_calibrated.
         if self.uses_r_stat:
-            self.alpha_modality = nn.Parameter(torch.tensor(float(alpha_init)))
+            if self.uses_r_learned:
+                self.alpha_modality = nn.Parameter(torch.tensor(float(alpha_init)))
             self.stat_scale = nn.Parameter(torch.tensor(5.0))
             self.stat_shift = nn.Parameter(torch.tensor(-0.5))
 
@@ -105,23 +113,30 @@ class ITGCrossAttentionGate(nn.Module):
         B, L_q, H = query_feat.shape
 
         # ===== Modality Gate =====
-        # r_learned = sigmoid(c_q^T W c_k + bias) — always computed
-        r_logit = torch.sum(
-            torch.matmul(encoder_cls_q, self.bilinear_W) * encoder_cls_k,
-            dim=-1
-        ) + self.bilinear_bias.squeeze()  # [B]
-        r_learned = torch.sigmoid(r_logit)  # [B]
+        r_learned = None
+        if self.uses_r_learned:
+            r_logit = torch.sum(
+                torch.matmul(encoder_cls_q, self.bilinear_W) * encoder_cls_k,
+                dim=-1
+            ) + self.bilinear_bias.squeeze()  # [B]
+            r_learned = torch.sigmoid(r_logit)  # [B]
 
         if self.uses_r_stat and r_stat is not None:
             # Calibrate r_stat: map from natural range to gate-useful range
             r_calibrated = torch.sigmoid(self.stat_scale * r_stat + self.stat_shift)
-            # Gated residual: r_mod = r_calibrated + beta * (r_learned - r_calibrated)
-            beta_1 = torch.sigmoid(self.alpha_modality)
-            r_mod = r_calibrated + beta_1 * (r_learned - r_calibrated)  # [B]
-        else:
-            # r_stat ablated, not provided, or this branch has no modality prior
-            # → fall back to pure learned gate
+            if r_learned is None:
+                r_mod = r_calibrated
+            else:
+                # Gated residual: r_mod = r_calibrated + beta * (r_learned - r_calibrated)
+                beta_1 = torch.sigmoid(self.alpha_modality)
+                r_mod = r_calibrated + beta_1 * (r_learned - r_calibrated)  # [B]
+        elif r_learned is not None:
+            # r_stat ablated, not provided, or this branch has no modality prior.
             r_mod = r_learned  # [B]
+        else:
+            # No modality-level signal remains. Keep cross-attention enabled and
+            # leave any token-level gate as the only output modulation.
+            r_mod = torch.ones(B, device=query_feat.device, dtype=query_feat.dtype)
 
         # ===== Token Gate (pure learned) =====
         if self.ablate_g_token:
@@ -157,7 +172,8 @@ class BidirectionalFusionLayer(nn.Module):
     def __init__(self, hidden_size, heads_num, feedforward_size, hidden_act, dropout,
                  use_itgca=False,
                  ablate_r_stat=False, ablate_g_token=False, ablate_source_bias=False,
-                 alpha_init=-2.0, token_gate_bias_init=2.0):
+                 alpha_init=-2.0, token_gate_bias_init=2.0,
+                 ablate_r_learned=False):
         super(BidirectionalFusionLayer, self).__init__()
 
         self.use_itgca = use_itgca
@@ -236,6 +252,7 @@ class BidirectionalFusionLayer(nn.Module):
             self.gate_raw = ITGCrossAttentionGate(
                 hidden_size, dropout, has_modality_prior=False,
                 ablate_r_stat=ablate_r_stat,
+                ablate_r_learned=ablate_r_learned,
                 ablate_g_token=ablate_g_token,
                 alpha_init=alpha_init,
                 token_gate_bias_init=token_gate_bias_init,
@@ -244,6 +261,7 @@ class BidirectionalFusionLayer(nn.Module):
             self.gate_size = ITGCrossAttentionGate(
                 hidden_size, dropout, has_modality_prior=True,
                 ablate_r_stat=ablate_r_stat,
+                ablate_r_learned=ablate_r_learned,
                 ablate_g_token=ablate_g_token,
                 alpha_init=alpha_init,
                 token_gate_bias_init=token_gate_bias_init,
@@ -386,6 +404,7 @@ class MultiModalFusionEncoder(nn.Module):
 
         # ITGCA component-level ablation flags (defaults: full ITGCA, all components active)
         ablate_r_stat = getattr(args, 'ablate_r_stat', False)
+        ablate_r_learned = getattr(args, 'ablate_r_learned', False)
         ablate_g_token = getattr(args, 'ablate_g_token', False)
         ablate_source_bias = getattr(args, 'ablate_source_bias', False)
 
@@ -402,6 +421,7 @@ class MultiModalFusionEncoder(nn.Module):
                 dropout=args.dropout,
                 use_itgca=use_itgca,
                 ablate_r_stat=ablate_r_stat,
+                ablate_r_learned=ablate_r_learned,
                 ablate_g_token=ablate_g_token,
                 ablate_source_bias=ablate_source_bias,
                 alpha_init=alpha_init,

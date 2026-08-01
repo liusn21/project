@@ -479,10 +479,14 @@ class MultiModalTrainer(Trainer):
                 for i, layer in enumerate(model_ref.fusion.fusion_layers):
                     if hasattr(layer, 'gate_size') and hasattr(layer.gate_size, 'stat_scale'):
                         g = layer.gate_size
-                        print(f"  ITGCA L{i}: scale={g.stat_scale.item():.3f} "
-                              f"shift={g.stat_shift.item():.3f} "
-                              f"alpha={g.alpha_modality.item():.3f} "
-                              f"beta={torch.sigmoid(g.alpha_modality).item():.3f}")
+                        message = (f"  ITGCA L{i}: scale={g.stat_scale.item():.3f} "
+                                   f"shift={g.stat_shift.item():.3f}")
+                        if hasattr(g, 'alpha_modality'):
+                            message += (f" alpha={g.alpha_modality.item():.3f} "
+                                        f"beta={torch.sigmoid(g.alpha_modality).item():.3f}")
+                        else:
+                            message += " r_learned=ablated"
+                        print(message)
                         break  
 
         # Reset statistics

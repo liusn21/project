@@ -1275,6 +1275,10 @@ def main():
     parser.add_argument("--num_fusion_layers", type=int, default=6)
     parser.add_argument("--use_itgca", action="store_true")
     parser.add_argument("--itgca_window_size", type=int, default=16)
+    parser.add_argument("--ablate_r_stat", action="store_true")
+    parser.add_argument("--ablate_r_learned", action="store_true")
+    parser.add_argument("--ablate_g_token", action="store_true")
+    parser.add_argument("--ablate_source_bias", action="store_true")
     parser.add_argument("--seq_length_raw", type=int, default=512)
     parser.add_argument("--seq_length_size", type=int, default=256)
 
@@ -1528,4 +1532,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

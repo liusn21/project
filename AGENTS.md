@@ -249,6 +249,9 @@ Current implementation details:
   `sigmoid(stat_scale * r_stat + stat_shift)`.
 - The modality gate is:
   `r_mod = r_calibrated + sigmoid(alpha) * (r_learned - r_calibrated)`.
+- Under `--ablate_r_learned`, Size <- Raw uses `r_calibrated` directly and
+  Raw <- Size fixes its modality gate to 1, preserving the token gate and the
+  cross-attention pathway.
 - `alpha_init` defaults to -2.0, so the initial beta is about 0.12 and the model
   starts close to the statistical prior.
 - The token gate is a learned per-position gate based on the self-attention
@@ -269,6 +272,7 @@ pre-training and fine-tuning:
 - `--num_fusion_layers`
 - `--itgca_window_size`
 - `--ablate_r_stat`
+- `--ablate_r_learned`
 - `--ablate_g_token`
 - `--ablate_source_bias`
 

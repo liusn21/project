@@ -175,6 +175,7 @@ class MultiModalModel(nn.Module):
             self.vocab_size_raw = embedding_raw.token_embedding.num_embeddings
             # Component-level ablation flags
             self.ablate_r_stat = getattr(args, 'ablate_r_stat', False)
+            self.ablate_r_learned = getattr(args, 'ablate_r_learned', False)
             self.ablate_g_token = getattr(args, 'ablate_g_token', False)
             self.ablate_source_bias = getattr(args, 'ablate_source_bias', False)
 

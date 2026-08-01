@@ -230,13 +230,19 @@ April training behavior.
 
 ### Component-level ablation flags
 
-Disable individual ITGCA components to reproduce the per-component decomposition (Table 5):
+Disable individual ITGCA components. The published Table 5 uses the
+`r_stat`, `g_token`, and source-bias rows; `r_learned` is available as an
+additional diagnostic ablation:
 
-| Flag                  | Disables                                                  |
-|-----------------------|-----------------------------------------------------------|
-| `--ablate_r_stat`     | Flow-level Shannon-entropy prior (Eq. 5)                  |
-| `--ablate_g_token`    | Per-position learned token gate (Eq. 8)                   |
-| `--ablate_source_bias`| Source-side attention reweighting (Eq. 10)                |
+| Flag                   | Disables                                                   |
+|------------------------|------------------------------------------------------------|
+| `--ablate_r_stat`      | Flow-level Shannon-entropy prior (Eq. 5)                   |
+| `--ablate_r_learned`   | Bilinear compatibility correction in the modality gate     |
+| `--ablate_g_token`     | Per-position learned token gate (Eq. 8)                    |
+| `--ablate_source_bias` | Source-side attention reweighting (Eq. 10)                 |
+
+With `--ablate_r_learned`, `Size←Raw` uses calibrated `r_stat` directly,
+while `Raw←Size` sets its modality gate to one and retains `g_token`.
 
 These flags must be passed identically at fine-tune time so that loaded checkpoint geometry matches.
 
