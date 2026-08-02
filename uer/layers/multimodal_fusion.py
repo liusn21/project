@@ -16,6 +16,11 @@ Gate mechanism - ITGCA (Information-Theoretic Gated Cross-Attention) — Asymmet
   - Token gate: pure learned (SA residual)
 - Multiplicative: g = r_mod * g_token
 - Gate applied AFTER final_linear, per-position [B, L_q, 1]
+
+Lightweight alternative:
+- One stack-shared MLP reads detached Raw/Size encoder CLS plus Raw r_stat
+- Produces two flow-level scalar gates, one for each fusion direction
+- No token gate, bilinear matrix per layer, or source-side attention bias
 """
 
 import torch
@@ -158,6 +163,43 @@ class ITGCrossAttentionGate(nn.Module):
         return gate, r_mod
 
 
+class LightweightMLPGate(nn.Module):
+    """Shared flow-level gate for the lightweight learned-gating baseline."""
+
+    def __init__(self, hidden_size, bottleneck_size=64, gate_bias_init=2.0):
+        super(LightweightMLPGate, self).__init__()
+        bottleneck_size = min(bottleneck_size, hidden_size)
+        self.input_projection = nn.Linear(2 * hidden_size + 1, bottleneck_size)
+        self.output_projection = nn.Linear(bottleneck_size, 2)
+
+        # Start close to standard cross-attention while allowing the MLP to
+        # learn direction-specific gates from the first optimizer step.
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.constant_(self.output_projection.bias, float(gate_bias_init))
+
+    def forward(self, raw_cls_enc, size_cls_enc, r_stat_raw):
+        if raw_cls_enc is None or size_cls_enc is None or r_stat_raw is None:
+            raise ValueError(
+                "Lightweight MLP gating requires Raw/Size encoder CLS features "
+                "and the Raw entropy reliability score."
+            )
+
+        # Gate supervision should train the small MLP, not add a second gradient
+        # path into the unimodal encoders.
+        raw_cls = raw_cls_enc.detach()
+        size_cls = size_cls_enc.detach()
+        r_stat = r_stat_raw.detach().to(dtype=raw_cls.dtype).unsqueeze(-1)
+
+        features = torch.cat([raw_cls, size_cls, r_stat], dim=-1)
+        hidden = F.gelu(self.input_projection(features))
+        gates = torch.sigmoid(self.output_projection(hidden))
+
+        # gate_raw controls Raw<-Size; gate_size controls Size<-Raw.
+        gate_raw = gates[:, 0].view(-1, 1, 1)
+        gate_size = gates[:, 1].view(-1, 1, 1)
+        return gate_raw, gate_size
+
+
 class BidirectionalFusionLayer(nn.Module):
     """
     Single bidirectional cross-attention fusion layer.
@@ -166,17 +208,20 @@ class BidirectionalFusionLayer(nn.Module):
         Raw Branch:  Self-Attn -> Cross-Attn(Q=raw, KV=size) -> FFN
         Size Branch: Self-Attn -> Cross-Attn(Q=size, KV=raw) -> FFN
 
-    Gate: ITGCA (use_itgca=True) provides information-theoretic per-position gating.
+    Gate: ITGCA provides per-position gating; the lightweight MLP alternative
+    provides two shared flow-level scalar gates.
     """
 
     def __init__(self, hidden_size, heads_num, feedforward_size, hidden_act, dropout,
                  use_itgca=False,
+                 use_mlp_gate=False,
                  ablate_r_stat=False, ablate_g_token=False, ablate_source_bias=False,
                  alpha_init=-2.0, token_gate_bias_init=2.0,
                  ablate_r_learned=False):
         super(BidirectionalFusionLayer, self).__init__()
 
         self.use_itgca = use_itgca
+        self.use_mlp_gate = use_mlp_gate
         self.ablate_source_bias = ablate_source_bias
         self.heads_num = heads_num
         attention_head_size = hidden_size // heads_num
@@ -276,7 +321,8 @@ class BidirectionalFusionLayer(nn.Module):
                 cross_mask_r2s, cross_mask_s2r,
                 raw_cls_enc=None, size_cls_enc=None,
                 r_stat_raw=None,
-                local_ent_raw=None):
+                local_ent_raw=None,
+                mlp_gate_raw=None, mlp_gate_size=None):
         """
         Args:
             raw_feat: [batch, seq_len_raw, hidden]
@@ -289,6 +335,8 @@ class BidirectionalFusionLayer(nn.Module):
             size_cls_enc: [batch, hidden] - Size encoder CLS (detached), for ITGCA
             r_stat_raw: [batch] - Raw flow-level reliability, for ITGCA (Size←Raw direction only)
             local_ent_raw: [batch, seq_len_raw] - Raw local entropy, for source-side V gating
+            mlp_gate_raw: [batch, seq_len_raw, 1] - Shared MLP gate for Raw<-Size
+            mlp_gate_size: [batch, seq_len_size, 1] - Shared MLP gate for Size<-Raw
 
         Returns:
             raw_out: [batch, seq_len_raw, hidden]
@@ -360,6 +408,16 @@ class BidirectionalFusionLayer(nn.Module):
                 'gate_size': gate_size.squeeze(-1),   # [B, L_size]
             }
 
+        elif self.use_mlp_gate:
+            raw_cross, _ = self.cross_attn_raw(
+                size_feat_sa, size_feat_sa, raw_feat_sa,
+                cross_mask_r2s, None, logits_gate=mlp_gate_raw
+            )
+            size_cross, _ = self.cross_attn_size(
+                raw_feat_sa, raw_feat_sa, size_feat_sa,
+                cross_mask_s2r, None, logits_gate=mlp_gate_size
+            )
+
         else:
             raw_cross, _ = self.cross_attn_raw(
                 size_feat_sa, size_feat_sa, raw_feat_sa, cross_mask_r2s, None
@@ -391,8 +449,8 @@ class MultiModalFusionEncoder(nn.Module):
     """
     Stacked bidirectional cross-attention fusion encoder.
 
-    Contains multiple BidirectionalFusionLayer modules and supports the
-    optional ITGCA gating mechanism.
+    Contains multiple BidirectionalFusionLayer modules and supports either
+    ITGCA or a shared lightweight MLP gate.
     """
 
     def __init__(self, args, num_layers=6, use_itgca=False):
@@ -401,6 +459,12 @@ class MultiModalFusionEncoder(nn.Module):
         self.num_layers = num_layers
         self.hidden_size = args.hidden_size
         self.use_itgca = use_itgca
+        self.use_mlp_gate = getattr(args, 'use_mlp_gate', False)
+        if self.use_itgca and self.use_mlp_gate:
+            raise ValueError("--use_itgca and --use_mlp_gate are mutually exclusive.")
+
+        if self.use_mlp_gate:
+            self.mlp_gate = LightweightMLPGate(args.hidden_size)
 
         # ITGCA component-level ablation flags (defaults: full ITGCA, all components active)
         ablate_r_stat = getattr(args, 'ablate_r_stat', False)
@@ -420,6 +484,7 @@ class MultiModalFusionEncoder(nn.Module):
                 hidden_act=args.hidden_act,
                 dropout=args.dropout,
                 use_itgca=use_itgca,
+                use_mlp_gate=self.use_mlp_gate,
                 ablate_r_stat=ablate_r_stat,
                 ablate_r_learned=ablate_r_learned,
                 ablate_g_token=ablate_g_token,
@@ -471,6 +536,18 @@ class MultiModalFusionEncoder(nn.Module):
         cross_mask_s2r = cross_mask_s2r.expand(-1, -1, seq_len_size, -1).float()
         cross_mask_s2r = (1.0 - cross_mask_s2r) * -10000.0
 
+        # The MLP is evaluated once per paired example and shared by every
+        # fusion layer. expand() creates views, not full per-token copies.
+        if self.use_mlp_gate:
+            mlp_gate_raw, mlp_gate_size = self.mlp_gate(
+                raw_cls_enc, size_cls_enc, r_stat_raw
+            )
+            mlp_gate_raw = mlp_gate_raw.expand(-1, seq_len_raw, -1)
+            mlp_gate_size = mlp_gate_size.expand(-1, seq_len_size, -1)
+        else:
+            mlp_gate_raw = None
+            mlp_gate_size = None
+
         # ===== Layer-by-layer Fusion =====
         raw_hidden = raw_feat
         size_hidden = size_feat
@@ -483,7 +560,9 @@ class MultiModalFusionEncoder(nn.Module):
                 raw_cls_enc=raw_cls_enc,
                 size_cls_enc=size_cls_enc,
                 r_stat_raw=r_stat_raw,
-                local_ent_raw=local_ent_raw
+                local_ent_raw=local_ent_raw,
+                mlp_gate_raw=mlp_gate_raw,
+                mlp_gate_size=mlp_gate_size
             )
 
         return raw_hidden, size_hidden, None

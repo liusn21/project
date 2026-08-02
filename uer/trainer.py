@@ -96,19 +96,20 @@ def train_and_validate(args):
         pretrained_prefixes = ('embedding_raw.', 'encoder_raw.', 'embedding_size.', 'encoder_size.',
                                'embedding_raw_m.', 'encoder_raw_m.', 'embedding_size_m.', 'encoder_size_m.',
                                'itc_proj_raw_m.', 'itc_proj_size_m.')
-        # ITGCA gate parameters have specific initializations for implicit curriculum learning
-        # (alpha=-2.0 → sigmoid≈0.12, g_default_logit=0.0, bilinear xavier gain=0.1)
-        # These must NOT be overwritten by blanket normal_(0, 0.02)
-        itgca_param_names = ('alpha_modality', 'g_default_logit',
-                             'bilinear_W', 'bilinear_bias',
-                             'stat_scale', 'stat_shift',
-                             'local_stat_scale', 'local_stat_shift',
-                             'token_gate_bias')
+        # Gate parameters with deliberate initializations must not be overwritten
+        # by blanket normal_(0, 0.02). The lightweight MLP output starts at
+        # weight=0, bias=2, so both directions are initially about 0.88 open.
+        gate_param_names = ('alpha_modality', 'g_default_logit',
+                            'bilinear_W', 'bilinear_bias',
+                            'stat_scale', 'stat_shift',
+                            'local_stat_scale', 'local_stat_shift',
+                            'token_gate_bias',
+                            'mlp_gate.output_projection')
         for n, p in list(model.named_parameters()):
             if "gamma" not in n and "beta" not in n:
                 if not n.startswith(pretrained_prefixes):
-                    if any(ip in n for ip in itgca_param_names):
-                        continue  # Preserve ITGCA-specific initialization
+                    if any(ip in n for ip in gate_param_names):
+                        continue  # Preserve gate-specific initialization
                     p.data.normal_(0, 0.02)
     else:
         # Initialize with normal distribution.

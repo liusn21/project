@@ -4,7 +4,7 @@ Stage 2 Multi-Modal Classifier (paper §4.1.4 fine-tuning recipe).
 Architecture:
     - Raw encoder (loaded from Stage 2 pretrained checkpoint)
     - Size encoder (loaded from Stage 2 pretrained checkpoint)
-    - Fusion module (loaded from Stage 2 pretrained checkpoint, with optional ITGCA)
+    - Fusion module (loaded from Stage 2 pretrained checkpoint, with optional gating)
     - Classification head (concat fused [CLS] + non-CLS mean-pool, two-layer MLP)
 
 Training (paper §4.1.4):
@@ -115,7 +115,7 @@ class Stage2Classifier(nn.Module):
     Architecture:
         - Raw encoder (pretrained): embedding + transformer
         - Size encoder (pretrained): embedding + transformer
-        - Fusion module (pretrained): bidirectional cross-attention with optional ITGCA
+        - Fusion module (pretrained): bidirectional cross-attention with optional gating
         - Classifier head: concat([fused_raw_cls, fused_size_cls,
                                    mean_pool(fused_raw), mean_pool(fused_size)])
                           -> Linear -> Tanh -> Dropout -> Linear -> labels
@@ -127,8 +127,11 @@ class Stage2Classifier(nn.Module):
         self.hidden_size = args.hidden_size
         self.labels_num = labels_num
 
-        # ITGCA support (must match the pretrained checkpoint).
+        # Fusion gate mode (must match the pretrained checkpoint).
         self.use_itgca = getattr(args, 'use_itgca', False)
+        self.use_mlp_gate = getattr(args, 'use_mlp_gate', False)
+        if self.use_itgca and self.use_mlp_gate:
+            raise ValueError("--use_itgca and --use_mlp_gate are mutually exclusive.")
         self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
         self.vocab_size_raw = vocab_size_raw
         self.ablate_r_stat = getattr(args, 'ablate_r_stat', False)
@@ -181,24 +184,33 @@ class Stage2Classifier(nn.Module):
         size_seg = (size_src != PAD_ID).long()
         size_output = self.encoder_size(size_emb, size_seg)
 
-        # ITGCA signals (no detach -- let gate gradients flow back into the encoder).
+        # ITGCA signals (no detach -- preserve the existing fine-tuning behavior).
         if self.use_itgca:
             r_stat_raw = (None if self.ablate_r_stat
                           else compute_flow_reliability_raw(raw_src, vocab_size=self.vocab_size_raw))
             local_ent_raw = (None if self.ablate_source_bias
                              else compute_local_entropy(raw_src, self.itgca_window_size))
-            itgca_kwargs = {
+            gate_kwargs = {
                 'raw_cls_enc': raw_output[:, 0, :],
                 'size_cls_enc': size_output[:, 0, :],
                 'r_stat_raw': r_stat_raw,
                 'local_ent_raw': local_ent_raw,
             }
+        elif self.use_mlp_gate:
+            gate_kwargs = {
+                'raw_cls_enc': raw_output[:, 0, :].detach(),
+                'size_cls_enc': size_output[:, 0, :].detach(),
+                'r_stat_raw': compute_flow_reliability_raw(
+                    raw_src, vocab_size=self.vocab_size_raw
+                ),
+                'local_ent_raw': None,
+            }
         else:
-            itgca_kwargs = {}
+            gate_kwargs = {}
 
         # Fusion.
         raw_fused, size_fused, _ = self.fusion(
-            raw_output, size_output, raw_seg, size_seg, **itgca_kwargs
+            raw_output, size_output, raw_seg, size_seg, **gate_kwargs
         )
 
         # Fused [CLS] tokens + mean pool over non-CLS, non-PAD positions.
@@ -249,17 +261,25 @@ def load_pretrained_model(model, pretrained_path):
     print(f"  Missing keys: {len(missing)} (classifier: {len(classifier_missing)}, other: {len(other_missing)})")
     print(f"  Unexpected keys: {len(unexpected)}")
 
-    # ITGCA config mismatch detection.
+    # Fusion-gate config mismatch detection.
     has_itgca_in_checkpoint = any(
-        k.startswith('fusion.fusion_layers.0.gate_') for k in filtered_state.keys()
+        k.startswith('fusion.fusion_layers.0.gate_') or
+        k.startswith('fusion.fusion_layers.0.local_stat_')
+        for k in filtered_state.keys()
+    )
+    has_mlp_gate_in_checkpoint = any(
+        k.startswith('fusion.mlp_gate.') for k in filtered_state.keys()
     )
     model_uses_itgca = getattr(model, 'use_itgca', False)
-    if has_itgca_in_checkpoint and not model_uses_itgca:
-        print(f"  WARNING: Pretrained model was trained WITH ITGCA, "
-              f"but fine-tuning does NOT use --use_itgca. Gate weights discarded.")
-    elif not has_itgca_in_checkpoint and model_uses_itgca:
-        print(f"  WARNING: Pretrained model was trained WITHOUT ITGCA, "
-              f"but fine-tuning uses --use_itgca. Gate parameters randomly initialized!")
+    model_uses_mlp_gate = getattr(model, 'use_mlp_gate', False)
+    checkpoint_gate = ('ITGCA' if has_itgca_in_checkpoint else
+                       'MLP' if has_mlp_gate_in_checkpoint else 'none')
+    model_gate = ('ITGCA' if model_uses_itgca else
+                  'MLP' if model_uses_mlp_gate else 'none')
+    if checkpoint_gate != model_gate:
+        print(f"  WARNING: Pretrained gate mode is {checkpoint_gate}, but "
+              f"fine-tuning gate mode is {model_gate}. Use the matching "
+              f"--use_itgca or --use_mlp_gate flag.")
 
     if len(other_missing) == 0 and len(unexpected) == 0:
         print(f"  All encoder/fusion parameters loaded successfully.")
@@ -1113,6 +1133,9 @@ def main():
                         help="Number of fusion layers (must match the pretrained model).")
     parser.add_argument("--use_itgca", action="store_true",
                         help="Enable ITGCA gate mechanism. MUST match the pretrained model's configuration.")
+    parser.add_argument("--use_mlp_gate", action="store_true",
+                        help="Enable the shared lightweight MLP gate. MUST match the "
+                             "pretrained model's configuration.")
     parser.add_argument("--itgca_window_size", type=int, default=16,
                         help="Sliding window size for ITGCA local entropy.")
 
@@ -1187,6 +1210,9 @@ def main():
 
     args = parser.parse_args()
 
+    if args.use_itgca and args.use_mlp_gate:
+        parser.error("--use_itgca and --use_mlp_gate are mutually exclusive.")
+
     # Guardrail: items 5 and 6 both reshape dropout/loss; keep them mutually exclusive.
     assert not (args.use_msd and args.use_rdrop), \
         "--use_msd and --use_rdrop are mutually exclusive (item-5 vs item-6)."
@@ -1241,6 +1267,9 @@ def main():
     print("Building model...")
     model = Stage2Classifier(args, len(vocab_raw), len(vocab_size),
                              len(vocab_temporal), args.labels_num)
+    gate_mode = ('ITGCA' if args.use_itgca else
+                 'lightweight MLP' if args.use_mlp_gate else 'none')
+    print(f"  Fusion gate: {gate_mode}")
 
     # Load pretrained Stage 2 weights.
     load_pretrained_model(model, args.pretrained_model_path)

@@ -156,7 +156,7 @@ def compute_local_entropy(tokens, window_size=16, pad_id=0):
 
 class MultiModalModel(nn.Module):
     """
-    Multi-Modal Pretraining Model (ALBEF-style) with optional ITGCA.
+    Multi-Modal Pretraining Model (ALBEF-style) with optional gated fusion.
     """
 
     def __init__(self, args, embedding_raw, encoder_raw, embedding_size, encoder_size,
@@ -168,11 +168,18 @@ class MultiModalModel(nn.Module):
         self.momentum = momentum
         self.itc_temp = getattr(args, 'itc_temperature', 0.07)
 
-        # ITGCA parameters
+        # Fusion gate parameters.
         self.use_itgca = getattr(args, 'use_itgca', False)
+        self.use_mlp_gate = getattr(args, 'use_mlp_gate', False)
+        self.use_gated_fusion = self.use_itgca or self.use_mlp_gate
+        if self.use_itgca and self.use_mlp_gate:
+            raise ValueError("--use_itgca and --use_mlp_gate are mutually exclusive.")
+
+        if self.use_gated_fusion:
+            self.vocab_size_raw = embedding_raw.token_embedding.num_embeddings
+
         if self.use_itgca:
             self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
-            self.vocab_size_raw = embedding_raw.token_embedding.num_embeddings
             # Component-level ablation flags
             self.ablate_r_stat = getattr(args, 'ablate_r_stat', False)
             self.ablate_r_learned = getattr(args, 'ablate_r_learned', False)
@@ -267,12 +274,12 @@ class MultiModalModel(nn.Module):
 
         self.queue_ptr[0] = ptr
 
-    def _compute_itgca_signals(self, raw_src, raw_cls, size_cls):
+    def _compute_fusion_gate_signals(self, raw_src, raw_cls, size_cls):
         """
-        Compute ITGCA statistical priors and encoder CLS signals (asymmetric).
+        Compute the statistical and encoder signals needed by the active gate.
 
-        Only computes priors for the Raw modality (Size is stable, no prior needed).
-        Local entropy is computed on-the-fly using vectorized GPU ops (< 1ms/batch).
+        The lightweight MLP uses only the flow-level Raw reliability score. Full
+        ITGCA additionally computes local entropy unless that path is ablated.
 
         Args:
             raw_src: [B, L_raw] - Raw token IDs
@@ -280,19 +287,25 @@ class MultiModalModel(nn.Module):
             size_cls: [B, H] - Size encoder CLS (will be detached)
 
         Returns:
-            itgca_kwargs: dict of keyword arguments for fusion forward
+            gate_kwargs: dict of keyword arguments for fusion forward
         """
-        # Skip r_stat / local_ent computation when their downstream consumers
-        # are ablated — saves a few ms per batch and ensures the gate's
-        # `r_stat is None` branch fires for "w/o r_stat" runs.
-        if self.ablate_r_stat:
-            r_stat_raw = None
-        else:
-            r_stat_raw = compute_flow_reliability_raw(raw_src, vocab_size=self.vocab_size_raw)
-        if self.ablate_source_bias:
+        if self.use_mlp_gate:
+            r_stat_raw = compute_flow_reliability_raw(
+                raw_src, vocab_size=self.vocab_size_raw
+            )
             local_ent_raw = None
         else:
-            local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
+            # Skip signals whose ITGCA consumers are ablated.
+            if self.ablate_r_stat:
+                r_stat_raw = None
+            else:
+                r_stat_raw = compute_flow_reliability_raw(
+                    raw_src, vocab_size=self.vocab_size_raw
+                )
+            if self.ablate_source_bias:
+                local_ent_raw = None
+            else:
+                local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
 
         raw_cls_enc = raw_cls.detach()
         size_cls_enc = size_cls.detach()
@@ -341,13 +354,13 @@ class MultiModalModel(nn.Module):
         raw_cls = raw_output[:, 0, :]
         size_cls = size_output_clean[:, 0, :]
 
-        # ===== ITGCA: Compute statistical priors =====
-        if self.use_itgca:
-            itgca_kwargs = self._compute_itgca_signals(
+        # ===== Fusion gate: Compute reliability/compatibility inputs =====
+        if self.use_gated_fusion:
+            gate_kwargs = self._compute_fusion_gate_signals(
                 raw_src, raw_cls, size_cls
             )
         else:
-            itgca_kwargs = {}
+            gate_kwargs = {}
 
         # ===== Step 3: Momentum Encoders =====
         with torch.no_grad():
@@ -380,7 +393,7 @@ class MultiModalModel(nn.Module):
         # ===== Step 6: Fusion for Positive Samples =====
         raw_fused, size_fused, gate_info_pos = self.fusion(
             raw_output, size_output_clean, raw_seg, size_seg,
-            **itgca_kwargs
+            **gate_kwargs
         )
 
         pos_raw_cls = raw_fused[:, 0, :]
@@ -396,19 +409,19 @@ class MultiModalModel(nn.Module):
         neg_size_output_1 = size_output_clean[neg_size_idx]
         neg_size_seg_1 = size_seg[neg_size_idx]
 
-        if self.use_itgca:
-            itgca_kwargs_neg1 = {
-                'raw_cls_enc': itgca_kwargs['raw_cls_enc'],
-                'size_cls_enc': itgca_kwargs['size_cls_enc'][neg_size_idx],
-                'r_stat_raw': itgca_kwargs['r_stat_raw'],
-                'local_ent_raw': itgca_kwargs['local_ent_raw'],
+        if self.use_gated_fusion:
+            gate_kwargs_neg1 = {
+                'raw_cls_enc': gate_kwargs['raw_cls_enc'],
+                'size_cls_enc': gate_kwargs['size_cls_enc'][neg_size_idx],
+                'r_stat_raw': gate_kwargs['r_stat_raw'],
+                'local_ent_raw': gate_kwargs['local_ent_raw'],
             }
         else:
-            itgca_kwargs_neg1 = {}
+            gate_kwargs_neg1 = {}
 
         neg1_raw_fused, neg1_size_fused, _ = self.fusion(
             raw_output, neg_size_output_1, raw_seg, neg_size_seg_1,
-            **itgca_kwargs_neg1
+            **gate_kwargs_neg1
         )
         neg1_raw_cls = neg1_raw_fused[:, 0, :]
         neg1_size_cls = neg1_size_fused[:, 0, :]
@@ -417,26 +430,26 @@ class MultiModalModel(nn.Module):
         neg_raw_output_2 = raw_output[neg_raw_idx]
         neg_raw_seg_2 = raw_seg[neg_raw_idx]
 
-        if self.use_itgca:
+        if self.use_gated_fusion:
             # r_stat_raw / local_ent_raw may be None when their components are ablated
-            r_stat_neg2 = itgca_kwargs['r_stat_raw']
+            r_stat_neg2 = gate_kwargs['r_stat_raw']
             if r_stat_neg2 is not None:
                 r_stat_neg2 = r_stat_neg2[neg_raw_idx]
-            local_ent_neg2 = itgca_kwargs['local_ent_raw']
+            local_ent_neg2 = gate_kwargs['local_ent_raw']
             if local_ent_neg2 is not None:
                 local_ent_neg2 = local_ent_neg2[neg_raw_idx]
-            itgca_kwargs_neg2 = {
-                'raw_cls_enc': itgca_kwargs['raw_cls_enc'][neg_raw_idx],
-                'size_cls_enc': itgca_kwargs['size_cls_enc'],
+            gate_kwargs_neg2 = {
+                'raw_cls_enc': gate_kwargs['raw_cls_enc'][neg_raw_idx],
+                'size_cls_enc': gate_kwargs['size_cls_enc'],
                 'r_stat_raw': r_stat_neg2,
                 'local_ent_raw': local_ent_neg2,
             }
         else:
-            itgca_kwargs_neg2 = {}
+            gate_kwargs_neg2 = {}
 
         neg2_raw_fused, neg2_size_fused, _ = self.fusion(
             neg_raw_output_2, size_output_clean, neg_raw_seg_2, size_seg,
-            **itgca_kwargs_neg2
+            **gate_kwargs_neg2
         )
         neg2_raw_cls = neg2_raw_fused[:, 0, :]
         neg2_size_cls = neg2_size_fused[:, 0, :]
@@ -454,15 +467,15 @@ class MultiModalModel(nn.Module):
         size_output_masked = self.encoder_size(size_emb_masked, size_seg_masked)
 
         # ===== Step 11: Fusion with Masked Size features =====
-        if self.use_itgca:
+        if self.use_gated_fusion:
             # Use clean encoder CLS and clean r_stat/local_ent for masked fusion
-            itgca_kwargs_masked = dict(itgca_kwargs)
+            gate_kwargs_masked = dict(gate_kwargs)
         else:
-            itgca_kwargs_masked = {}
+            gate_kwargs_masked = {}
 
         _, size_fused_masked, _ = self.fusion(
             raw_output, size_output_masked, raw_seg, size_seg_masked,
-            **itgca_kwargs_masked
+            **gate_kwargs_masked
         )
 
         # ===== Step 12: Masked Reconstruction Loss =====
@@ -502,20 +515,20 @@ class MultiModalModel(nn.Module):
         size_seg = (size_src != PAD_ID).long()
         size_output = self.encoder_size(size_emb, size_seg)
 
-        # ITGCA signals for inference
-        if self.use_itgca:
+        # Gate signals for inference.
+        if self.use_gated_fusion:
             raw_cls = raw_output[:, 0, :]
             size_cls = size_output[:, 0, :]
-            itgca_kwargs = self._compute_itgca_signals(
+            gate_kwargs = self._compute_fusion_gate_signals(
                 raw_src, raw_cls, size_cls
             )
         else:
-            itgca_kwargs = {}
+            gate_kwargs = {}
 
         # Fusion
         raw_fused, size_fused, _ = self.fusion(
             raw_output, size_output, raw_seg, size_seg,
-            **itgca_kwargs
+            **gate_kwargs
         )
 
         return raw_fused, size_fused

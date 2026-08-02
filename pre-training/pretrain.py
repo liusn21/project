@@ -117,6 +117,10 @@ def main():
                         help="Enable asymmetric ITGCA gate mechanism in fusion layers. "
                              "Size←Raw: source-side V gating + modality prior + learned token gate. "
                              "Raw←Size: pure learned gate (no prior).")
+    parser.add_argument("--use_mlp_gate", action="store_true",
+                        help="Replace ITGCA with one lightweight flow-level MLP gate shared "
+                             "by all fusion layers. Inputs are detached Raw/Size encoder CLS "
+                             "features and Raw entropy reliability; outputs gate both directions.")
     parser.add_argument("--itgca_window_size", type=int, default=16,
                         help="Sliding window size for local entropy computation in ITGCA token gate. "
                              "Recommended range: 16-32 for byte-level token sequences.")
@@ -173,6 +177,9 @@ def main():
 
 
     args = parser.parse_args()
+    if args.use_itgca and args.use_mlp_gate:
+        parser.error("--use_itgca and --use_mlp_gate are mutually exclusive.")
+
     print("Training arguments:")
     print(f"Learning rate: {args.learning_rate}")
     print(f"Encoder learning rate ratio: {args.encoder_lr_ratio}")

@@ -51,6 +51,12 @@ def fusion_layer_gates(H):
     return 3 * H * H + 9
 
 
+def lightweight_mlp_gate(H, bottleneck=64):
+    """One stack-shared MLP: Linear(2H+1,B) + Linear(B,2)."""
+    B = min(bottleneck, H)
+    return B * (2 * H + 4) + 2
+
+
 def target_heads(H):
     """ITC(2 x (H^2+H)) + ITM(2H^2+3H+2) + recon_size(H^2+3009H+3006) + recon_temporal(H^2+1008H+1005)."""
     itc = 2 * (H * H + H)
@@ -144,3 +150,8 @@ if __name__ == "__main__":
     print("Note: feature queues (2 x [4096,H]) are buffers, not params:")
     for r in rows:
         print(f"   {r['name']:<16} queue buffer = {r['queues']/1e6:.2f}M (excluded from all counts above)")
+
+    print()
+    print("Gate-only comparison (base H=768, 6 fusion layers):")
+    print(f"   Full ITGCA       = {6 * fusion_layer_gates(768)/1e6:.2f}M parameters")
+    print(f"   Shared MLP gate  = {lightweight_mlp_gate(768)/1e6:.5f}M parameters")

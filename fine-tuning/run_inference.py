@@ -122,6 +122,9 @@ def build_args():
                         help="[Stage 2] Number of fusion layers (must match training)")
     parser.add_argument("--use_itgca", action="store_true",
                         help="[Stage 2] Enable ITGCA (must match training config)")
+    parser.add_argument("--use_mlp_gate", action="store_true",
+                        help="[Stage 2] Enable the shared lightweight MLP gate "
+                             "(must match training config)")
     parser.add_argument("--itgca_window_size", type=int, default=16,
                         help="[Stage 2] ITGCA sliding window size")
     parser.add_argument(
@@ -174,6 +177,9 @@ def build_args():
                              "(only used with --detailed)")
 
     args = parser.parse_args()
+    if args.use_itgca and args.use_mlp_gate:
+        parser.error("--use_itgca and --use_mlp_gate are mutually exclusive.")
+
     legacy_cli_options = (args.old, args.use_attn_pooling, args.use_scl)
 
     # Load hyperparameters from config JSON
@@ -184,6 +190,8 @@ def build_args():
 
     if args.old and args.stage != 2:
         parser.error("--old is only valid with --stage 2")
+    if args.old and args.use_mlp_gate:
+        parser.error("--use_mlp_gate is supported by the current Stage 2 classifier only")
     if (args.use_attn_pooling or args.use_scl) and not args.old:
         parser.error("--use_attn_pooling and --use_scl require --old")
 
@@ -418,6 +426,9 @@ def main():
         )
     else:
         stage2_classifier = get_stage2_classifier(args.old)
+        gate_mode = ('ITGCA' if args.use_itgca else
+                     'lightweight MLP' if args.use_mlp_gate else 'none')
+        print(f"  Fusion gate: {gate_mode}")
         if args.old:
             print(
                 "  Legacy classifier: "
@@ -484,6 +495,9 @@ def main():
                for k in unsafe_unexpected):
             print(f"\n  HINT: Checkpoint contains ITGCA gate weights. "
                   f"Add --use_itgca to match.")
+        if any('mlp_gate' in k for k in unsafe_unexpected):
+            print(f"\n  HINT: Checkpoint contains lightweight MLP gate weights. "
+                  f"Add --use_mlp_gate to match.")
 
     if missing:
         has_error = True
@@ -498,12 +512,16 @@ def main():
             print(f"        If checkpoint was trained WITH ablation → add matching "
                   f"--ablate_r_stat / --ablate_r_learned / --ablate_g_token / "
                   f"--ablate_source_bias.")
+        if any('mlp_gate' in k for k in missing):
+            print(f"\n  HINT: Model defines the lightweight MLP gate, but the "
+                  f"checkpoint does not. Remove --use_mlp_gate or use a matching checkpoint.")
         if any('classifier' in k for k in missing):
             print(f"\n  HINT: Classifier shape mismatch. Check --labels_num.")
 
     if has_error:
         print(f"\n  Current inference flags:")
         print(f"    --use_itgca={getattr(args, 'use_itgca', False)}")
+        print(f"    --use_mlp_gate={getattr(args, 'use_mlp_gate', False)}")
         print(f"    --ablate_r_stat={getattr(args, 'ablate_r_stat', False)}")
         print(f"    --ablate_r_learned={getattr(args, 'ablate_r_learned', False)}")
         print(f"    --ablate_g_token={getattr(args, 'ablate_g_token', False)}")

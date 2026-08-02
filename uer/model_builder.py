@@ -46,6 +46,7 @@ def build_model(args):
 
         num_fusion_layers = getattr(args, 'num_fusion_layers', 6)
         use_itgca = getattr(args, 'use_itgca', False)
+        use_mlp_gate = getattr(args, 'use_mlp_gate', False)
         fusion = MultiModalFusionEncoder(args, num_layers=num_fusion_layers, use_itgca=use_itgca)
 
         # Build target module (ITC + ITM + Masked Reconstruction)
@@ -123,6 +124,7 @@ def build_model(args):
         print(f"  Encoder layers: raw={layers_num_raw}, size={layers_num_size}")
         print(f"  Fusion layers: {num_fusion_layers}")
         print(f"  ITGCA: {use_itgca}")
+        print(f"  Lightweight MLP gate: {use_mlp_gate}")
         if use_itgca:
             print(f"  ITGCA window size: {getattr(args, 'itgca_window_size', 16)}")
             ablations = [name for name in ('r_stat', 'r_learned', 'g_token', 'source_bias')

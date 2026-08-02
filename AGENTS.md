@@ -10,6 +10,10 @@ collaboration constraints. Do not use this file as a per-chat log.
   inference, preprocessing, data generation, or LaTeX builds locally unless the
   user explicitly asks for it.
 - Static inspection commands such as listing files and reading source are fine.
+- Do not modify any project file unless the user explicitly authorizes an edit.
+  Requests to read, inspect, discuss, review, propose, or plan changes do not
+  constitute edit authorization; present proposed changes in chat and wait for
+  approval before applying them.
 - The user mainly wants help with two kinds of work:
   1. Modify and improve the project code and paper.
   2. Develop follow-up research ideas extending this project.

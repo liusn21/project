@@ -32,7 +32,7 @@ class MultiHeadedAttention(nn.Module):
             query: [batch_size x seq_length_q x hidden_size]
             mask: [batch_size x 1 x seq_length_q x seq_length_k]
             position_bias: [1 x heads_num x seq_length x seq_length]
-            logits_gate: Optional ITGCA gate for cross-attention control.
+            logits_gate: Optional output gate for cross-attention control.
                          Shape: [batch_size x seq_length_q x 1] (per-position).
                          Values in [0, 1]. When gate=0, cross-attention output is suppressed.
                          Applied AFTER final_linear to prevent bias leakage.

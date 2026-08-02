@@ -228,6 +228,24 @@ micro-batches. Stage 2 ITC/ITM candidate sets remain micro-batch-local, and the
 momentum teacher and queue update after every micro-batch, matching the original
 April training behavior.
 
+### Fusion-gate alternatives
+
+Stage 2 exposes three mutually exclusive fusion modes:
+
+| Mode | Flag | Gate behavior |
+|------|------|---------------|
+| Standard cross-attention | neither flag | Cross-modal outputs are not gated |
+| Full ITGCA | `--use_itgca` | Flow-, token-, and source-level reliability gating |
+| Lightweight MLP | `--use_mlp_gate` | One stack-shared flow gate using detached Raw/Size CLS and Raw entropy reliability |
+
+The lightweight MLP has a 64-dimensional hidden layer and outputs one scalar
+for each cross-attention direction. The two scalars are shared across all token
+positions and fusion layers and are applied after the attention output
+projection. For the base configuration it adds about 0.099M parameters, versus
+about 10.62M gate parameters for six-layer ITGCA. To run this replacement
+experiment, replace `--use_itgca` with `--use_mlp_gate` in pre-training,
+fine-tuning, and inference commands.
+
 ### Component-level ablation flags
 
 Disable individual ITGCA components. The published Table 5 uses the
@@ -317,7 +335,11 @@ python3 fine-tuning/run_classifier_stage2.py \
     --seed 42 --gpu_ranks 0
 ```
 
-Important: every `--use_itgca / --ablate_*` / `--num_fusion_layers` / `--itgca_window_size` flag here **must match the value used at Stage 2 pre-training** — otherwise the gate parameters in the checkpoint cannot be loaded. The classifier prints a warning if it detects a mismatch.
+Important: the `--use_itgca` / `--use_mlp_gate` mode and every relevant
+`--ablate_*` / `--num_fusion_layers` / `--itgca_window_size` value here **must
+match the Stage 2 pre-training configuration**. Otherwise the gate parameters
+in the checkpoint cannot be loaded. The classifier prints a warning if it
+detects a mismatch.
 
 ### 5.4 Few-shot fine-tuning
 
