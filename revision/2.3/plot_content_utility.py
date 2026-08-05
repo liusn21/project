@@ -32,6 +32,12 @@ Generate all three views:
 
     python3 revision/2.3/plot_content_utility.py --mode all
 
+Generate the manuscript figure with the recommended display configuration:
+
+    python3 revision/2.3/plot_content_utility.py --mode weighted \\
+        --output revision/2.3/figures/content_utility.png \\
+        --dpi 300 --no-sample-csv
+
 Use arbitrary datasets:
 
     python3 revision/2.3/plot_content_utility.py --mode ranked \\
@@ -173,6 +179,15 @@ def parse_args() -> argparse.Namespace:
         help="Do not export selected samples for ranked/weighted modes.",
     )
     output_group.add_argument("--dpi", type=int, default=240)
+    output_group.add_argument(
+        "--font-scale",
+        type=float,
+        default=1.8,
+        help=(
+            "Uniform multiplier for every figure font size while keeping "
+            "the canvas dimensions unchanged (default: 1.8)."
+        ),
+    )
 
     common_group = parser.add_argument_group("common analysis parameters")
     common_group.add_argument(
@@ -243,25 +258,25 @@ def parse_args() -> argparse.Namespace:
     weighted_group.add_argument(
         "--sample-size",
         type=int,
-        default=500,
+        default=800,
         help="Displayed flows per dataset; also used by the lower panels.",
     )
     weighted_group.add_argument(
         "--weight-floor",
         type=float,
-        default=0.02,
+        default=0.19,
         help="Baseline weight retained for discordant samples.",
     )
     weighted_group.add_argument(
         "--bandwidth",
         type=float,
-        default=0.09,
+        default=0.19,
         help="Rank-agreement bandwidth; smaller means stronger diagonal bias.",
     )
     weighted_group.add_argument(
         "--edge-strength",
         type=float,
-        default=1.75,
+        default=0.65,
         help="Additional preference for low-low and high-high extremes.",
     )
     weighted_group.add_argument(
@@ -308,6 +323,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--bootstrap-repetitions must be positive")
     if args.dpi <= 0:
         raise ValueError("--dpi must be positive")
+    if args.font_scale <= 0:
+        raise ValueError("--font-scale must be positive")
     if args.samples_per_quintile <= 0:
         raise ValueError("--samples-per-quintile must be positive")
     if args.sample_size < N_QUINTILES:
@@ -541,15 +558,16 @@ def output_path_for_mode(
     return output
 
 
-def configure_style() -> None:
+def configure_style(font_scale: float) -> None:
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
-            "font.size": 10,
-            "axes.titlesize": 12,
-            "axes.labelsize": 10.5,
-            "xtick.labelsize": 9,
-            "ytick.labelsize": 9,
+            "font.size": 10 * font_scale,
+            "axes.titlesize": 12 * font_scale,
+            "axes.labelsize": 10.5 * font_scale,
+            "xtick.labelsize": 9 * font_scale,
+            "ytick.labelsize": 9 * font_scale,
+            "legend.fontsize": 10 * font_scale,
             "axes.spines.top": False,
             "axes.spines.right": False,
             "pdf.fonttype": 42,
@@ -837,7 +855,7 @@ def draw_helpful_rate_curve(
         transform=axis.transAxes,
         ha="right",
         va="top",
-        fontsize=9.5,
+        fontsize=9.5 * args.font_scale,
         color="#333333",
     )
     return {
@@ -937,7 +955,7 @@ def draw_selected_sample_helpful_rate_curve(
         transform=axis.transAxes,
         ha="left",
         va="top",
-        fontsize=9.5,
+        fontsize=9.5 * args.font_scale,
         color="#333333",
     )
     return {
@@ -949,7 +967,19 @@ def draw_selected_sample_helpful_rate_curve(
     }
 
 
-def scatter_legend(epsilon: float, median_label: str) -> Sequence[Line2D]:
+def scatter_legend(
+    epsilon: float,
+    median_label: str,
+    compact: bool = False,
+) -> Sequence[Line2D]:
+    if compact:
+        helpful_label = "Helpful"
+        near_zero_label = "Near zero"
+        harmful_label = "Harmful"
+    else:
+        helpful_label = rf"Helpful: $u_i>{epsilon:g}$"
+        near_zero_label = rf"Near zero: $|u_i|\leq {epsilon:g}$"
+        harmful_label = rf"Harmful: $u_i<-{epsilon:g}$"
     return [
         Line2D(
             [0],
@@ -959,7 +989,7 @@ def scatter_legend(epsilon: float, median_label: str) -> Sequence[Line2D]:
             markerfacecolor=GROUP_COLOR["helpful"],
             markeredgecolor="white",
             markersize=7,
-            label=rf"Helpful: $u_i>{epsilon:g}$",
+            label=helpful_label,
         ),
         Line2D(
             [0],
@@ -969,7 +999,7 @@ def scatter_legend(epsilon: float, median_label: str) -> Sequence[Line2D]:
             markerfacecolor=GROUP_COLOR["near_zero"],
             markeredgecolor="white",
             markersize=7,
-            label=rf"Near zero: $|u_i|\leq {epsilon:g}$",
+            label=near_zero_label,
         ),
         Line2D(
             [0],
@@ -979,7 +1009,7 @@ def scatter_legend(epsilon: float, median_label: str) -> Sequence[Line2D]:
             markerfacecolor=GROUP_COLOR["harmful"],
             markeredgecolor="white",
             markersize=7,
-            label=rf"Harmful: $u_i<-{epsilon:g}$",
+            label=harmful_label,
         ),
         Line2D(
             [0],
@@ -1039,7 +1069,7 @@ def run_raw_mode(
     )
     figure.suptitle(
         "Statistical reliability and conditional content utility",
-        fontsize=14,
+        fontsize=14 * args.font_scale,
         y=1.075,
     )
     save_figure(
@@ -1249,7 +1279,7 @@ def draw_ranked_sample(
             f"{helpful_count}/{len(quintile_sample)}",
             ha="center",
             va="bottom",
-            fontsize=8.5,
+            fontsize=8.5 * args.font_scale,
             color=GROUP_COLOR["helpful"],
         )
 
@@ -1317,7 +1347,7 @@ def run_ranked_mode(
     )
     figure.suptitle(
         "Representative flows ranked by statistical reliability",
-        fontsize=14,
+        fontsize=14 * args.font_scale,
         y=1.08,
     )
     figure.text(
@@ -1329,7 +1359,7 @@ def run_ranked_mode(
         ),
         ha="center",
         va="top",
-        fontsize=9,
+        fontsize=9 * args.font_scale,
         color="#555555",
     )
     save_figure(
@@ -1476,7 +1506,7 @@ def run_weighted_mode(
             transform=axis.transAxes,
             ha="left",
             va="top",
-            fontsize=9.2,
+            fontsize=9.2 * args.font_scale,
             color="#333333",
             bbox={
                 "boxstyle": "round,pad=0.35",
@@ -1500,16 +1530,11 @@ def run_weighted_mode(
         handles=scatter_legend(
             args.epsilon,
             "Quintile median",
+            compact=True,
         ),
         loc="outside upper center",
         ncol=4,
         frameon=False,
-        bbox_to_anchor=(0.5, 1.035),
-    )
-    figure.suptitle(
-        "Content reliability and utility",
-        fontsize=14,
-        y=1.075,
     )
     save_figure(
         figure,
@@ -1558,7 +1583,7 @@ def main() -> None:
     dataset_paths = parse_dataset_specs(args)
     datasets = load_datasets(dataset_paths, args)
     bounds = compute_plot_bounds(datasets, args)
-    configure_style()
+    configure_style(args.font_scale)
 
     modes = ("raw", "ranked", "weighted") if args.mode == "all" else (
         args.mode,

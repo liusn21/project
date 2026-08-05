@@ -175,7 +175,7 @@ class MultiModalModel(nn.Module):
         if self.use_itgca and self.use_mlp_gate:
             raise ValueError("--use_itgca and --use_mlp_gate are mutually exclusive.")
 
-        if self.use_gated_fusion:
+        if self.use_itgca:
             self.vocab_size_raw = embedding_raw.token_embedding.num_embeddings
 
         if self.use_itgca:
@@ -276,10 +276,11 @@ class MultiModalModel(nn.Module):
 
     def _compute_fusion_gate_signals(self, raw_src, raw_cls, size_cls):
         """
-        Compute the statistical and encoder signals needed by the active gate.
+        Compute the encoder and optional statistical signals needed by the gate.
 
-        The lightweight MLP uses only the flow-level Raw reliability score. Full
-        ITGCA additionally computes local entropy unless that path is ablated.
+        The lightweight MLP uses only detached Raw/Size CLS features. Full ITGCA
+        additionally computes its flow-level and local entropy signals unless
+        those paths are ablated.
 
         Args:
             raw_src: [B, L_raw] - Raw token IDs
@@ -289,33 +290,28 @@ class MultiModalModel(nn.Module):
         Returns:
             gate_kwargs: dict of keyword arguments for fusion forward
         """
-        if self.use_mlp_gate:
-            r_stat_raw = compute_flow_reliability_raw(
-                raw_src, vocab_size=self.vocab_size_raw
-            )
-            local_ent_raw = None
-        else:
-            # Skip signals whose ITGCA consumers are ablated.
-            if self.ablate_r_stat:
-                r_stat_raw = None
-            else:
-                r_stat_raw = compute_flow_reliability_raw(
-                    raw_src, vocab_size=self.vocab_size_raw
-                )
-            if self.ablate_source_bias:
-                local_ent_raw = None
-            else:
-                local_ent_raw = compute_local_entropy(raw_src, self.itgca_window_size)
-
         raw_cls_enc = raw_cls.detach()
         size_cls_enc = size_cls.detach()
 
-        return {
+        gate_kwargs = {
             'raw_cls_enc': raw_cls_enc,
             'size_cls_enc': size_cls_enc,
-            'r_stat_raw': r_stat_raw,
-            'local_ent_raw': local_ent_raw,
         }
+
+        if self.use_itgca:
+            # Skip signals whose ITGCA consumers are ablated.
+            gate_kwargs['r_stat_raw'] = (
+                None if self.ablate_r_stat else compute_flow_reliability_raw(
+                    raw_src, vocab_size=self.vocab_size_raw
+                )
+            )
+            gate_kwargs['local_ent_raw'] = (
+                None if self.ablate_source_bias else compute_local_entropy(
+                    raw_src, self.itgca_window_size
+                )
+            )
+
+        return gate_kwargs
 
     def forward(self, raw_src, raw_packet_ids, raw_directions,
                 size_src_clean, iat_src_clean,
@@ -413,9 +409,12 @@ class MultiModalModel(nn.Module):
             gate_kwargs_neg1 = {
                 'raw_cls_enc': gate_kwargs['raw_cls_enc'],
                 'size_cls_enc': gate_kwargs['size_cls_enc'][neg_size_idx],
-                'r_stat_raw': gate_kwargs['r_stat_raw'],
-                'local_ent_raw': gate_kwargs['local_ent_raw'],
             }
+            if self.use_itgca:
+                gate_kwargs_neg1.update({
+                    'r_stat_raw': gate_kwargs['r_stat_raw'],
+                    'local_ent_raw': gate_kwargs['local_ent_raw'],
+                })
         else:
             gate_kwargs_neg1 = {}
 
@@ -431,19 +430,22 @@ class MultiModalModel(nn.Module):
         neg_raw_seg_2 = raw_seg[neg_raw_idx]
 
         if self.use_gated_fusion:
-            # r_stat_raw / local_ent_raw may be None when their components are ablated
-            r_stat_neg2 = gate_kwargs['r_stat_raw']
-            if r_stat_neg2 is not None:
-                r_stat_neg2 = r_stat_neg2[neg_raw_idx]
-            local_ent_neg2 = gate_kwargs['local_ent_raw']
-            if local_ent_neg2 is not None:
-                local_ent_neg2 = local_ent_neg2[neg_raw_idx]
             gate_kwargs_neg2 = {
                 'raw_cls_enc': gate_kwargs['raw_cls_enc'][neg_raw_idx],
                 'size_cls_enc': gate_kwargs['size_cls_enc'],
-                'r_stat_raw': r_stat_neg2,
-                'local_ent_raw': local_ent_neg2,
             }
+            if self.use_itgca:
+                # These signals may be None when their components are ablated.
+                r_stat_neg2 = gate_kwargs['r_stat_raw']
+                if r_stat_neg2 is not None:
+                    r_stat_neg2 = r_stat_neg2[neg_raw_idx]
+                local_ent_neg2 = gate_kwargs['local_ent_raw']
+                if local_ent_neg2 is not None:
+                    local_ent_neg2 = local_ent_neg2[neg_raw_idx]
+                gate_kwargs_neg2.update({
+                    'r_stat_raw': r_stat_neg2,
+                    'local_ent_raw': local_ent_neg2,
+                })
         else:
             gate_kwargs_neg2 = {}
 

@@ -169,7 +169,7 @@ class LightweightMLPGate(nn.Module):
     def __init__(self, hidden_size, bottleneck_size=64, gate_bias_init=2.0):
         super(LightweightMLPGate, self).__init__()
         bottleneck_size = min(bottleneck_size, hidden_size)
-        self.input_projection = nn.Linear(2 * hidden_size + 1, bottleneck_size)
+        self.input_projection = nn.Linear(2 * hidden_size, bottleneck_size)
         self.output_projection = nn.Linear(bottleneck_size, 2)
 
         # Start close to standard cross-attention while allowing the MLP to
@@ -177,20 +177,13 @@ class LightweightMLPGate(nn.Module):
         nn.init.zeros_(self.output_projection.weight)
         nn.init.constant_(self.output_projection.bias, float(gate_bias_init))
 
-    def forward(self, raw_cls_enc, size_cls_enc, r_stat_raw):
-        if raw_cls_enc is None or size_cls_enc is None or r_stat_raw is None:
+    def forward(self, raw_cls_enc, size_cls_enc):
+        if raw_cls_enc is None or size_cls_enc is None:
             raise ValueError(
-                "Lightweight MLP gating requires Raw/Size encoder CLS features "
-                "and the Raw entropy reliability score."
+                "Lightweight MLP gating requires Raw/Size encoder CLS features."
             )
 
-        # Gate supervision should train the small MLP, not add a second gradient
-        # path into the unimodal encoders.
-        raw_cls = raw_cls_enc.detach()
-        size_cls = size_cls_enc.detach()
-        r_stat = r_stat_raw.detach().to(dtype=raw_cls.dtype).unsqueeze(-1)
-
-        features = torch.cat([raw_cls, size_cls, r_stat], dim=-1)
+        features = torch.cat([raw_cls_enc, size_cls_enc], dim=-1)
         hidden = F.gelu(self.input_projection(features))
         gates = torch.sigmoid(self.output_projection(hidden))
 
@@ -331,8 +324,8 @@ class BidirectionalFusionLayer(nn.Module):
             size_mask: [batch, 1, seq_len_size, seq_len_size]
             cross_mask_r2s: [batch, 1, seq_len_raw, seq_len_size]
             cross_mask_s2r: [batch, 1, seq_len_size, seq_len_raw]
-            raw_cls_enc: [batch, hidden] - Raw encoder CLS (detached), for ITGCA
-            size_cls_enc: [batch, hidden] - Size encoder CLS (detached), for ITGCA
+            raw_cls_enc: [batch, hidden] - Raw encoder CLS, for ITGCA or MLP gating
+            size_cls_enc: [batch, hidden] - Size encoder CLS, for ITGCA or MLP gating
             r_stat_raw: [batch] - Raw flow-level reliability, for ITGCA (Size←Raw direction only)
             local_ent_raw: [batch, seq_len_raw] - Raw local entropy, for source-side V gating
             mlp_gate_raw: [batch, seq_len_raw, 1] - Shared MLP gate for Raw<-Size
@@ -540,7 +533,7 @@ class MultiModalFusionEncoder(nn.Module):
         # fusion layer. expand() creates views, not full per-token copies.
         if self.use_mlp_gate:
             mlp_gate_raw, mlp_gate_size = self.mlp_gate(
-                raw_cls_enc, size_cls_enc, r_stat_raw
+                raw_cls_enc, size_cls_enc
             )
             mlp_gate_raw = mlp_gate_raw.expand(-1, seq_len_raw, -1)
             mlp_gate_size = mlp_gate_size.expand(-1, seq_len_size, -1)

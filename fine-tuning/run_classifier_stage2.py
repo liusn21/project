@@ -198,12 +198,8 @@ class Stage2Classifier(nn.Module):
             }
         elif self.use_mlp_gate:
             gate_kwargs = {
-                'raw_cls_enc': raw_output[:, 0, :].detach(),
-                'size_cls_enc': size_output[:, 0, :].detach(),
-                'r_stat_raw': compute_flow_reliability_raw(
-                    raw_src, vocab_size=self.vocab_size_raw
-                ),
-                'local_ent_raw': None,
+                'raw_cls_enc': raw_output[:, 0, :],
+                'size_cls_enc': size_output[:, 0, :],
             }
         else:
             gate_kwargs = {}

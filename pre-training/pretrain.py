@@ -120,7 +120,7 @@ def main():
     parser.add_argument("--use_mlp_gate", action="store_true",
                         help="Replace ITGCA with one lightweight flow-level MLP gate shared "
                              "by all fusion layers. Inputs are detached Raw/Size encoder CLS "
-                             "features and Raw entropy reliability; outputs gate both directions.")
+                             "features; outputs gate both directions without entropy inputs.")
     parser.add_argument("--itgca_window_size", type=int, default=16,
                         help="Sliding window size for local entropy computation in ITGCA token gate. "
                              "Recommended range: 16-32 for byte-level token sequences.")

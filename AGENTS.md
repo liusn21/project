@@ -9,6 +9,9 @@ collaboration constraints. Do not use this file as a per-chat log.
 - The project is not run on this local machine. Do not start training, testing,
   inference, preprocessing, data generation, or LaTeX builds locally unless the
   user explicitly asks for it.
+- Authorization to edit or migrate manuscript sources does not authorize a
+  LaTeX build. Before running any LaTeX compiler or build command, describe the
+  current source state and ask the user for explicit permission at that time.
 - Static inspection commands such as listing files and reading source are fine.
 - Do not modify any project file unless the user explicitly authorizes an edit.
   Requests to read, inspect, discuss, review, propose, or plan changes do not
@@ -84,11 +87,19 @@ uninformative while behavior signals remain useful.
   - `vocab_raw.txt`: byte vocabulary.
   - `vocab_size.txt`: packet-size vocabulary.
   - `vocab_temporal.txt`: IAT vocabulary.
-- `latex/ACM_conference/`: current paper source.
+- `latex/ACM_conference/`: preserved ACM/CCS version of the paper.
   - `main.tex`: ACM/CCS-style root file.
   - `sections/*.tex`: main manuscript sections.
   - `references.bib`: bibliography.
   - `figures/`: manuscript figures and plotting helpers.
+- `latex/NDSS/`: active NDSS 2027 anonymous-submission source, venue
+  instructions, and official template files. It is maintained independently of
+  the frozen ACM source tree.
+  - `main.tex`: NDSS/IEEEtran root file.
+  - `sections/*.tex`: independent NDSS manuscript sections, including a
+    separate `08_ethics.tex` placed before the references.
+  - `references.bib`: independent bibliography copy.
+  - `figures/`: independent figure and plotting-source copy.
 - `followup_final.md`: merged design document for a follow-up robustness paper.
 - `papers/`: related PDFs, research notes, and extracted presentation materials.
 - `test/`: experiment notes, figures, result summaries, and older planning docs.
@@ -175,9 +186,10 @@ Stage 1 trains unimodal encoders independently:
   - Implemented by `PacketSizeDataset`, `PacketSizeDataLoader`,
     `PacketSizeModel`, `DualMlmTarget`, and `PacketSizeMlmTrainer`.
 
-The paper justifies the 6-layer behavior encoder because behavior tokens encode
-lower-order size/timing statistics; the appendix reports that 12 behavior layers
-do not improve average F1 and cost many more parameters.
+The implementation uses a 6-layer behavior encoder. The former manuscript
+justification and appendix ablation comparing 6 and 12 behavior layers have
+been removed; retain the factual 6-layer configuration without referring to a
+behavior-depth appendix.
 
 ## Stage 2 Multimodal Pre-Training
 
@@ -325,7 +337,9 @@ Stage 1 classifier:
 
 ## Manuscript Context
 
-The current main paper source is under `latex/ACM_conference/`.
+The active NDSS submission source is under `latex/NDSS/`. The previous
+ACM/CCS-formatted source remains preserved under `latex/ACM_conference/` and
+should not be edited as part of NDSS work.
 
 Core manuscript structure:
 
@@ -339,7 +353,7 @@ Core manuscript structure:
 - `sections/06_related_work.tex`: related work.
 - `sections/07_conclusion.tex`: conclusion.
 - `sections/08_appendix.tex`: ethics, open science, datasets, baselines,
-  leakage audit, sensitivity, shaping robustness, seed variability.
+  leakage audit, sensitivity, and seed variability.
 
 Current paper claims:
 
@@ -357,12 +371,51 @@ Current paper claims:
   per-task baseline on average, with larger gains under label scarcity.
 - The ablation narrative is that Stage 1, CMC/ITC, CMM/ITM, masked
   reconstruction, both modalities, deep fusion, and ITGCA all contribute.
-- The discussion admits two major limitations:
-  inference cost and vulnerability to active behavior shaping.
+- The discussion addresses inference cost and future broader and deeper
+  multimodal fusion. The former active behavior-shaping limitation and its
+  appendix experiment have been removed from the current manuscript.
 
 When editing the paper, prefer aligning prose with the current code. In
 particular, use the current ITGCA formula and implementation behavior, not older
 draft notes.
+
+## NDSS 2027 Migration
+
+The paper is intended for the NDSS 2027 Fall Cycle as an anonymous initial
+submission. The user has confirmed that it is not under concurrent review and
+was not rejected from the NDSS 2027 Summer Cycle.
+
+Migration decisions:
+
+- Preserve `latex/ACM_conference/` as the existing ACM version. The independent
+  NDSS manuscript is under `latex/NDSS/`; do not make the two venue versions
+  share mutable section sources.
+- The official NDSS 2027 starter, reference PDF, and required IEEEtran class are
+  already stored under `latex/NDSS/`.
+- Perform the first pass as a format-only migration. Keep scientific prose and
+  claims unchanged except for venue-required structural changes; handle
+  scientific consistency edits and NDSS-oriented positioning in a separate
+  pass so that the diffs remain reviewable.
+- The initial format-only source migration has been created and statically
+  checked. It uses the official IEEEtran class, an anonymous author block, the
+  official NDSS publication block, IEEE references, and independent copies of
+  all sections, figures, and bibliography data. It has not yet been compiled.
+- In the NDSS source, Ethics Considerations is a separate section immediately
+  before the references. The former dedicated `algorithm` float is represented
+  inside a `figure` float because the official template explicitly disallows
+  dedicated algorithm float types. The ACM-only `\Description` command is
+  retained through a local no-op compatibility definition.
+- Retain the existing anonymous Open Science repository link in the NDSS
+  submission.
+- Prepare an anonymous submission with a 13-page main-body limit, excluding the
+  Ethical Considerations section, references, and appendices. Place Ethical
+  Considerations immediately before the references.
+- The downloaded starter contains camera-ready-style author and publication
+  metadata. Reconcile those fields with the current Fall Cycle initial-
+  submission instructions rather than copying the sample author block or DOI
+  metadata blindly.
+- Do not compile the migrated LaTeX until the user has reviewed the source state
+  and explicitly approved a build.
 
 ## Follow-Up Research Direction
 
@@ -393,11 +446,11 @@ Core follow-up idea:
   differentiable proxies for non-differentiable traffic actions, channel balance
   regularization, and partial certification.
 
-This follow-up direction connects naturally to the current paper's limitation on
-behavior shaping. Current MM-TrafficBERT is strong on clean classification and
-label efficiency, but all methods degrade under active size/IAT shaping. Future
-work can target behavior-side reliability, shaping-aware pre-training, robust
-fusion, and protocol-realizable adversarial training.
+This follow-up direction remains motivated by robustness to behavior shaping,
+but the current MM-TrafficBERT manuscript no longer presents active shaping as a
+discussion limitation or reports the former shaping appendix experiment. The
+independent follow-up can target behavior-side reliability, shaping-aware pre-
+training, robust fusion, and protocol-realizable adversarial training.
 
 ## Common Gotchas
 
@@ -415,7 +468,8 @@ fusion, and protocol-realizable adversarial training.
 - `followup_final.md` and `papers/followup_*.md` are research notes. They are not
   necessarily part of the current MM-TrafficBERT paper.
 - `test/` contains useful experimental notes and figures but may include stale
-  design drafts. Prefer current source code and `latex/ACM_conference/sections`
-  when resolving conflicts.
+  design drafts. Prefer current source code and `latex/NDSS/sections` when
+  resolving conflicts; use `latex/ACM_conference/` only as the preserved venue
+  baseline.
 - Large data/checkpoints are not stored directly in this repo. README references
   a Zenodo release for `pretrain.bin` and processed dataset splits.

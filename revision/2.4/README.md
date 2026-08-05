@@ -157,15 +157,72 @@ Do not choose a threshold after inspecting which one produces the strongest
 result; use `0.01` as the prespecified main analysis and the other two only as
 sensitivity checks.
 
+## 4. Incremental no-r_learned ablation
+
+When the preceding results already exist, do not rerun Sections 1-3.  Use
+`compression_r_learned_ablation.py` to run only the independently trained and
+fine-tuned `--ablate_r_learned` classifier on the same positive-exposure flows.
+Rows with \(e_i=0\) are skipped.
+
+The checkpoint passed here must be a fine-tuned classifier checkpoint, not a
+Stage 2 pre-training checkpoint.  Fine-tune the ablated pre-training checkpoint
+with the same split, label mapping, seed, optimizer settings, epochs, and model
+selection rule used by the full model, adding:
+
+```bash
+--use_itgca --ablate_r_learned
+```
+
+The two pre-training checkpoints must also be matched by training progress.  A
+120,000-step full checkpoint must not be compared with a 100,000-step ablation;
+compare both at 100,000 steps or continue the ablation to 120,000 steps.
+
+Run the incremental inference once for Browser and once for ITC-Net-Blend:
+
+```bash
+CUDA_VISIBLE_DEVICES=<GPU> python3 revision/2.4/compression_r_learned_ablation.py \
+  /path/to/existing/flow_results.csv \
+  --dataset-dir /path/to/DATASET \
+  --dataset-name DATASET \
+  --no-r-learned-checkpoint /path/to/fine_tuned_no_r_learned.bin \
+  --label2id-path /path/to/label2id.pkl \
+  --raw-config models/bert/base_config.json \
+  --behavior-config models/bert/base_behavior_config.json \
+  --batch-size 64 \
+  --device cuda:0 \
+  --output-dir /path/to/DATASET_r_learned_ablation
+```
+
+This command does not regenerate the compression audit, concat/behavior/full
+ITGCA predictions, utility statistics, gate statistics, or the previous formal
+summary.  It only recreates input tensors for the selected PCAPs because the
+existing CSV does not store model tensors.
+
+It writes:
+
+- `r_learned_ablation_flows.csv`: reused full predictions paired with the new
+  no-r_learned predictions;
+- `r_learned_ablation_summary.csv`: exactly three rows containing
+  `delta_macro_f1_pp_full_minus_no_r_learned` and a label-stratified bootstrap
+  95% interval;
+- `r_learned_ablation_provenance.json`: checkpoint and source provenance.
+
+The delta column is already expressed in percentage points and can fill the
+pending final column in `data/main_text_table.csv`.
+
 ## Files to share for result interpretation
 
-To inspect results or prepare the final table/figure, the following small files
-are sufficient:
+To inspect the original results or prepare the existing table/figure, the
+following small files are sufficient:
 
 - `flow_results.csv`;
 - `gate_layers.csv`;
 - `calibration.json`;
 - optionally `utility_summary.csv` and `trend_statistics.csv`.
+
+For the incremental ablation, only the two
+`r_learned_ablation_summary.csv` files and their provenance JSON files are
+needed.
 
 Checkpoints and PCAPs are not needed for downstream statistical analysis once
 these files have been produced.

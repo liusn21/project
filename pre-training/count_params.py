@@ -52,9 +52,9 @@ def fusion_layer_gates(H):
 
 
 def lightweight_mlp_gate(H, bottleneck=64):
-    """One stack-shared MLP: Linear(2H+1,B) + Linear(B,2)."""
+    """One stack-shared MLP: Linear(2H,B) + Linear(B,2)."""
     B = min(bottleneck, H)
-    return B * (2 * H + 4) + 2
+    return B * (2 * H + 3) + 2
 
 
 def target_heads(H):

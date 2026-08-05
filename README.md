@@ -236,12 +236,13 @@ Stage 2 exposes three mutually exclusive fusion modes:
 |------|------|---------------|
 | Standard cross-attention | neither flag | Cross-modal outputs are not gated |
 | Full ITGCA | `--use_itgca` | Flow-, token-, and source-level reliability gating |
-| Lightweight MLP | `--use_mlp_gate` | One stack-shared flow gate using detached Raw/Size CLS and Raw entropy reliability |
+| Lightweight MLP | `--use_mlp_gate` | One stack-shared flow gate using only Raw/Size CLS features |
 
-The lightweight MLP has a 64-dimensional hidden layer and outputs one scalar
+The lightweight MLP has a 64-dimensional hidden layer, takes the concatenated
+Raw/Size encoder CLS features without any entropy input, and outputs one scalar
 for each cross-attention direction. The two scalars are shared across all token
 positions and fusion layers and are applied after the attention output
-projection. For the base configuration it adds about 0.099M parameters, versus
+projection. For the base configuration it adds about 0.098M parameters, versus
 about 10.62M gate parameters for six-layer ITGCA. To run this replacement
 experiment, replace `--use_itgca` with `--use_mlp_gate` in pre-training,
 fine-tuning, and inference commands.
