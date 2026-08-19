@@ -1,8 +1,10 @@
 """
-Stage 1 Multi-Modal Classifier
+Stage 1 Encoder Classifier
 
-Uses two separate pretrained encoders (Raw + Size) without fusion.
-Classification is done by concatenating CLS tokens from both modalities.
+Uses separately pretrained Stage 1 encoders for downstream classification.
+Besides the single-modality and CLS-concatenation baselines, ``fusion`` mode
+randomly initializes an ITGCA fusion stack and learns it only from downstream
+supervision; no Stage 2 checkpoint is loaded.
 
 Usage:
     python fine-tuning/run_classifier_stage1.py \
@@ -19,7 +21,8 @@ Usage:
         --config_path models/bert/base_config.json \
         --config_path_raw models/bert/base_config.json \
         --config_path_size models/bert/behavior_6_config.json \
-        --modality both \
+        --modality fusion \
+        --num_fusion_layers 4 \
         --epochs_num 10 \
         --batch_size 32
 """
@@ -39,6 +42,7 @@ import numpy as np
 from sklearn.metrics import f1_score, precision_score, recall_score
 
 from uer.layers import RawPacketEmbedding, PacketSizeEmbedding
+from uer.layers.multimodal_fusion import MultiModalFusionEncoder
 from uer.encoders import str2encoder
 from uer.utils.vocab import Vocab
 from uer.utils.config import load_hyperparam, apply_modality_configs
@@ -47,6 +51,9 @@ from uer.model_saver import save_model
 from uer.utils.constants import PAD_ID
 from uer.utils import *
 from uer.opts import finetune_opts
+from uer.models.multimodal_model import (
+    compute_flow_reliability_raw, compute_local_entropy
+)
 
 
 class Stage1Classifier(nn.Module):
@@ -58,10 +65,12 @@ class Stage1Classifier(nn.Module):
         - Size encoder (pretrained): embedding + transformer
         - Modality combination -> Classification head
 
-    Supports three modality modes:
+    Supports four modality modes:
         - 'raw': Only use Raw modality
         - 'size': Only use Size modality
         - 'both': Concatenate Raw and Size (default)
+        - 'fusion': Initialize ITGCA from scratch and learn fusion during
+                    downstream fine-tuning only
     """
 
     def __init__(self, args, vocab_size_raw, vocab_size_size, vocab_size_temporal, labels_num):
@@ -69,7 +78,9 @@ class Stage1Classifier(nn.Module):
 
         self.hidden_size = args.hidden_size
         self.labels_num = labels_num
-        self.modality = getattr(args, 'modality', 'both')  # raw, size, both
+        self.modality = getattr(args, 'modality', 'both')
+        self.vocab_size_raw = vocab_size_raw
+        self.itgca_window_size = getattr(args, 'itgca_window_size', 16)
 
         # Per-modality encoder depth. apply_modality_configs() populates these
         # fields from --config_path_raw / --config_path_size. Callers that do
@@ -79,21 +90,33 @@ class Stage1Classifier(nn.Module):
         layers_num_size = getattr(args, 'layers_num_size', base_layers) or base_layers
 
         # Raw modality encoder
-        if self.modality in ['raw', 'both']:
+        if self.modality in ['raw', 'both', 'fusion']:
             self.embedding_raw = RawPacketEmbedding(args, vocab_size_raw)
             raw_args = copy.copy(args)
             raw_args.layers_num = layers_num_raw
             self.encoder_raw = str2encoder[args.encoder](raw_args)
 
         # Size modality encoder (with temporal/IAT support)
-        if self.modality in ['size', 'both']:
+        if self.modality in ['size', 'both', 'fusion']:
             self.embedding_size = PacketSizeEmbedding(args, vocab_size_size, vocab_size_temporal)
             size_args = copy.copy(args)
             size_args.layers_num = layers_num_size
             self.encoder_size = str2encoder[args.encoder](size_args)
 
+        # Fine-tuning-only fusion baseline. The two encoders are initialized
+        # from Stage 1 checkpoints below, whereas every fusion parameter is
+        # intentionally left at its random initialization.
+        if self.modality == 'fusion':
+            self.fusion = MultiModalFusionEncoder(
+                args,
+                num_layers=getattr(args, 'num_fusion_layers', 4),
+                use_itgca=True,
+            )
+
         # Classification head
-        if self.modality == 'both':
+        if self.modality == 'fusion':
+            classifier_input_size = 4 * args.hidden_size
+        elif self.modality == 'both':
             classifier_input_size = 2 * args.hidden_size
         else:
             classifier_input_size = args.hidden_size
@@ -118,29 +141,63 @@ class Stage1Classifier(nn.Module):
         Returns:
             loss, logits if tgt is provided, else None, logits
         """
-        features = []
+        raw_output = size_output = None
+        raw_seg = size_seg = None
 
         # Raw encoder
-        if self.modality in ['raw', 'both']:
+        if self.modality in ['raw', 'both', 'fusion']:
             raw_emb = self.embedding_raw(raw_src, packet_ids, directions)
             raw_seg = (raw_src != PAD_ID).long()
             raw_output = self.encoder_raw(raw_emb, raw_seg)  # [batch, seq_len, hidden]
-            raw_cls = raw_output[:, 0, :]  # [batch, hidden]
-            features.append(raw_cls)
 
         # Size encoder (with IAT temporal information)
-        if self.modality in ['size', 'both']:
+        if self.modality in ['size', 'both', 'fusion']:
             size_emb = self.embedding_size(size_src, iat_src)
             size_seg = (size_src != PAD_ID).long()
             size_output = self.encoder_size(size_emb, size_seg)  # [batch, seq_len, hidden]
-            size_cls = size_output[:, 0, :]  # [batch, hidden]
-            features.append(size_cls)
 
-        # Combine features
-        if len(features) == 2:
-            combined = torch.cat(features, dim=-1)  # [batch, 2*hidden]
+        if self.modality == 'fusion':
+            # Match the complete model's ITGCA inputs and downstream feature
+            # aggregation, while learning all fusion parameters from labels.
+            r_stat_raw = compute_flow_reliability_raw(
+                raw_src, vocab_size=self.vocab_size_raw
+            )
+            local_ent_raw = compute_local_entropy(
+                raw_src, self.itgca_window_size
+            )
+            raw_fused, size_fused, _ = self.fusion(
+                raw_output,
+                size_output,
+                raw_seg,
+                size_seg,
+                raw_cls_enc=raw_output[:, 0, :],
+                size_cls_enc=size_output[:, 0, :],
+                r_stat_raw=r_stat_raw,
+                local_ent_raw=local_ent_raw,
+            )
+
+            raw_mask = raw_seg[:, 1:].unsqueeze(-1).float()
+            raw_pool = (
+                (raw_fused[:, 1:, :] * raw_mask).sum(1)
+                / raw_mask.sum(1).clamp(min=1.0)
+            )
+            size_mask = size_seg[:, 1:].unsqueeze(-1).float()
+            size_pool = (
+                (size_fused[:, 1:, :] * size_mask).sum(1)
+                / size_mask.sum(1).clamp(min=1.0)
+            )
+            combined = torch.cat(
+                [raw_fused[:, 0, :], size_fused[:, 0, :], raw_pool, size_pool],
+                dim=-1,
+            )
+        elif self.modality == 'both':
+            combined = torch.cat(
+                [raw_output[:, 0, :], size_output[:, 0, :]], dim=-1
+            )
+        elif self.modality == 'raw':
+            combined = raw_output[:, 0, :]
         else:
-            combined = features[0]  # [batch, hidden]
+            combined = size_output[:, 0, :]
 
         # Classification
         logits = self.classifier(combined)  # [batch, labels_num]
@@ -152,7 +209,7 @@ class Stage1Classifier(nn.Module):
             return None, logits
 
 
-def load_pretrained_encoder(model, pretrained_path, encoder_type='raw'):
+def load_pretrained_encoder(model, pretrained_path, encoder_type='raw', require_complete=False):
     """
     Load pretrained encoder weights
 
@@ -160,6 +217,9 @@ def load_pretrained_encoder(model, pretrained_path, encoder_type='raw'):
         model: Stage1Classifier model
         pretrained_path: Path to pretrained checkpoint
         encoder_type: 'raw' or 'size'
+        require_complete: Raise if any embedding/encoder parameter is not
+            loaded. Used by the fine-tuning-only fusion experiment to ensure
+            that only the fusion stack and classifier are randomly initialized.
     """
     if pretrained_path is None:
         return
@@ -174,6 +234,13 @@ def load_pretrained_encoder(model, pretrained_path, encoder_type='raw'):
                        for k, v in state_dict.items() if k.startswith(prefix_emb)}
     encoder_state = {k[len(prefix_enc):]: v
                      for k, v in state_dict.items() if k.startswith(prefix_enc)}
+
+    if require_complete and (not embedding_state or not encoder_state):
+        raise ValueError(
+            f"{encoder_type} checkpoint does not contain the expected "
+            "'embedding.*' and 'encoder.*' Stage 1 parameters: "
+            f"{pretrained_path}"
+        )
 
     if encoder_type == 'raw':
         emb_result = model.embedding_raw.load_state_dict(embedding_state, strict=False)
@@ -212,6 +279,13 @@ def load_pretrained_encoder(model, pretrained_path, encoder_type='raw'):
             print(f"    Missing encoder keys ({len(enc_result.missing_keys)}): {enc_result.missing_keys[:5]}...")
         if enc_result.unexpected_keys:
             print(f"    Unexpected encoder keys ({len(enc_result.unexpected_keys)}): {enc_result.unexpected_keys[:5]}...")
+
+        if require_complete:
+            raise ValueError(
+                f"Incomplete {encoder_type} Stage 1 checkpoint load. "
+                "The fusion-only fine-tuning experiment requires both "
+                "encoders to be initialized completely."
+            )
 
 
 def load_dataset(path):
@@ -391,8 +465,26 @@ def main():
     parser.add_argument("--earlystop", type=int, default=5)
 
     # Model options
-    parser.add_argument("--modality", choices=["raw", "size", "both"], default="both",
-                        help="Modality mode: 'raw' (only Raw), 'size' (only Size), 'both' (concat both)")
+    parser.add_argument(
+        "--modality",
+        choices=["raw", "size", "both", "fusion"],
+        default="both",
+        help=("Modality mode: 'raw' (only Raw), 'size' (only Size), "
+              "'both' (concatenate encoder CLS tokens), or 'fusion' "
+              "(learn randomly initialized ITGCA during fine-tuning only)."),
+    )
+    parser.add_argument(
+        "--num_fusion_layers",
+        type=int,
+        default=4,
+        help="Number of randomly initialized ITGCA layers in --modality fusion.",
+    )
+    parser.add_argument(
+        "--itgca_window_size",
+        type=int,
+        default=16,
+        help="Local entropy window size in --modality fusion.",
+    )
 
     # Sequence lengths
     parser.add_argument("--seq_length_raw", type=int, default=512)
@@ -405,6 +497,20 @@ def main():
                         help="List of GPU ranks to use. E.g., --gpu_ranks 2 3 to use GPU 2 and 3.")
 
     args = parser.parse_args()
+
+    if args.modality == 'fusion':
+        if not args.pretrained_raw_path or not args.pretrained_size_path:
+            parser.error(
+                "--modality fusion requires both --pretrained_raw_path and "
+                "--pretrained_size_path."
+            )
+        if args.pretrained_model_path:
+            parser.error(
+                "--modality fusion must not use --pretrained_model_path; "
+                "only the two Stage 1 encoder checkpoints are allowed."
+            )
+        if args.num_fusion_layers < 1:
+            parser.error("--num_fusion_layers must be at least 1.")
 
     # Load hyperparameters from config
     if args.config_path:
@@ -445,17 +551,32 @@ def main():
     # Build model
     print("Building model...")
     print(f"  Modality mode: {args.modality}")
-    if args.modality in ['raw', 'both']:
+    if args.modality in ['raw', 'both', 'fusion']:
         print(f"  Raw encoder layers: {args.layers_num_raw}")
-    if args.modality in ['size', 'both']:
+    if args.modality in ['size', 'both', 'fusion']:
         print(f"  Size encoder layers: {args.layers_num_size}")
+    if args.modality == 'fusion':
+        print(f"  ITGCA fusion layers: {args.num_fusion_layers} (random initialization)")
+        print("  Stage 2 checkpoint: not used")
     model = Stage1Classifier(args, len(vocab_raw), len(vocab_size), len(vocab_temporal), args.labels_num)
 
     # Load pretrained encoders based on modality
-    if args.modality in ['raw', 'both']:
-        load_pretrained_encoder(model, args.pretrained_raw_path, 'raw')
-    if args.modality in ['size', 'both']:
-        load_pretrained_encoder(model, args.pretrained_size_path, 'size')
+    if args.modality in ['raw', 'both', 'fusion']:
+        load_pretrained_encoder(
+            model,
+            args.pretrained_raw_path,
+            'raw',
+            require_complete=(args.modality == 'fusion'),
+        )
+    if args.modality in ['size', 'both', 'fusion']:
+        load_pretrained_encoder(
+            model,
+            args.pretrained_size_path,
+            'size',
+            require_complete=(args.modality == 'fusion'),
+        )
+    if args.modality == 'fusion':
+        print("  Fusion/classifier remain randomly initialized and will be learned downstream.")
 
     # Setup GPU device(s)
     ranks_num = len(args.gpu_ranks)

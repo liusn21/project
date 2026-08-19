@@ -17,7 +17,8 @@ Usage:
         --config_path models/bert/base_config.json \
         --config_path_raw models/bert/base_config.json \
         --config_path_size models/bert/behavior_6_config.json \
-        --modality both
+        --modality fusion \
+        --num_fusion_layers 4
 
     # Stage 2 inference
     python fine-tuning/run_inference.py --stage 2 \
@@ -87,7 +88,8 @@ def build_args():
 
     # ---- Stage selection ----
     parser.add_argument("--stage", type=int, choices=[1, 2], default=2,
-                        help="Classifier stage: 1 (no fusion) or 2 (with fusion)")
+                        help="Classifier stage: 1 (Stage 1 encoders, optionally with "
+                             "fine-tuning-only fusion) or 2 (Stage 2 fusion)")
 
     # ---- Path options ----
     parser.add_argument("--load_model_path", type=str, required=True,
@@ -114,19 +116,29 @@ def build_args():
     model_opts(parser)
 
     # Stage 1 options
-    parser.add_argument("--modality", choices=["raw", "size", "both"], default="both",
-                        help="[Stage 1] Modality mode (must match training)")
+    parser.add_argument(
+        "--modality",
+        choices=["raw", "size", "both", "fusion"],
+        default="both",
+        help=("[Stage 1] Modality mode: raw, size, encoder CLS concatenation "
+              "(both), or fine-tuning-only ITGCA (fusion); must match training"),
+    )
 
-    # Stage 2 options
-    parser.add_argument("--num_fusion_layers", type=int, default=6,
-                        help="[Stage 2] Number of fusion layers (must match training)")
+    # Fusion options
+    parser.add_argument(
+        "--num_fusion_layers",
+        type=int,
+        default=None,
+        help=("Number of fusion layers; defaults to 4 for Stage 1 fusion and "
+              "6 for Stage 2, and must match training"),
+    )
     parser.add_argument("--use_itgca", action="store_true",
                         help="[Stage 2] Enable ITGCA (must match training config)")
     parser.add_argument("--use_mlp_gate", action="store_true",
                         help="[Stage 2] Enable the shared lightweight MLP gate "
                              "(must match training config)")
     parser.add_argument("--itgca_window_size", type=int, default=16,
-                        help="[Stage 2] ITGCA sliding window size")
+                        help="ITGCA sliding window size (Stage 1 fusion / Stage 2)")
     parser.add_argument(
         "--old",
         action="store_true",
@@ -187,6 +199,11 @@ def build_args():
         args = load_hyperparam(args)
     args = apply_modality_configs(args)
     args.old, args.use_attn_pooling, args.use_scl = legacy_cli_options
+
+    if args.num_fusion_layers is None:
+        args.num_fusion_layers = (
+            4 if args.stage == 1 and args.modality == "fusion" else 6
+        )
 
     if args.old and args.stage != 2:
         parser.error("--old is only valid with --stage 2")
@@ -421,6 +438,8 @@ def main():
     print("Building model...")
     if args.stage == 1:
         print(f"  Modality: {args.modality}")
+        if args.modality == "fusion":
+            print(f"  Fine-tuning-only ITGCA layers: {args.num_fusion_layers}")
         model = Stage1Classifier(
             args, len(vocab_raw), len(vocab_size), len(vocab_temporal), args.labels_num
         )
@@ -493,8 +512,12 @@ def main():
             print(f"    - {k}")
         if any('gate_raw' in k or 'gate_size' in k or 'local_stat_' in k
                for k in unsafe_unexpected):
-            print(f"\n  HINT: Checkpoint contains ITGCA gate weights. "
-                  f"Add --use_itgca to match.")
+            if args.stage == 1:
+                print(f"\n  HINT: Checkpoint contains Stage 1 fusion weights. "
+                      f"Use --modality fusion and match --num_fusion_layers.")
+            else:
+                print(f"\n  HINT: Checkpoint contains ITGCA gate weights. "
+                      f"Add --use_itgca to match.")
         if any('mlp_gate' in k for k in unsafe_unexpected):
             print(f"\n  HINT: Checkpoint contains lightweight MLP gate weights. "
                   f"Add --use_mlp_gate to match.")
@@ -507,11 +530,15 @@ def main():
             print(f"    - {k}")
         if any('gate_raw' in k or 'gate_size' in k or 'local_stat_' in k
                for k in missing):
-            print(f"\n  HINT: Model defines ITGCA parameters not in checkpoint.")
-            print(f"        If checkpoint was trained WITHOUT ITGCA → remove --use_itgca.")
-            print(f"        If checkpoint was trained WITH ablation → add matching "
-                  f"--ablate_r_stat / --ablate_r_learned / --ablate_g_token / "
-                  f"--ablate_source_bias.")
+            if args.stage == 1:
+                print(f"\n  HINT: Stage 1 fusion geometry does not match the checkpoint. "
+                      f"Check --modality and --num_fusion_layers.")
+            else:
+                print(f"\n  HINT: Model defines ITGCA parameters not in checkpoint.")
+                print(f"        If checkpoint was trained WITHOUT ITGCA → remove --use_itgca.")
+                print(f"        If checkpoint was trained WITH ablation → add matching "
+                      f"--ablate_r_stat / --ablate_r_learned / --ablate_g_token / "
+                      f"--ablate_source_bias.")
         if any('mlp_gate' in k for k in missing):
             print(f"\n  HINT: Model defines the lightweight MLP gate, but the "
                   f"checkpoint does not. Remove --use_mlp_gate or use a matching checkpoint.")

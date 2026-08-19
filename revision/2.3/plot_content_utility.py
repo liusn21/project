@@ -1068,7 +1068,7 @@ def run_raw_mode(
         bbox_to_anchor=(0.5, 1.035),
     )
     figure.suptitle(
-        "Statistical reliability and conditional content utility",
+        "Entropy-deficit score and conditional content utility",
         fontsize=14 * args.font_scale,
         y=1.075,
     )
@@ -1346,7 +1346,7 @@ def run_ranked_mode(
         bbox_to_anchor=(0.5, 1.035),
     )
     figure.suptitle(
-        "Representative flows ranked by statistical reliability",
+        "Representative flows ranked by entropy-deficit score",
         fontsize=14 * args.font_scale,
         y=1.08,
     )

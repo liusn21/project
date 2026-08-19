@@ -24,8 +24,9 @@ This repository hosts the open-science release of MM-TrafficBERT: source code, v
 │   └── run_inference.py          held-out test inference
 ├── uer/                       trimmed UER-py / ET-BERT backbone
 ├── models/bert/
-│   ├── base_config.json           12-layer config (content encoder)
-│   ├── behavior_6_config.json     6-layer  config (behavior encoder)
+│   ├── medium_config.json          8-layer config (default content encoder)
+│   ├── small_config.json           4-layer config (default behavior encoder)
+│   ├── base_config.json           12-layer config (larger-scale variant)
 │   ├── vocab_raw.txt              byte vocab  (256 + 5 special)
 │   ├── vocab_size.txt             size vocab  (3001 + 5 special)
 │   └── vocab_temporal.txt         IAT  vocab  (1000 + 5 special)
@@ -36,36 +37,29 @@ The three vocabularies under `models/bert/` are deterministic and shipped with t
 
 ---
 
-## 2. Released artifacts (Zenodo)
+## 2. Pretrained model (Zenodo)
 
-The Stage 2 multimodal pretrained checkpoint and the per-dataset fine-tuning splits used in the paper are hosted on Zenodo, because anonymous.4open.science enforces a per-file size limit too small for these artifacts. Anonymous deposit:
+You can use our provided `pretrain.bin` for fine-tuning, or pre-train the model
+yourself by following the steps below. The provided Stage 2 multimodal
+checkpoint is hosted on an anonymous Zenodo record:
 
-    https://doi.org/10.5281/zenodo.19992866
+    https://doi.org/10.5281/zenodo.22005121
 
-Layout of the deposit:
-
-```
-zenodo_release/
-├── pretrain.bin                       Stage 2 multimodal pretrained checkpoint
-└── datasets/
-    ├── AnonProxy/                     train.pkl, val.pkl, test.pkl, label2id.pkl
-    ├── Appsniffer/                      (same four files in each subdirectory)
-    ├── cstnet-tls/
-    ├── datacon2021-p2/
-    ├── browser/
-    └── ITC-Net-Blend/
-```
-
-To follow the commands in §5 / §6 verbatim, unpack the deposit so that:
+This Zenodo release contains the pretrained checkpoint:
 
 ```
-project/models/mm_trafficbert.bin                                    ← from pretrain.bin
-project/data/finetune/<task>/processed/{train,val,test,label2id}.pkl ← from datasets/<dataset_name>/
+pretrain.bin    Stage 2 multimodal pretrained checkpoint
 ```
 
-Equivalently, leave the layout flat and pass absolute paths to the scripts.
+To follow the fine-tuning commands in §5, download
+`pretrain.bin` and place it at:
 
-The pickles are pre-tokenized with the byte / size / temporal vocabularies under `models/bert/`. Reviewers who want to verify downstream numbers without redoing pre-training (§4) can start directly from §5 (fine-tuning) using these artifacts.
+```
+project/models/mm_trafficbert.bin
+```
+
+Alternatively, keep the original filename and pass its path directly through
+`--pretrained_model_path`.
 
 ---
 
@@ -119,7 +113,7 @@ python3 data_generation/multimodal_data_gen.py \
 ### 4.3 Preprocess into `.pt`
 
 ```bash
-# Stage 1 — content (raw bytes, 12-layer encoder)
+# Stage 1 — content (raw bytes, 8-layer encoder)
 python3 pre-training/preprocess.py \
     --target raw_packet \
     --corpus_path  data/corpus_raw.txt \
@@ -129,7 +123,7 @@ python3 pre-training/preprocess.py \
     --processes_num 32 \
     --dynamic_masking
 
-# Stage 1 — behavior (size + IAT, 6-layer encoder)
+# Stage 1 — behavior (size + IAT, 4-layer encoder)
 python3 pre-training/preprocess.py \
     --target packet_size \
     --corpus_path         data/corpus_size.txt \
@@ -158,27 +152,27 @@ python3 pre-training/preprocess.py \
 ### 4.4 Stage 1 — unimodal pre-training
 
 ```bash
-# Content encoder (12 layers)
+# Content encoder (8 layers, BERT-Medium width)
 python3 pre-training/pretrain.py \
     --target raw_packet \
     --dataset_path       data/raw_dataset.pt \
     --vocab_path         models/bert/vocab_raw.txt \
     --output_model_path  models/raw_encoder.bin \
-    --config_path        models/bert/base_config.json \
+    --config_path        models/bert/medium_config.json \
     --total_steps        100000 \
     --batch_size         64 \
     --learning_rate      5e-5 \
     --world_size 4 --gpu_ranks 0 1 2 3 \
     --master_ip tcp://localhost:12345
 
-# Behavior encoder (6 layers; uses DualMlm with size CE + IAT soft-label KL, σ=10)
+# Behavior encoder (4 layers; uses DualMlm with size CE + IAT soft-label KL, σ=10)
 python3 pre-training/pretrain.py \
     --target packet_size \
     --dataset_path        data/size_dataset.pt \
     --vocab_path          models/bert/vocab_size.txt \
     --vocab_path_temporal models/bert/vocab_temporal.txt \
     --output_model_path   models/size_encoder.bin \
-    --config_path         models/bert/behavior_6_config.json \
+    --config_path         models/bert/small_config.json \
     --total_steps         100000 \
     --batch_size          64 \
     --learning_rate       5e-5 \
@@ -198,10 +192,10 @@ python3 pre-training/pretrain.py \
     --pretrained_raw_path  models/raw_encoder.bin \
     --pretrained_size_path models/size_encoder.bin \
     --output_model_path    models/mm_trafficbert.bin \
-    --config_path          models/bert/base_config.json \
-    --config_path_size     models/bert/behavior_6_config.json \
+    --config_path          models/bert/medium_config.json \
+    --config_path_size     models/bert/small_config.json \
     --use_itgca  \
-    --num_fusion_layers 6  \
+    --num_fusion_layers 4  \
     --total_steps        100000 \
     --batch_size         64 \
     --learning_rate      5e-5 \
@@ -213,7 +207,7 @@ python3 pre-training/pretrain.py \
 
 ### 4.6 OOM mitigation: gradient accumulation
 
-Stage 2 is the most memory-hungry step (two encoders + 6-layer fusion + momentum encoders + 4096-entry queue + ITM hard negatives that triple the fused-CLS forward pass). The restored compatibility trainer treats `--total_steps` as the number of micro-batches and performs an optimizer/scheduler update every `--accumulation_steps` micro-batches:
+Stage 2 is the most memory-hungry step (two encoders + 4-layer fusion + momentum encoders + 4096-entry queue + ITM hard negatives that triple the fused-CLS forward pass). The restored compatibility trainer treats `--total_steps` as the number of micro-batches and performs an optimizer/scheduler update every `--accumulation_steps` micro-batches:
 
 | Global optimizer batch | Per-GPU micro-batch | `--accumulation_steps` (4 GPUs) |
 |------------------------|---------------------|---------------------------------|
@@ -242,8 +236,8 @@ The lightweight MLP has a 64-dimensional hidden layer, takes the concatenated
 Raw/Size encoder CLS features without any entropy input, and outputs one scalar
 for each cross-attention direction. The two scalars are shared across all token
 positions and fusion layers and are applied after the attention output
-projection. For the base configuration it adds about 0.098M parameters, versus
-about 10.62M gate parameters for six-layer ITGCA. To run this replacement
+projection. For the default Medium configuration it adds about 0.066M parameters,
+versus about 3.15M gate parameters for four-layer ITGCA. To run this replacement
 experiment, replace `--use_itgca` with `--use_mlp_gate` in pre-training,
 fine-tuning, and inference commands.
 
@@ -325,9 +319,9 @@ python3 fine-tuning/run_classifier_stage2.py \
     --vocab_path_temporal models/bert/vocab_temporal.txt \
     --pretrained_model_path models/mm_trafficbert.bin \
     --output_model_path     models/<task>_classifier.bin \
-    --config_path           models/bert/base_config.json \
-    --config_path_size      models/bert/behavior_6_config.json \
-    --use_itgca  \
+    --config_path           models/bert/medium_config.json \
+    --config_path_size      models/bert/small_config.json \
+    --use_itgca --num_fusion_layers 4  \
     --batch_size 32 --learning_rate 5e-5 \
     --phase1_epochs 5 --phase1_lr 1e-3 \
     --epochs_num 10 \
@@ -359,9 +353,9 @@ python3 fine-tuning/run_inference.py \
     --vocab_path_raw      models/bert/vocab_raw.txt \
     --vocab_path_size     models/bert/vocab_size.txt \
     --vocab_path_temporal models/bert/vocab_temporal.txt \
-    --config_path         models/bert/base_config.json \
-    --config_path_size    models/bert/behavior_6_config.json \
-    --use_itgca --num_fusion_layers 6
+    --config_path         models/bert/medium_config.json \
+    --config_path_size    models/bert/small_config.json \
+    --use_itgca --num_fusion_layers 4
 ```
 
 ---

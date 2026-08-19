@@ -9,6 +9,9 @@ Input format: datasets/label_name/flow_file.pcap
   - Filename format: {protocol}_{src_ip}_{src_port}_{dst_ip}_{dst_port}.pcap
 
 Output: train/val/test datasets with both modalities
+
+Test-only mode processes an external test directory with an existing label2id
+mapping and writes one test pickle without rebuilding train/val splits.
 """
 
 import os
@@ -742,6 +745,120 @@ def process_dataset(pcap_dir, tokenizer_raw, tokenizer_size, tokenizer_temporal,
     return train_data, val_data, test_data, label2id
 
 
+def process_test_dataset(test_dir, label2id,
+                         tokenizer_raw, tokenizer_size, tokenizer_temporal,
+                         seq_length_raw=512, seq_length_size=256,
+                         bytes_per_packet=64, max_raw_packets=8,
+                         max_size_packets=256, seed=42, num_workers=None):
+    """Process an external test directory using an existing label mapping.
+
+    This mode deliberately does not infer labels from the test set: numeric
+    labels must remain identical to those used by the trained classifier.
+    Unknown test labels are rejected rather than silently excluded.
+    """
+    if not os.path.isdir(test_dir):
+        raise ValueError(f"Test directory does not exist or is not a directory: {test_dir}")
+    if not isinstance(label2id, dict) or not label2id:
+        raise ValueError("label2id must be a non-empty dictionary")
+    if any(not isinstance(name, str) for name in label2id):
+        raise ValueError("Every label2id key must be a string label name")
+
+    label_ids = list(label2id.values())
+    expected_ids = set(range(len(label2id)))
+    if (any(type(label_id) is not int for label_id in label_ids)
+            or len(set(label_ids)) != len(label_ids)
+            or set(label_ids) != expected_ids):
+        raise ValueError(
+            "label2id values must be unique, contiguous integers in "
+            f"[0, {len(label2id) - 1}]"
+        )
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    raw_cache, size_cache, iat_cache = build_all_caches(
+        tokenizer_raw, tokenizer_size, tokenizer_temporal
+    )
+
+    extractor_params = {
+        'bytes_per_packet': bytes_per_packet,
+        'max_raw_packets': max_raw_packets,
+        'max_size_packets': max_size_packets,
+    }
+    if num_workers is None:
+        num_workers = max(1, (os.cpu_count() or 1) - 1)
+
+    init_args = (
+        extractor_params, raw_cache, size_cache, iat_cache,
+        tokenizer_raw.vocab, tokenizer_size.vocab, tokenizer_temporal.vocab,
+        seq_length_raw, seq_length_size
+    )
+
+    print(f"Scanning external test directory: {test_dir}")
+    directory_labels = [
+        name for name in sorted(os.listdir(test_dir))
+        if os.path.isdir(os.path.join(test_dir, name))
+    ]
+    unknown_labels = sorted(set(directory_labels) - set(label2id))
+    if unknown_labels:
+        raise ValueError(
+            "External test directory contains labels absent from the training "
+            f"label2id mapping: {unknown_labels}. Refusing to skip them silently."
+        )
+
+    missing_labels = sorted(set(label2id) - set(directory_labels))
+    if missing_labels:
+        print(f"WARNING: labels in label2id but absent from external test: {missing_labels}")
+
+    test_items = []
+    scanned_label_counts = defaultdict(int)
+    for label_name in directory_labels:
+        label_path = os.path.join(test_dir, label_name)
+        pcap_files = [
+            filename for filename in os.listdir(label_path)
+            if filename.endswith('.pcap') or filename.endswith('.pcapng')
+        ]
+        scanned_label_counts[label_name] = len(pcap_files)
+        print(f"  Found label '{label_name}': {len(pcap_files)} files")
+        test_items.extend(
+            (os.path.join(label_path, filename), label_name)
+            for filename in pcap_files
+        )
+
+    if not test_items:
+        raise ValueError(f"No PCAP files found under external test directory: {test_dir}")
+
+    print(f"Total: {len(test_items)} test PCAP files, using {num_workers} workers")
+    test_results = _process_items(
+        test_items, num_workers, init_args, desc="Processing external test"
+    )
+
+    test_data = []
+    processed_label_counts = defaultdict(int)
+    for result in test_results:
+        label_name = result['label_name']
+        result['label'] = label2id[label_name]
+        test_data.append(result)
+        processed_label_counts[label_name] += 1
+
+    if not test_data:
+        raise ValueError("All external test PCAP files failed during feature extraction")
+
+    failed_count = len(test_items) - len(test_data)
+    if failed_count:
+        print(f"WARNING: {failed_count} test PCAP files failed during feature extraction")
+
+    print("\nExternal test label distribution:")
+    for label_name in directory_labels:
+        processed = processed_label_counts[label_name]
+        scanned = scanned_label_counts[label_name]
+        print(f"  {label_name}: {processed} processed / {scanned} scanned")
+
+    random.shuffle(test_data)
+    print(f"\nExternal test samples: {len(test_data)}")
+    return test_data
+
+
 def save_dataset(data, output_path):
     """Save dataset to pickle file"""
     with open(output_path, 'wb') as f:
@@ -759,19 +876,28 @@ def load_dataset(input_path):
 def main():
     parser = argparse.ArgumentParser(description='Process PCAP files for multi-modal fine-tuning')
 
-    parser.add_argument('--pcap_dir', type=str, required=True,
+    parser.add_argument('--mode', choices=['split', 'test_only'], default='split',
+                        help="'split' creates train/val/test datasets (default); "
+                             "'test_only' creates one external-test pickle using an existing label mapping")
+    parser.add_argument('--pcap_dir', type=str, default=None,
                         help='Root directory with structure: pcap_dir/label_name/*.pcap (used as train dir when --test_dir is specified)')
     parser.add_argument('--test_dir', type=str, default=None,
-                        help='Separate test directory. When specified, pcap_dir is used for train/val only, '
-                             'and all samples in test_dir are used for testing. Labels are determined by pcap_dir.')
+                        help='Separate test directory. In split mode, pcap_dir supplies train/val and labels. '
+                             'In test_only mode, labels come from --label2id_path.')
+    parser.add_argument('--label2id_path', type=str, default=None,
+                        help='Existing training label2id.pkl (required in test_only mode)')
     parser.add_argument('--vocab_path_raw', type=str, required=True,
                         help='Path to raw modality vocabulary file')
     parser.add_argument('--vocab_path_size', type=str, required=True,
                         help='Path to size modality vocabulary file')
     parser.add_argument('--vocab_path_temporal', type=str, required=True,
                         help='Path to temporal (IAT) modality vocabulary file')
-    parser.add_argument('--output_dir', type=str, required=True,
-                        help='Output directory for processed datasets')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Output directory for train.pkl, val.pkl, test.pkl, and label2id.pkl in split mode')
+    parser.add_argument('--output_path', type=str, default=None,
+                        help='Output pickle path in test_only mode (for example, external_test.pkl)')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Allow test_only mode to overwrite an existing --output_path')
 
     # Sequence lengths
     parser.add_argument('--seq_length_raw', type=int, default=512)
@@ -797,8 +923,23 @@ def main():
 
     args = parser.parse_args()
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    if args.mode == 'test_only':
+        if not args.test_dir:
+            parser.error("--test_dir is required when --mode test_only")
+        if not args.label2id_path:
+            parser.error("--label2id_path is required when --mode test_only")
+        if not args.output_path:
+            parser.error("--output_path is required when --mode test_only")
+        if os.path.exists(args.output_path) and not args.overwrite:
+            parser.error(
+                f"--output_path already exists: {args.output_path}; choose another path "
+                "or pass --overwrite"
+            )
+    else:
+        if not args.pcap_dir:
+            parser.error("--pcap_dir is required when --mode split")
+        if not args.output_dir:
+            parser.error("--output_dir is required when --mode split")
 
     # Create tokenizers (same as pretraining)
     print("Creating tokenizers...")
@@ -808,6 +949,34 @@ def main():
     print(f"  Raw vocab size: {len(tokenizer_raw.vocab)}")
     print(f"  Size vocab size: {len(tokenizer_size.vocab)}")
     print(f"  Temporal vocab size: {len(tokenizer_temporal.vocab)}")
+
+    if args.mode == 'test_only':
+        label2id = load_dataset(args.label2id_path)
+        print(f"Loaded label mapping: {len(label2id)} classes from {args.label2id_path}")
+
+        test_data = process_test_dataset(
+            test_dir=args.test_dir,
+            label2id=label2id,
+            tokenizer_raw=tokenizer_raw,
+            tokenizer_size=tokenizer_size,
+            tokenizer_temporal=tokenizer_temporal,
+            seq_length_raw=args.seq_length_raw,
+            seq_length_size=args.seq_length_size,
+            bytes_per_packet=args.bytes_per_packet,
+            max_raw_packets=args.max_raw_packets,
+            max_size_packets=args.max_size_packets,
+            seed=args.seed,
+            num_workers=args.num_workers
+        )
+
+        output_parent = os.path.dirname(os.path.abspath(args.output_path))
+        os.makedirs(output_parent, exist_ok=True)
+        save_dataset(test_data, args.output_path)
+        print("\nDone! Existing train/val/test splits and label mapping were not modified.")
+        return
+
+    # Create output directory for the standard split mode.
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # Process dataset
     train_data, val_data, test_data, label2id = process_dataset(
